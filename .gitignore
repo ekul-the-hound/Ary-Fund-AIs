@@ -68,10 +68,14 @@ coverage.xml
 # ---------------------------------------------------------------------------
 # Project-specific: runtime data, caches, logs
 # ---------------------------------------------------------------------------
-# Runtime data directory created by config.py on import. Holds caches and DBs.
-data/
-!data/__init__.py
-!data/prompts/
+# Runtime artifacts inside the data/ source folder (caches, DB, prompts output).
+# The .py source files in data/ ARE tracked — only generated artifacts are ignored.
+data/cache/
+data/portfolio.db
+data/*.db
+data/*.db-journal
+data/*.sqlite
+data/*.sqlite3
 
 # SQLite databases at any depth
 *.db
