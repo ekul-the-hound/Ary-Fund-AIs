@@ -1,0 +1,11 @@
+VSCode Terminal Auto-Setup (30 seconds):
+
+Open VSCode in D:\Ary Fund
+
+Ctrl+Shift+P → "Python: Select Interpreter"
+
+Pick: D:\ary fund\hedgefund_ai\Scripts\python.exe
+
+Terminal → New Terminal
+
+Done. Every new terminal auto-activates (hedgefund_ai).

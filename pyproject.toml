@@ -1,0 +1,50 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "hedgefund-ai"
+version = "0.1.0"
+description = "Modular hedge-fund-style AI research assistant: SEC, market, macro, and LLM agents."
+readme = "README.md"
+requires-python = ">=3.11"
+license = { text = "Proprietary" }
+authors = [{ name = "Hedge Fund AI" }]
+
+dependencies = [
+    # Data & numerics
+    "pandas>=2.1",
+    "numpy>=1.26",
+    "requests>=2.31",
+    "yfinance>=0.2.40",
+    "sqlalchemy>=2.0",
+    "python-dotenv>=1.0",
+
+    # Modeling (lightweight core; heavy stats in [quant] extra)
+    "scikit-learn>=1.4",
+
+    # UI
+    "streamlit>=1.36",
+    "plotly>=5.20",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0",
+    "pytest-mock>=3.12",
+]
+quant = [
+    "statsmodels>=0.14",
+    "arch>=6.3",
+]
+
+[tool.setuptools]
+packages = ["agent", "data", "quant", "ui"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+python_files = ["test_*.py"]
+addopts = "-ra"
+filterwarnings = [
+    "ignore::DeprecationWarning",
+]

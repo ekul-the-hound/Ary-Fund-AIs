@@ -1,0 +1,21 @@
+# Runtime dependencies for hedgefund-ai
+# Keep in sync with pyproject.toml [project.dependencies]
+
+# Data & numerics
+pandas>=2.1
+numpy>=1.26
+requests>=2.31
+yfinance>=0.2.40
+sqlalchemy>=2.0
+python-dotenv>=1.0
+
+# Modeling
+scikit-learn>=1.4
+
+# UI
+streamlit>=1.36
+plotly>=5.20
+
+# Dev / test
+pytest>=8.0
+pytest-mock>=3.12

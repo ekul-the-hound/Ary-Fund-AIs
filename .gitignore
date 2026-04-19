@@ -71,6 +71,7 @@ coverage.xml
 # Runtime artifacts inside the data/ source folder (caches, DB, prompts output).
 # The .py source files in data/ ARE tracked — only generated artifacts are ignored.
 data/cache/
+data/sec_cache/
 data/portfolio.db
 data/*.db
 data/*.db-journal
