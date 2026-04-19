@@ -1,0 +1,122 @@
+# ---------------------------------------------------------------------------
+# Secrets & environment
+# ---------------------------------------------------------------------------
+.env
+.env.*
+!.env.example
+
+# The legacy underscored names sometimes used during setup before .env worked
+_env
+_env.*
+
+# ---------------------------------------------------------------------------
+# Python
+# ---------------------------------------------------------------------------
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+
+# Distribution / packaging
+build/
+dist/
+*.egg-info/
+*.egg
+.eggs/
+wheels/
+pip-wheel-metadata/
+share/python-wheels/
+MANIFEST
+
+# Installer logs
+pip-log.txt
+pip-delete-this-directory.txt
+
+# ---------------------------------------------------------------------------
+# Virtual environments
+# ---------------------------------------------------------------------------
+.venv/
+venv/
+env/
+ENV/
+hedgefund_ai/
+.python-version
+
+# ---------------------------------------------------------------------------
+# Testing & coverage
+# ---------------------------------------------------------------------------
+.pytest_cache/
+.coverage
+.coverage.*
+htmlcov/
+.cache/
+.tox/
+.nox/
+coverage.xml
+*.cover
+.hypothesis/
+
+# ---------------------------------------------------------------------------
+# Type checkers & linters
+# ---------------------------------------------------------------------------
+.mypy_cache/
+.dmypy.json
+.pyre/
+.pytype/
+.ruff_cache/
+
+# ---------------------------------------------------------------------------
+# Project-specific: runtime data, caches, logs
+# ---------------------------------------------------------------------------
+# Runtime data directory created by config.py on import. Holds caches and DBs.
+data/
+!data/__init__.py
+!data/prompts/
+
+# SQLite databases at any depth
+*.db
+*.db-journal
+*.sqlite
+*.sqlite3
+
+# Log files at the repo root or in logs/
+logs/
+*.log
+
+# Parquet / CSV caches from market + macro fetchers
+*.parquet
+cache/
+
+# ---------------------------------------------------------------------------
+# Streamlit
+# ---------------------------------------------------------------------------
+.streamlit/secrets.toml
+
+# ---------------------------------------------------------------------------
+# Jupyter
+# ---------------------------------------------------------------------------
+.ipynb_checkpoints/
+*.ipynb_checkpoints
+
+# ---------------------------------------------------------------------------
+# Editors & IDEs
+# ---------------------------------------------------------------------------
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+Thumbs.db
+
+# ---------------------------------------------------------------------------
+# OS-specific
+# ---------------------------------------------------------------------------
+# Windows
+desktop.ini
+ehthumbs.db
+$RECYCLE.BIN/
+
+# macOS
+.AppleDouble
+.LSOverride
