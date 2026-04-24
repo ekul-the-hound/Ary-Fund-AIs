@@ -1,68 +1,64 @@
 # Ary Fund — Hedge Fund AI Research Assistant
 
-Quantamental research assistant for a student-run hedge fund (~$6M AUM,
-long-term focus). Runs a local LLM against SEC filings, market data, and
+Quantamental research assistant for a student-run hedge fund
+(long-term focus). Runs a local LLM against SEC filings, market data, and
 macroeconomic indicators to parse filings, scan portfolio risks, generate
 investment theses, and produce quant risk reports.
 
 Everything runs locally. No paid APIs, no cloud LLM costs. The agent layer
 is model-agnostic — it ships with a `mock` backend (offline, deterministic),
-a `dev` backend (Phi-3-mini via Ollama, fits the RTX 2080), and a `prod`
-slot reserved for Qwen3.
+a `dev` backend (a small instruction-tuned model via Ollama), and a `prod`
+slot for a larger model once it's validated.
 
 ---
 
 ## Overview
 
-The system is organized as four independent, importable layers. The repo is
-currently flat (all modules at the root) — module names reflect which layer
-they belong to:
+The system is organized as four independent, importable layers:
 
-- **Data layer** (`sec_fetcher.py`, `market_data.py`, `macro_data.py`,
-  `portfolio_db.py`, `pipeline.py`) — SEC EDGAR fetcher with CIK lookup and
-  XBRL parsing, yfinance market data with technicals (RSI, MACD, Bollinger),
-  FRED macro dashboard with a composite recession probability, SQLite
-  portfolio DB with FIFO P&L, and a `DataPipeline` orchestrator that builds
-  the structured context injected into the LLM.
-- **Agent layer** (`base_agent.py`, `filing_analyzer.py`, `risk_scanner.py`,
-  `thesis_generator.py`) — `ask_agent()` is the single entry point every
-  downstream module calls. `AgentRequest` goes in, `AgentResponse` comes
-  back, always with the same four keys in `generated_json`: `risks`,
-  `thesis`, `price_direction`, `confidence`. Mock mode, Ollama success, and
-  Ollama failure all produce the same shape, so the pipeline never crashes
-  from a backend outage.
-- **Quant layer** (`var_es.py`, `volatility.py`, `regime.py`,
-  `position_sizing.py`) — historical + parametric + Monte Carlo VaR/ES,
-  close-to-close and Yang-Zhang volatility estimators with forecasting, a
-  pragmatic rule-based regime classifier (trend + drawdown + vol), and Kelly
-  + volatility-target position sizing.
-- **UI layer** (`app.py`) — Streamlit dashboard: ticker picker, portfolio
-  cards, price chart with MA/RSI/vol overlays, risk & thesis panels, macro
-  context, and a debug view of the raw agent context JSON.
+- **Data layer** (`data/sec_fetcher.py`, `data/market_data.py`,
+  `data/macro_data.py`, `data/portfolio_db.py`, `data/pipeline.py`) — SEC
+  EDGAR fetcher with CIK lookup and XBRL parsing, yfinance market data with
+  technicals (RSI, MACD, Bollinger), FRED macro dashboard with a composite
+  recession probability, SQLite portfolio DB with FIFO P&L, and a
+  `DataPipeline` orchestrator that builds the structured context injected
+  into the LLM.
+- **Agent layer** (`agent/base_agent.py`, `agent/filing_analyzer.py`,
+  `agent/risk_scanner.py`, `agent/thesis_generator.py`) — `ask_agent()` is
+  the single entry point every downstream module calls. `AgentRequest` goes
+  in, `AgentResponse` comes back, always with the same four keys in
+  `generated_json`: `risks`, `thesis`, `price_direction`, `confidence`.
+  Mock mode, Ollama success, and Ollama failure all produce the same shape,
+  so the pipeline never crashes from a backend outage.
+- **Quant layer** (`quant/var_es.py`, `quant/volatility.py`,
+  `quant/regime.py`, `quant/position_sizing.py`) — historical + parametric
+  + Monte Carlo VaR/ES, close-to-close and Yang-Zhang volatility estimators
+  with forecasting, a pragmatic rule-based regime classifier (trend +
+  drawdown + vol), and Kelly + volatility-target position sizing.
+- **UI layer** (`ui/app.py`) — Streamlit dashboard: ticker picker,
+  portfolio cards, price chart with MA / RSI / vol overlays, risk & thesis
+  panels, macro context, and a debug view of the raw agent context JSON.
 
-`config.py` centralizes model selection, API keys, data paths, logging, and
-risk thresholds. `main.py` is the top-level CLI entry point.
+`config.py` centralizes model selection, API keys, data paths, logging,
+and risk thresholds. `main.py` is the top-level CLI entry point.
 
 ---
 
-## Hardware & Model
+## Model Configuration
 
-- **GPU:** RTX 2080 (8GB VRAM)
-- **RAM:** 64GB
-- **OS:** Windows 10
-- **Python:** 3.11+
-- **Current default LLM:** `phi3:3.8b` via Ollama (`dev` tag) — fits
-  comfortably in the 2080's VRAM budget and validates the full pipeline
-  end-to-end while the Qwen stack is still being sized.
-- **Future production LLM:** `qwen3:14b-instruct` (`prod` tag) once
-  hardware/quant thresholds are confirmed; the 30B MoE variant is a
-  stretch target.
-- **Offline default:** `mock` — returns deterministic JSON, no model
-  server needed. Used in tests and when Ollama is unreachable.
+The agent layer defines three model tags in `config.py`:
+
+- **`mock`** — deterministic stub, no model server required. Used in tests
+  and when Ollama is unreachable.
+- **`dev`** — a small instruction-tuned model served via Ollama. Current
+  default; lets the full pipeline run end-to-end on modest hardware while
+  the `prod` stack is validated.
+- **`prod`** — reserved for a larger Qwen-family model once thresholds are
+  confirmed.
 
 Switch models by editing `DEFAULT_AGENT_MODEL` in `config.py`. No other
-code needs to change — callers route through `AGENT_MODELS`, never a raw
-model string.
+code changes — callers route through `AGENT_MODELS`, never a raw model
+string.
 
 ---
 
@@ -72,44 +68,55 @@ model string.
 .
 ├── config.py                  # model tags, API keys, paths, risk thresholds
 ├── main.py                    # CLI entry point; runs the full pipeline
-├── app.py                     # Streamlit dashboard (run via streamlit)
 │
-├── sec_fetcher.py             # SEC EDGAR REST + XBRL parser (rate-limited)
-├── market_data.py             # yfinance + technicals (RSI, MACD, BBands)
-├── macro_data.py              # FRED: rates, inflation, VIX, recession prob
-├── portfolio_db.py            # SQLite: positions, trades, snapshots
-├── pipeline.py                # Daily refresh + agent context builder
+├── agent/
+│   ├── __init__.py
+│   ├── base_agent.py          # AgentRequest / AgentResponse / ask_agent
+│   ├── filing_analyzer.py     # 10-K / 10-Q metric extraction
+│   ├── risk_scanner.py        # Portfolio-level risk flagging
+│   └── thesis_generator.py    # BUY / HOLD / SELL thesis writer
 │
-├── base_agent.py              # AgentRequest / AgentResponse / ask_agent
-├── filing_analyzer.py         # 10-K / 10-Q metric extraction
-├── risk_scanner.py            # Portfolio-level risk flagging
-├── thesis_generator.py        # BUY / HOLD / SELL thesis writer
+├── data/
+│   ├── __init__.py
+│   ├── sec_fetcher.py         # SEC EDGAR REST + XBRL parser (rate-limited)
+│   ├── market_data.py         # yfinance + technicals (RSI, MACD, BBands)
+│   ├── macro_data.py          # FRED: rates, inflation, VIX, recession prob
+│   ├── portfolio_db.py        # SQLite: positions, trades, snapshots
+│   └── pipeline.py            # Daily refresh + agent context builder
 │
-├── var_es.py                  # Historical / parametric / MC VaR & ES
-├── volatility.py              # Vol estimators + forecasting
-├── regime.py                  # Trend + drawdown + vol regime classifier
-├── position_sizing.py         # Kelly + volatility-targeted sizing
+├── quant/
+│   ├── __init__.py
+│   ├── var_es.py              # Historical / parametric / MC VaR & ES
+│   ├── volatility.py          # Vol estimators + forecasting
+│   ├── regime.py              # Trend + drawdown + vol regime classifier
+│   └── position_sizing.py     # Kelly + volatility-targeted sizing
 │
-├── conftest.py                # Shared pytest fixtures
-├── test_base_agent.py
-├── test_filing_analyzer.py
-├── test_risk_scanner.py
-├── test_thesis_generator.py
-├── test_main.py
-├── test_end_to_end_smoke.py
+├── ui/
+│   ├── __init__.py
+│   └── app.py                 # Streamlit dashboard
+│
+├── tests/
+│   ├── __init__.py
+│   ├── conftest.py            # Shared pytest fixtures
+│   ├── test_base_agent.py
+│   ├── test_filing_analyzer.py
+│   ├── test_risk_scanner.py
+│   ├── test_thesis_generator.py
+│   ├── test_main.py
+│   └── test_end_to_end_smoke.py
 │
 ├── pyproject.toml
 ├── pytest.ini
 ├── requirements.txt
 ├── setup.py
-├── activate.bat               # Windows: activate the venv in one command
-├── .env                       # Local secrets (see .env.example)
+├── activate.bat               # Windows convenience: activate the venv
+├── .env.example               # Template for local secrets
 └── README.md
 ```
 
-A `data/` subfolder is created at runtime by `config.py` to hold the
-portfolio DB, per-source caches, and LLM prompt templates. It is not
-committed — `.gitignore` excludes it.
+Caches and the portfolio database are created at runtime under `data/`
+(e.g. `data/cache/`, `data/portfolio.db`) and are excluded from version
+control.
 
 ---
 
@@ -117,21 +124,16 @@ committed — `.gitignore` excludes it.
 
 ### 1. Prerequisites
 
-- Python 3.11 ([python.org/downloads](https://python.org/downloads) — check
-  "Add to PATH" during install)
+- Python 3.11+
 - Git
-- Ollama ([ollama.com](https://ollama.com)) — only needed if you run
-  anything other than `mock` mode
-
-CUDA is not required for the current `dev` model (`phi3:3.8b`) — Ollama
-handles acceleration automatically. CUDA 12.1 becomes relevant only when
-moving to the Qwen `prod` model.
+- [Ollama](https://ollama.com) — only needed if you run anything other
+  than `mock` mode
 
 ### 2. Clone and install
 
 ```bash
-git clone <your-repo-url> ary-fund
-cd ary-fund
+git clone https://github.com/ekul-the-hound/Ary-Fund-AIs.git
+cd Ary-Fund-AIs
 
 python -m venv .venv
 .venv\Scripts\activate               # Windows
@@ -146,13 +148,11 @@ Or, for an editable install with dev tools:
 pip install -e ".[dev]"
 ```
 
-On Windows there's also `activate.bat` that wraps the venv activation.
-
-### 3. Pull a model (optional — skip for mock mode)
+### 3. Pull a model (skip for mock mode)
 
 ```bash
-ollama serve                 # leave this running in its own terminal
-ollama pull phi3:3.8b        # current dev model, ~2.3GB
+ollama serve                         # leave this running
+ollama pull <model_name>             # see config.AGENT_MODELS for the current dev model
 ```
 
 ### 4. API keys
@@ -162,7 +162,7 @@ Copy `.env.example` → `.env` and fill in:
 ```dotenv
 FRED_API_KEY=your_fred_key_here
 SEC_AGENT_NAME=Your Name
-SEC_AGENT_EMAIL=you@school.edu
+SEC_AGENT_EMAIL=you@example.com
 ```
 
 - **FRED** is free: [fred.stlouisfed.org/docs/api/api_key.html](https://fred.stlouisfed.org/docs/api/api_key.html)
@@ -175,10 +175,7 @@ SEC_AGENT_EMAIL=you@school.edu
 
 ```bash
 # Mock mode — no Ollama required
-python -c "from base_agent import ask_agent, AgentRequest; print(ask_agent(AgentRequest(prompt='ping', context={}, model_tag='mock')).generated_json)"
-
-# If Ollama is running with phi3:3.8b pulled
-python -c "import ollama; print(ollama.chat(model='phi3:3.8b', messages=[{'role':'user','content':'ping'}])['message']['content'])"
+python -c "from agent.base_agent import ask_agent, AgentRequest; print(ask_agent(AgentRequest(prompt='ping', context={}, model_tag='mock')).generated_json)"
 
 # Market data sanity check
 python -c "import yfinance as yf; print(yf.Ticker('AAPL').history(period='1d')['Close'].iloc[-1])"
@@ -198,18 +195,18 @@ python main.py
 Daily data refresh only, no LLM calls:
 
 ```bash
-python pipeline.py
+python -m data.pipeline
 ```
 
 Streamlit dashboard:
 
 ```bash
-streamlit run app.py
+streamlit run ui/app.py
 ```
 
 ### Switching agent backends
 
-In `config.py`, change:
+In `config.py`:
 
 ```python
 DEFAULT_AGENT_MODEL: str = "dev"    # "mock" | "dev" | "prod"
@@ -226,7 +223,7 @@ four-key response contract is preserved either way.
 ```bash
 pytest                              # full suite
 pytest -k filing_analyzer           # single module
-pytest test_end_to_end_smoke.py
+pytest tests/test_end_to_end_smoke.py
 pytest -x                           # stop at first failure
 ```
 
@@ -244,8 +241,8 @@ with mocked LLM responses to prove the wiring holds.
 **Built:**
 - **Data layer (~3,600 lines):** SEC fetcher with CIK lookup and XBRL
   parsing, market data with technicals and multi-stock comparison, FRED
-  macro dashboard with recession probability, SQLite portfolio DB with FIFO
-  P&L, and the `DataPipeline` orchestrator.
+  macro dashboard with recession probability, SQLite portfolio DB with
+  FIFO P&L, and the `DataPipeline` orchestrator.
 - **Agent layer:** model-agnostic `ask_agent` core with mock/dev/prod
   routing, filing analyzer, risk scanner, thesis generator. Graceful
   fallback to mock when Ollama is unreachable.
@@ -261,27 +258,22 @@ with mocked LLM responses to prove the wiring holds.
   `pytest.ini`, `.env` support via `python-dotenv`.
 
 **In progress:**
-- Swapping the `prod` tag onto Qwen3 once VRAM/quant thresholds are
-  confirmed.
-- Migrating the flat module layout into proper `data/`, `agent/`, `quant/`,
-  `ui/` subpackages.
-- Filling in prompt templates under `data/prompts/agent/` (reserved by
-  `config.AGENT_PROMPT_TEMPLATES_DIR`).
+- Promoting the `prod` model tag once validation is complete.
+- Filling in prompt templates under the directory reserved by
+  `config.AGENT_PROMPT_TEMPLATES_DIR`.
 
 ---
 
 ## Future Work
 
-- **Fine-tuning** — LoRA fine-tune on SEC filings + fund notes. Skipped for
-  the MVP; the base instruction-tuned model plus strong prompts gets most
-  of the way there.
+- **Fine-tuning** — LoRA fine-tune on SEC filings + fund notes. Skipped
+  for the MVP; the base instruction-tuned model plus strong prompts gets
+  most of the way there.
 - **Daily scheduler** — auto-scan holdings at market open, push high-risk
-  flags to Slack.
+  flags to a Slack channel.
 - **PDF reports** — one-click investment memos combining thesis + charts +
   risk summary.
 - **Candidate screener** — rank 500+ tickers by fundamental quality.
-- **Hardware upgrade path** — RTX 4090 unlocks Qwen 70B Q4 quantization
-  (~10× throughput over the current stack).
 
 ---
 
