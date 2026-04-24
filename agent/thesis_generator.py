@@ -62,15 +62,19 @@ _RISK_DAMPENERS: Dict[str, float] = {
     "LOW": 1.0,
 }
 
-# Bias -> outlook bucket boundaries. Symmetric, tuned so that a NEUTRAL
-# verdict requires genuinely mixed signals rather than slight drift.
-_OUTLOOK_BULLISH: float = 0.20
-_OUTLOOK_BEARISH: float = -0.20
+# Bias -> outlook bucket boundaries.
+# INVARIANT: _OUTLOOK_BULLISH must equal _DIR_MODERATE_UP, and
+# _OUTLOOK_BEARISH must equal _DIR_MODERATE_DOWN.  If these pairs ever
+# diverge, a bias in the gap (e.g. 0.16) would produce "bullish" outlook
+# but "flat" direction — an internally contradictory verdict.  Keep them
+# in sync whenever you tune these constants.
+_OUTLOOK_BULLISH: float = 0.15   # was 0.20 — aligned to _DIR_MODERATE_UP
+_OUTLOOK_BEARISH: float = -0.15  # was -0.20 — aligned to _DIR_MODERATE_DOWN
 
 # Bias -> price_direction bucket boundaries. Five symmetric buckets.
 _DIR_STRONG_UP: float = 0.50
-_DIR_MODERATE_UP: float = 0.15
-_DIR_MODERATE_DOWN: float = -0.15
+_DIR_MODERATE_UP: float = 0.15   # must equal _OUTLOOK_BULLISH
+_DIR_MODERATE_DOWN: float = -0.15  # must equal _OUTLOOK_BEARISH
 _DIR_STRONG_DOWN: float = -0.50
 
 # Max items surfaced in key_risks / key_opportunities to keep prompts and

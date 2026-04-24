@@ -93,13 +93,31 @@ except Exception as e:
     MacroData = None
     _BACKEND_ERRORS.append(f"data.macro_data.MacroData unavailable: {e}")
 
+try:
+    # Imported to trigger on-demand agent generation from the UI.
+    # main._process_ticker() runs the full chain and persists to agent_opinions.
+    import main as agent_main
+except Exception as e:
+    agent_main = None
+    _BACKEND_ERRORS.append(f"main (agent chain) unavailable: {e}")
+
+# Local UI modules — chat + essay. Import after backend so any failure here
+# is still recoverable (the Overview tab works without chat/essay).
+try:
+    from ui import chat as ary_chat
+    from ui import essay as ary_essay
+except Exception as e:
+    ary_chat = None
+    ary_essay = None
+    _BACKEND_ERRORS.append(f"ARY QUANT modules unavailable: {e}")
+
 
 # ======================================================================
 # Page configuration
 # ======================================================================
 st.set_page_config(
-    page_title="Hedge Fund AI Research",
-    page_icon="📈",
+    page_title="ARY QUANT",
+    page_icon="🧠",
     layout="wide",
     initial_sidebar_state="expanded",
 )
@@ -158,10 +176,17 @@ def _db_path() -> str | None:
 
 @st.cache_data(ttl=300, show_spinner=False)
 def load_portfolio_summary() -> dict[str, Any]:
-    """Return a portfolio summary dict from portfolio_db.
+    """Return a portfolio summary dict from PortfolioDB.
 
-    Tries a few plausible method names so minor backend API differences
-    don't break the UI. Falls back to an empty-but-well-shaped dict.
+    Uses the class-based API:
+        - get_portfolio_snapshot(market_data=...) for positions and totals
+        - get_risk_metrics(market_data=...) for concentration-based risk level
+        - get_cash() for the cash balance
+
+    Live prices are pulled via MarketData when available; otherwise the
+    snapshot falls back to stored entry prices (no unrealized P&L in that
+    case). Falls back to an empty-but-well-shaped dict on any failure so
+    the UI renders placeholders instead of crashing.
     """
     empty = {
         "holdings": pd.DataFrame(),
@@ -172,48 +197,66 @@ def load_portfolio_summary() -> dict[str, Any]:
         "cash": None,
     }
 
-    if portfolio_db is None:
+    if portfolio_db is None or not hasattr(portfolio_db, "PortfolioDB"):
         return empty
 
-    holdings_df = pd.DataFrame()
-    for method_name in ("get_all_holdings", "get_portfolio", "fetch_all", "list_holdings"):
-        fn = getattr(portfolio_db, method_name, None)
-        if callable(fn):
-            try:
-                result = fn()
-                if isinstance(result, pd.DataFrame):
-                    holdings_df = result
-                elif isinstance(result, list):
-                    holdings_df = pd.DataFrame(result)
-                break
-            except Exception:
-                continue
-
-    if holdings_df.empty:
+    path = _db_path()
+    if not path:
         return empty
 
-    # Compute summary values defensively — columns may or may not exist.
-    total_value = float(holdings_df["market_value"].sum()) if "market_value" in holdings_df else 0.0
-    total_pnl = float(holdings_df["pnl"].sum()) if "pnl" in holdings_df else 0.0
-    avg_risk = "unknown"
-    if "risk_level" in holdings_df:
-        risks = holdings_df["risk_level"].dropna().astype(str).str.lower()
-        if not risks.empty:
-            avg_risk = risks.mode().iat[0]
+    try:
+        db = portfolio_db.PortfolioDB(db_path=path)
+    except Exception as e:
+        st.warning(f"Could not open portfolio DB: {e}")
+        return empty
 
-    cash = None
-    get_cash = getattr(portfolio_db, "get_cash_balance", None)
-    if callable(get_cash):
+    # Optional: live prices for unrealized P&L. Passing None is safe —
+    # the snapshot will just use stored entry prices as "current".
+    md = None
+    if MarketData is not None:
         try:
-            cash = float(get_cash())
+            md = MarketData(db_path=path)
         except Exception:
-            cash = None
+            md = None
+
+    try:
+        snap = db.get_portfolio_snapshot(market_data=md)
+    except Exception as e:
+        st.warning(f"Could not build portfolio snapshot: {e}")
+        return empty
+
+    positions = snap.get("positions", []) or []
+    summary = snap.get("summary", {}) or {}
+
+    # Positions is a list-of-dicts from get_portfolio_snapshot — it already
+    # includes ticker, shares, avg_entry_price, current_price, market_value,
+    # unrealized_pnl, unrealized_pct, portfolio_weight, sector, conviction.
+    holdings_df = pd.DataFrame(positions) if positions else pd.DataFrame()
+
+    # Risk level comes from the concentration bucket (LOW / MODERATE / HIGH),
+    # which is already compatible with RISK_COLORS.
+    avg_risk = "unknown"
+    try:
+        risk = db.get_risk_metrics(market_data=md) or {}
+        concentration = str(risk.get("concentration", "")).lower()
+        if concentration in {"low", "moderate", "high"}:
+            avg_risk = concentration
+    except Exception:
+        pass
+
+    # Cash: prefer the dedicated getter so an empty portfolio still shows
+    # the starting balance from portfolio_meta.
+    cash = summary.get("cash")
+    try:
+        cash = float(db.get_cash())
+    except Exception:
+        pass
 
     return {
         "holdings": holdings_df,
-        "num_holdings": len(holdings_df),
-        "total_value": total_value,
-        "total_pnl": total_pnl,
+        "num_holdings": int(summary.get("num_positions", len(holdings_df))),
+        "total_value": float(summary.get("total_value", 0.0) or 0.0),
+        "total_pnl": float(summary.get("unrealized_pnl", 0.0) or 0.0),
         "avg_risk": avg_risk,
         "cash": cash,
     }
@@ -250,6 +293,86 @@ def load_latest_opinion(ticker: str) -> dict[str, Any]:
     except Exception as e:
         st.warning(f"Could not load opinion for {ticker}: {e}")
         return {}
+
+
+def generate_opinion(ticker: str) -> dict[str, Any] | None:
+    """Run the full agent chain for one ticker and persist the result.
+
+    Calls ``main._process_ticker(ticker, db_path, cfg)``, which:
+        1. Builds context (SEC filings, prices, fundamentals, macro).
+        2. Runs filing_analyzer to shape filings and extract key metrics.
+        3. Invokes the LLM agent (Qwen3 via Ollama).
+        4. Computes rule-based risk flags.
+        5. Generates the thesis.
+        6. Writes the merged opinion to the agent_opinions table.
+
+    This can take 30s–2min depending on Ollama speed and whether SEC /
+    yfinance / FRED data is cached. Exceptions inside _process_ticker are
+    already caught there; we treat a None return as a soft failure.
+
+    Returns the opinion dict on success, None on failure.
+    """
+    if agent_main is None or not hasattr(agent_main, "_process_ticker"):
+        st.error("Agent chain unavailable — `main._process_ticker` not importable.")
+        return None
+    if app_config is None:
+        st.error("Config unavailable — cannot locate DB path.")
+        return None
+    path = _db_path()
+    if not path:
+        st.error("PORTFOLIO_DB_PATH is not set in config.")
+        return None
+
+    try:
+        opinion = agent_main._process_ticker(ticker, path, app_config)
+    except Exception as e:
+        # _process_ticker already catches internally, but belt-and-suspenders
+        # in case an import-time issue escapes.
+        st.error(f"Agent chain raised for {ticker}: {e}")
+        return None
+
+    if opinion is None:
+        st.warning(
+            f"Agent chain returned no opinion for {ticker}. "
+            "Check the Streamlit console / hedgefund_ai.log for details."
+        )
+        return None
+
+    # Invalidate the caches that depend on agent_opinions / context so the
+    # next read picks up the freshly-written row.
+    load_latest_opinion.clear()
+    load_ticker_context.clear()
+    return opinion
+
+
+def render_generate_cta(ticker: str) -> None:
+    """Render the 'Generate analysis' call-to-action button.
+
+    Shown inline inside render_risk_panel / render_thesis_panel when no
+    opinion exists yet. Uses a unique key per ticker so Streamlit doesn't
+    conflate button presses across reruns.
+
+    The button lives inside a form-less flow: when clicked, we run the
+    agent synchronously under a spinner, then st.rerun() so the panels
+    re-render with the freshly-persisted data.
+    """
+    st.info(f"No agent opinion for **{ticker}** yet.")
+    st.caption(
+        "Running the agent chain fetches filings, pulls macro data, "
+        "and invokes the local LLM. Typical runtime: 30s–2min."
+    )
+    clicked = st.button(
+        f"🤖 Generate analysis for {ticker}",
+        key=f"gen_opinion_{ticker}",
+        type="primary",
+        use_container_width=True,
+    )
+    if clicked:
+        with st.spinner(f"Running agent chain for {ticker}… (this takes ~1min)"):
+            opinion = generate_opinion(ticker)
+        if opinion is not None:
+            st.success(f"Opinion generated for {ticker}.")
+            st.rerun()
 
 
 @st.cache_data(ttl=300, show_spinner=False)
@@ -596,11 +719,11 @@ def render_price_chart(
     st.plotly_chart(fig, use_container_width=True)
 
 
-def render_risk_panel(context: dict[str, Any]) -> None:
+def render_risk_panel(context: dict[str, Any], ticker: str) -> None:
     st.markdown("### ⚠️ Risk")
     risk = context.get("risk") or {}
     if not risk:
-        st.info("No risk data yet for this ticker.")
+        render_generate_cta(ticker)
         return
 
     combined = risk.get("combined_level") or risk.get("level") or "unknown"
@@ -638,7 +761,10 @@ def render_thesis_panel(context: dict[str, Any]) -> None:
     st.markdown("### 💡 Thesis")
     thesis = context.get("thesis") or {}
     if not thesis:
-        st.info("No thesis generated yet for this ticker.")
+        st.caption(
+            "Thesis will appear here once the agent has generated an "
+            "opinion (use the button in the Risk panel)."
+        )
         return
 
     direction = thesis.get("outlook") or thesis.get("direction") or "unknown"
@@ -757,6 +883,209 @@ def render_events_panel(context: dict[str, Any]) -> None:
 
 
 # ======================================================================
+# ARY QUANT — Briefing + chat renderers
+# ======================================================================
+_CHAT_STATE_KEY = "ary_quant_chat_history"
+
+
+def _chat_history(ticker: str) -> list[dict[str, str]]:
+    """Per-ticker chat history, lazily initialised in session_state."""
+    store = st.session_state.setdefault(_CHAT_STATE_KEY, {})
+    return store.setdefault(ticker, [])
+
+
+def _clear_chat_history(ticker: str) -> None:
+    store = st.session_state.get(_CHAT_STATE_KEY, {})
+    store.pop(ticker, None)
+
+
+def render_essay_block(ticker: str, context: dict[str, Any]) -> dict[str, Any] | None:
+    """Render the long-form briefing. Returns the essay dict (or None)
+    so the chat can use it to ground its answers."""
+    st.markdown(f"## 📝 Research Briefing — {ticker}")
+
+    if ary_essay is None:
+        st.warning(
+            "Essay module unavailable — see backend import warnings."
+        )
+        return None
+
+    essay = ary_essay.get_cached_essay(ticker)
+
+    top_cols = st.columns([3, 1])
+    with top_cols[1]:
+        button_label = (
+            "🔁 Regenerate briefing" if essay else "✨ Generate briefing"
+        )
+        if st.button(button_label, use_container_width=True, key=f"gen_essay_{ticker}"):
+            if app_config is None:
+                st.error("config module not importable — cannot call Ollama.")
+            else:
+                with st.spinner(
+                    f"ARY QUANT is drafting the {ticker} briefing… "
+                    "(30s–2min on local Qwen3-30B)"
+                ):
+                    essay = ary_essay.generate_essay(ticker, context, app_config)
+                st.rerun()
+
+    if essay is None:
+        st.info(
+            f"No briefing yet for **{ticker}**. Click **Generate briefing** to "
+            "have ARY QUANT draft a 2+ page institutional-memo essay from the "
+            "current data."
+        )
+        return None
+
+    text = essay.get("text", "")
+
+    # If generation produced an error marker, surface it prominently OUTSIDE
+    # the 640px scroll container so the user sees it immediately rather than
+    # having to scroll to notice.
+    if essay.get("error"):
+        st.error(text)
+        return None
+
+    meta_bits = []
+    if essay.get("model_used"):
+        meta_bits.append(f"model: `{essay['model_used']}`")
+    if essay.get("word_count"):
+        meta_bits.append(f"{essay['word_count']:,} words")
+    if essay.get("elapsed_ms"):
+        meta_bits.append(f"{essay['elapsed_ms'] / 1000:.1f}s")
+    if essay.get("fallback"):
+        meta_bits.append("⚠️ deterministic fallback")
+    if meta_bits:
+        st.caption(" · ".join(meta_bits))
+
+    # Render essay in a scrollable container so a 2-page essay doesn't dominate
+    # the viewport next to the chat pane.
+    with st.container(border=True, height=640):
+        st.markdown(text)
+
+    return essay
+
+
+def render_chat_panel(
+    ticker: str,
+    context: dict[str, Any],
+    essay: dict[str, Any] | None,
+) -> None:
+    """ChatGPT-style conversation with ARY QUANT, grounded in the briefing."""
+    header_cols = st.columns([4, 1])
+    with header_cols[0]:
+        st.markdown("## 💬 Ask ARY QUANT")
+    with header_cols[1]:
+        if st.button(
+            "🧹 Clear chat",
+            use_container_width=True,
+            key=f"clear_chat_{ticker}",
+            help="Remove this ticker's chat history.",
+        ):
+            _clear_chat_history(ticker)
+            st.rerun()
+
+    if ary_chat is None:
+        st.error("Chat module unavailable — see backend import warnings.")
+        return
+
+    history = _chat_history(ticker)
+
+    # Scrollable transcript — use the same height as the essay block so the
+    # two columns line up visually on wide screens.
+    with st.container(border=True, height=560):
+        if not history:
+            st.markdown(
+                "<div style='color:#6b7280;padding:1rem 0.5rem;font-size:0.95em;"
+                "line-height:1.55'>"
+                f"👋 Hi — I'm <b>ARY QUANT</b>, your research analyst for "
+                f"<b>{ticker}</b>.<br><br>"
+                "Ask me about the briefing, the risk flags, valuation, the "
+                "macro backdrop, or anything else in the context to the left. "
+                "I'll anchor answers in the data you're looking at."
+                "</div>",
+                unsafe_allow_html=True,
+            )
+        for turn in history:
+            role = turn["role"]
+            avatar = "🧠" if role == "assistant" else "👤"
+            with st.chat_message(role, avatar=avatar):
+                st.markdown(turn["content"])
+
+    # The chat input is sticky at the bottom of the viewport by Streamlit
+    # default — matches the ChatGPT pattern.
+    user_msg = st.chat_input(f"Ask ARY QUANT about {ticker}…")
+
+    if user_msg:
+        # Append user turn immediately so the transcript shows before we wait
+        # on the LLM.
+        history.append({"role": "user", "content": user_msg})
+
+        system_prompt = ary_chat.build_grounded_system_prompt(
+            ticker=ticker,
+            essay_text=(essay or {}).get("text"),
+            context=context,
+        )
+        prompt = ary_chat.build_chat_prompt(
+            system_prompt=system_prompt,
+            history=history[:-1],  # exclude the just-appended user msg
+            user_message=user_msg,
+        )
+
+        # Stream the response. We buffer into a string so we can persist the
+        # final answer to history.
+        if app_config is None:
+            history.append(
+                {
+                    "role": "assistant",
+                    "content": "⚠️ config module not importable; cannot reach Ollama.",
+                }
+            )
+            st.rerun()
+            return
+
+        try:
+            response_stream = ary_chat.stream_chat_response(
+                prompt=prompt, config=app_config
+            )
+
+            # Accumulate as we stream so we can store the finished answer.
+            collected: list[str] = []
+
+            def _gen():
+                for chunk in response_stream:
+                    collected.append(chunk)
+                    yield chunk
+
+            with st.chat_message("assistant", avatar="🧠"):
+                st.write_stream(_gen())
+
+            history.append(
+                {"role": "assistant", "content": "".join(collected).strip()}
+            )
+        except Exception as exc:
+            history.append(
+                {
+                    "role": "assistant",
+                    "content": (
+                        f"⚠️ ARY QUANT couldn't reach the LLM backend: "
+                        f"`{exc}`\n\nCheck that Ollama is running and "
+                        "`DEFAULT_AGENT_MODEL` is set in config.py."
+                    ),
+                }
+            )
+        st.rerun()
+
+
+def render_briefing_tab(ticker: str, context: dict[str, Any]) -> None:
+    """The 'ARY QUANT Briefing' tab — essay on the left, chat on the right."""
+    essay_col, chat_col = st.columns([1, 1], gap="large")
+    with essay_col:
+        essay = render_essay_block(ticker, context)
+    with chat_col:
+        render_chat_panel(ticker, context, essay)
+
+
+# ======================================================================
 # Sidebar
 # ======================================================================
 def build_sidebar(portfolio_summary: dict[str, Any]) -> dict[str, Any]:
@@ -803,9 +1132,10 @@ def build_sidebar(portfolio_summary: dict[str, Any]) -> dict[str, Any]:
 # Main app
 # ======================================================================
 def main() -> None:
-    st.title("📈 Hedge Fund AI Research")
+    st.title("🧠 ARY QUANT")
     st.caption(
-        "Portfolio · per-ticker context · agent thesis & risk · macro overlay"
+        "AI research analyst · portfolio · per-ticker briefings · "
+        "macro overlay · conversational Q&A"
     )
 
     if _BACKEND_ERRORS:
@@ -838,33 +1168,43 @@ def main() -> None:
 
     render_ticker_header(ticker, prices, context)
 
-    st.markdown("### 📉 Price & Indicators")
-    render_price_chart(
-        ticker,
-        prices,
-        show_ma=controls["show_ma"],
-        show_rsi=controls["show_rsi"],
-        show_vol=controls["show_vol"],
+    tab_overview, tab_briefing, tab_debug = st.tabs(
+        ["📊 Overview", "📝 ARY QUANT Briefing", "🔍 Debug"]
     )
 
-    # ---- Risk & Thesis side-by-side ----
-    col_r, col_t = st.columns(2)
-    with col_r:
-        render_risk_panel(context)
-    with col_t:
-        render_thesis_panel(context)
+    # ---------------- Overview tab ----------------
+    with tab_overview:
+        st.markdown("### 📉 Price & Indicators")
+        render_price_chart(
+            ticker,
+            prices,
+            show_ma=controls["show_ma"],
+            show_rsi=controls["show_rsi"],
+            show_vol=controls["show_vol"],
+        )
 
-    # ---- Events / filings (if present) ----
-    render_events_panel(context)
+        # ---- Risk & Thesis side-by-side ----
+        col_r, col_t = st.columns(2)
+        with col_r:
+            render_risk_panel(context, ticker)
+        with col_t:
+            render_thesis_panel(context)
 
-    # ---- Macro ----
-    if controls["show_macro"]:
-        st.markdown("---")
-        macro_snapshot = load_macro_snapshot()
-        render_macro_panel(context, macro_snapshot)
+        # ---- Events / filings (if present) ----
+        render_events_panel(context)
 
-    # ---- Debug ----
-    with st.expander("🔍 Raw agent context (debug)", expanded=False):
+        # ---- Macro ----
+        if controls["show_macro"]:
+            st.markdown("---")
+            macro_snapshot = load_macro_snapshot()
+            render_macro_panel(context, macro_snapshot)
+
+    # ---------------- ARY QUANT Briefing tab ----------------
+    with tab_briefing:
+        render_briefing_tab(ticker, context)
+
+    # ---------------- Debug tab ----------------
+    with tab_debug:
         db_path = _db_path()
         st.write(f"**DB path:** `{db_path}`")
         if db_path:
