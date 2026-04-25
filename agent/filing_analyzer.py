@@ -238,42 +238,60 @@ def extract_key_metrics_for_agent(
     margin_trend = _margin_trend(m)
 
     ebitda = _first_number(m, "ebitda")
-    total_debt = _first_number(m, "total_debt", "debt_total", "long_term_debt")
-    cash = _first_number(m, "cash", "cash_and_equivalents")
+    total_debt = _first_number(m, "total_debt", "debt_total", "long_term_debt", "totalDebt")
+    cash = _first_number(m, "cash", "cash_and_equivalents", "total_cash", "totalCash")
     net_debt = _safe_sub(total_debt, cash)
     debt_ebitda = _safe_ratio(total_debt, ebitda)
     net_debt_ebitda = _safe_ratio(net_debt, ebitda)
 
+    # --- P/E -----------------------------------------------------------------
+    # Prefer pre-computed trailing P/E from the data source (yfinance etc.).
+    # Only fall back to price/EPS derivation if the pre-computed value is absent.
     eps = _first_number(m, "eps", "earnings_per_share")
-    p_e = _safe_ratio(price, eps) if price and eps and eps > 0 else None
+    p_e = _first_number(m, "trailing_pe", "trailingPE", "pe_ratio")
+    if p_e is None and price and eps and eps > 0:
+        p_e = _safe_ratio(price, eps)
+    # Also grab forward P/E for the prompt if available.
+    forward_pe = _first_number(m, "forward_pe", "forwardPE")
 
-    enterprise_value = _first_number(m, "enterprise_value", "ev")
-    ev_ebitda = _safe_ratio(enterprise_value, ebitda)
+    # --- EV/EBITDA -----------------------------------------------------------
+    # Prefer pre-computed from yfinance; fall back to derivation.
+    ev_ebitda = _first_number(m, "ev_to_ebitda", "enterpriseToEbitda")
+    if ev_ebitda is None:
+        enterprise_value = _first_number(m, "enterprise_value", "ev", "enterpriseValue")
+        ev_ebitda = _safe_ratio(enterprise_value, ebitda)
+    else:
+        enterprise_value = _first_number(m, "enterprise_value", "ev", "enterpriseValue")
 
-    op_cf = _first_number(m, "operating_cash_flow", "cfo")
-    net_income = _first_number(m, "net_income", "earnings")
+    op_cf = _first_number(m, "operating_cash_flow", "cfo", "operatingCashflow")
+    net_income = _first_number(m, "net_income", "earnings", "netIncomeToCommon")
     cash_conversion = _safe_ratio(op_cf, net_income)
 
     capex = _first_number(m, "capex", "capital_expenditures")
-    fcf = _first_number(m, "fcf", "free_cash_flow")
+    fcf = _first_number(m, "fcf", "free_cash_flow", "freeCashflow")
     if fcf is None and op_cf is not None and capex is not None:
         # capex is typically reported negative in cash-flow statements; handle
         # both conventions so we don't double-subtract.
         fcf = op_cf - abs(capex)
 
-    shares = _first_number(m, "shares_outstanding", "shares")
-    market_cap = price * shares if price and shares else None
+    shares = _first_number(m, "shares_outstanding", "shares", "sharesOutstanding")
+    market_cap = _first_number(m, "market_cap", "marketCap")
+    if market_cap is None and price and shares:
+        market_cap = price * shares
     fcf_yield = _safe_ratio(fcf, market_cap)
 
     ebit = _first_number(m, "ebit", "operating_income")
-    interest_expense = _first_number(m, "interest_expense")
+    interest_expense = _first_number(m, "interest_expense", "interestExpense")
     interest_coverage = _safe_ratio(ebit, interest_expense)
 
     invested_capital = _first_number(m, "invested_capital")
     # ROIC using NOPAT proxy = EBIT * (1 - 0.21 assumed tax). Coarse; fine
     # for screening. Tax rate is overridable later via config if needed.
+    # Also accept yfinance returnOnEquity as a fallback signal.
     nopat = ebit * (1 - 0.21) if ebit is not None else None
     roic = _safe_ratio(nopat, invested_capital)
+    if roic is None:
+        roic = _first_number(m, "return_on_equity", "returnOnEquity")
 
     # Streak of negative FCF years, capped by available history.
     fcf_history = _get_numeric_history(m, "fcf_history", "free_cash_flow_history")
@@ -283,9 +301,11 @@ def extract_key_metrics_for_agent(
     # market-data layer. Not recomputed here, just surfaced in the snapshot
     # so downstream consumers (risk scanner, thesis generator, tests) can
     # read them under their industry-standard names.
-    revenue_growth_yoy = _first_number(m, "revenue_growth_yoy", "revenue_growth")
-    gross_margin = _first_number(m, "gross_margin")
-    operating_margin = _first_number(m, "operating_margin")
+    # yfinance returns these as 'revenue_growth' / 'grossMargins' / etc.
+    revenue_growth_yoy = _first_number(m, "revenue_growth_yoy", "revenue_growth", "revenueGrowth")
+    gross_margin = _first_number(m, "gross_margin", "grossMargins", "gross_margins")
+    operating_margin = _first_number(m, "operating_margin", "operatingMargins", "operating_margins")
+    profit_margin = _first_number(m, "profit_margin", "profitMargins", "net_margin")
     # ``fcf`` above already prefers explicit input (``fcf`` / ``free_cash_flow``)
     # over the op_cf − capex derivation, so we can surface it directly.
     free_cash_flow_out = fcf
@@ -306,6 +326,7 @@ def extract_key_metrics_for_agent(
         "net_debt_to_ebitda": net_debt_ebitda,  # alias
         "p_e": p_e,
         "pe_ratio": p_e,                     # alias
+        "forward_pe": forward_pe,
         "ev_ebitda": ev_ebitda,
         "ev_to_ebitda": ev_ebitda,           # alias
         "cash_conversion": cash_conversion,  # OCF / NI

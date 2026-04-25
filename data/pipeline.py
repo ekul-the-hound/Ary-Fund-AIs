@@ -162,7 +162,9 @@ def build_agent_context(ticker: str, db_path: str, cfg) -> dict:
         # Flatten the nested structure into a single-level dict that
         # filing_analyzer.extract_key_metrics_for_agent can consume.
         flat: dict = {}
-        for section in ("financials", "valuation", "growth", "analyst"):
+        # Include ALL sections — "overview" contains enterprise_value and
+        # market_cap which are required for EV/EBITDA and FCF yield.
+        for section in ("overview", "financials", "valuation", "growth", "analyst"):
             sub = fund.get(section) if isinstance(fund, dict) else None
             if isinstance(sub, dict):
                 flat.update(sub)

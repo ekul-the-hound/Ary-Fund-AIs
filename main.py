@@ -145,6 +145,12 @@ def _assemble_final_opinion(
         "rationale": thesis.get("rationale"),
         "bias_score": thesis.get("bias_score"),
 
+        # Essay and review (new).
+        "essay": thesis.get("essay"),
+        "essay_meta": thesis.get("essay_meta"),
+        "review": thesis.get("review"),
+        "essay_revised": thesis.get("essay_revised", False),
+
         # Nested supporting detail.
         "risk_flags": risk_flags,
         "key_metrics": key_metrics,
@@ -234,6 +240,59 @@ def _process_ticker(
             macro=macro,
             risk_flags=risk_flags,
         )
+
+        # 5b. Generate the institutional-memo essay and review it.
+        from agent.thesis_essay import generate_thesis_essay
+        from agent.thesis_review import review_essay, revise_essay
+
+        essay = generate_thesis_essay(
+            ticker=ticker,
+            thesis=thesis,
+            filings_summary=filings_summary,
+            metrics=key_metrics,
+            macro=macro,
+            risk_flags=risk_flags,
+            config=cfg,
+        )
+        thesis["essay"] = essay["text"]
+        thesis["essay_meta"] = {
+            "model": essay["model_used"],
+            "elapsed_ms": essay["elapsed_ms"],
+            "fallback": essay["fallback"],
+            "word_count": essay["word_count"],
+        }
+
+        # Optional: review the essay and auto-revise if score is low
+        review = review_essay(
+            ticker=ticker,
+            essay_text=essay["text"],
+            metrics=key_metrics,
+            macro=macro,
+            risk_flags=risk_flags,
+            config=cfg,
+        )
+        thesis["review"] = review
+
+        # Auto-revise if the review score is below 8.0 AND we're not in fallback mode
+        # (fallback mode means LLM is unavailable, so revision would also fail)
+        if review["overall_score"] < 8.0 and not review["fallback"]:
+            revised = revise_essay(
+                ticker=ticker,
+                original_essay=essay["text"],
+                review_text=review["text"],
+                metrics=key_metrics,
+                macro=macro,
+                risk_flags=risk_flags,
+                config=cfg,
+            )
+            if revised["revision_applied"]:
+                thesis["essay"] = revised["text"]
+                thesis["essay_revised"] = True
+                logger.info(
+                    "main | %s | essay revised | score %.1f -> revision applied",
+                    ticker,
+                    review["overall_score"],
+                )
 
         # 6. Merge into one persistable opinion.
         final_opinion = _assemble_final_opinion(

@@ -217,7 +217,7 @@ def _build_essay_prompt(
     risk_block = _format_risk_block(risk_flags)
     thesis_block = _format_thesis_block(thesis)
 
-    return f"""You are a senior equity analyst writing a formal investment memo for a hedge-fund investment committee. Your job is to interpret the provided financial data, not summarize it. Every major claim must be grounded in a specific number, filing, or macro datapoint from the context below.
+    return f"""You are a senior equity analyst writing a formal investment memo for a hedge-fund investment committee. Your job is to interpret the provided financial data and deliver a decisive analytical verdict. Every major claim must be grounded in a specific number from the context below.
 
 === TICKER ===
 {ticker}
@@ -225,7 +225,7 @@ def _build_essay_prompt(
 === HEURISTIC VERDICT (from quant model) ===
 {thesis_block}
 
-=== KEY METRICS (from 10-K / 10-Q filings) ===
+=== KEY METRICS (from 10-K / 10-Q filings and market data) ===
 {metrics_block}
 
 === FILINGS CONTEXT ===
@@ -238,82 +238,45 @@ def _build_essay_prompt(
 {risk_block}
 
 === WRITING INSTRUCTIONS ===
-Write an institutional-quality investment memo of {_TARGET_WORDS_MIN}-{_TARGET_WORDS_SOFT_MAX} words, structured as follows:
+Write an institutional-quality investment memo of {_TARGET_WORDS_MIN}-{_TARGET_WORDS_SOFT_MAX} words. The memo must read like a committee-ready document, not a data dump. Structure it as follows:
 
-1. **Executive Summary** (1 short paragraph). State the direction of the thesis, the core reason, and the single biggest risk.
+1. **Executive Summary** (2-3 sentences). Open with a single clear thesis statement in this form: "[TICKER] is [quality assessment], but at current valuation [return expectation] unless [key condition]." Follow with the single biggest risk and the single strongest catalyst.
 
-2. **Business & Financial Performance** (2-3 paragraphs). Interpret the metrics. Discuss revenue growth, margin trajectory, cash conversion, ROIC, and leverage. Connect numbers to what they imply about the business — e.g. rising debt/EBITDA combined with shrinking margins suggests operating leverage is breaking down; high OCF/NI ratio indicates accounting quality. Reference specific values.
+2. **Business & Financial Performance** (2-3 paragraphs). Interpret the metrics as a connected story about the business, not a list of numbers. For each metric you cite, explain what it implies — e.g. "Gross margin of X% alongside operating margin of Y% implies operating expenses consume Z percentage points, which is [high/low/typical] for [industry context]." Discuss revenue growth trajectory, margin health, cash conversion quality, and capital efficiency (ROIC). If any metric is missing, note it briefly and move on — do not dwell on data gaps.
 
-3. **Valuation & Capital Allocation** (1-2 paragraphs). Interpret P/E, EV/EBITDA, and FCF yield relative to typical ranges. Is the stock cheap or expensive given the growth and quality profile? Reference specific values.
+3. **Valuation** (1-2 paragraphs). State the actual P/E, forward P/E, and EV/EBITDA from the data. Compare them against reasonable benchmarks — the S&P 500 average (~20-22x trailing P/E), the sector, or the company's own historical range. State clearly whether the stock looks cheap, fair, or expensive for its quality and growth profile, and why. If a valuation metric is unavailable, say so in one sentence and base the assessment on what IS available (e.g. FCF yield alone). Never infer or reconstruct unavailable multiples.
 
-4. **Filings & Management Signal** (1 paragraph). Comment on management tone, red flags, and any notable risk-factor disclosures from the 10-K / 10-Q / 8-K. If tone diverges from numbers, flag the tension.
+4. **Filings & Management Signal** (1 paragraph). If filings were analyzed, comment on management tone and notable disclosures. If no filings were retrieved, state that in one sentence and move on — do not write speculative analysis from an empty data set.
 
-5. **Macro & Industry Context** (1 paragraph). How do current recession probability, VIX level, yield curve, and rate backdrop affect the setup? Be specific about which macro variables matter most for this business.
+5. **Macro & Industry Context** (1 paragraph). Connect specific macro variables (recession probability, VIX, yield curve, rates) to this specific company's exposure. For example: "A fed funds rate of X% pressures consumer discretionary demand, but [TICKER]'s services mix provides partial insulation." If macro data is absent, say so briefly and move on.
 
-6. **Risks & Counter-Arguments** (1 paragraph). Spell out the key risks. If any risk flag contradicts the heuristic verdict, explain which evidence should carry more weight and why.
+6. **Risks** (1 paragraph). Rank the top 3 risks from most to least impactful. For each: name it specifically (e.g. "iPhone demand slowdown in China" not "revenue growth risk"), explain the transmission mechanism to earnings or stock price, and note what data you would watch to see it materializing.
 
-7. **Conclusion & Outlook** (1 short paragraph). Restate the 1-year outlook. Identify the one or two catalysts or data points that would change the thesis.
+7. **Catalysts** (1 short paragraph). List 2-3 specific catalysts that could drive upside, with rough timing if possible (e.g. "next earnings report", "product launch cycle", "buyback acceleration").
+
+8. **Verdict** (2-3 sentences). Deliver a clear, decisive recommendation: BUY, HOLD, or AVOID at current levels. State the one-year return expectation qualitatively (strong upside / modest upside / flat / downside). Name the single data point that would change this verdict.
 
 STYLE RULES:
-- Write in fluent prose paragraphs. No bullet points inside sections (section headers are fine).
-- Every quantitative claim must cite a number from the context above. If a metric is marked "(not available in data)", say so in the essay — never infer, estimate, or reconstruct unavailable metrics from other numbers. P/E and EV/EBITDA cannot be derived from margins or FCF.
-- If a data section is marked with ⚠ DATA GAP, acknowledge the gap in the corresponding essay section. Do not write credible-sounding analysis from a data gap.
-- Discuss both positives and negatives. A memo that only says good things or only says bad things is not credible.
-- If the heuristic verdict shows a signal tension (e.g. bullish outlook + flat direction), address it directly: explain what is causing it and which signal carries more weight for the investor.
-- Do not repeat the heuristic bias scores verbatim — translate them into plain analytical language.
-- Do not use generic filler like "as we move forward" or "in today's market". Every sentence must say something specific about {ticker}.
-- Bullish and bearish are return expectations. If the thesis is bullish but price direction is flat, you MUST reconcile these — "bullish quality but constrained near-term return" is a valid position; silently calling both true without explanation is not.
+- Prose paragraphs only. No bullet points anywhere except in Risks and Catalysts where ranking is essential.
+- Every quantitative claim must cite a specific number from the context. If a metric is unavailable, acknowledge it in ONE sentence then move on. Never repeat data-gap warnings.
+- If the heuristic shows a signal tension (bullish outlook + flat direction), reconcile it in the Executive Summary: typically "high business quality but stretched valuation" or "strong fundamentals dampened by elevated risk."
+- Do not use hedge-speak ("it could be argued", "one might consider"). Take positions and explain why.
+- The thesis in the Executive Summary and the verdict in the Conclusion must be logically consistent. If the business is strong but the stock is expensive, say "HOLD" or "AVOID" — not "bullish."
+- Do not repeat heuristic bias scores verbatim. Do not use generic filler.
 
 Now write the memo."""
 
 
 def _format_thesis_block(thesis: Dict[str, Any]) -> str:
-    """Compact rendering of the heuristic verdict.
-
-    Explicitly flags internal contradictions (e.g. bullish outlook but flat
-    price direction) so the LLM is forced to address the tension rather than
-    blindly repeating both labels.
-    """
+    """Compact rendering of the heuristic verdict."""
     if not thesis:
         return "(no heuristic verdict available)"
-
-    outlook = thesis.get("outlook", "neutral")
-    direction = thesis.get("price_direction", "flat")
-    confidence = thesis.get("confidence", 0.5)
-    bias = thesis.get("bias_score", 0.0)
-
     parts = [
-        f"Outlook: {outlook}",
-        f"Price direction (1Y): {direction}",
-        f"Confidence: {confidence:.2f}",
-        f"Bias score (composite, [-1,+1]): {bias:+.2f}",
+        f"Outlook: {thesis.get('outlook', 'neutral')}",
+        f"Price direction (1Y): {thesis.get('price_direction', 'flat')}",
+        f"Confidence: {thesis.get('confidence', 0.5):.2f}",
+        f"Bias score: {thesis.get('bias_score', 0.0):+.2f}",
     ]
-
-    # Detect the outlook/direction mismatch that plagued the AAPL essay.
-    # Bullish outlook should imply at least moderate_up; bearish should imply
-    # at least moderate_down.  If there is a gap, flag it explicitly so the
-    # model cannot pretend it isn't there.
-    mismatch = False
-    if outlook == "bullish" and direction in ("flat", "moderate_down", "strong_down"):
-        parts.append(
-            "⚠ INTERNAL SIGNAL TENSION: outlook is bullish but price direction "
-            f"is '{direction}'. This often means the fundamental score is positive "
-            "but a HIGH risk dampener compressed the final bias below the "
-            "moderate_up threshold. You MUST address this tension explicitly in "
-            "the Risks section — do not simultaneously call the thesis bullish "
-            "and the return expectation flat without explaining why."
-        )
-        mismatch = True
-    elif outlook == "bearish" and direction in ("flat", "moderate_up", "strong_up"):
-        parts.append(
-            "⚠ INTERNAL SIGNAL TENSION: outlook is bearish but price direction "
-            f"is '{direction}'. Address this contradiction explicitly."
-        )
-        mismatch = True
-
-    if not mismatch:
-        parts.append("Outlook and direction are internally consistent.")
-
     risks = thesis.get("key_risks") or []
     opps = thesis.get("key_opportunities") or []
     if risks:
@@ -324,13 +287,7 @@ def _format_thesis_block(thesis: Dict[str, Any]) -> str:
 
 
 def _format_metrics_block(metrics: Dict[str, Any]) -> str:
-    """Render metrics as labelled lines, omitting missing values.
-
-    Crucially: missing valuation multiples (P/E, EV/EBITDA) are rendered
-    as explicit "(not available in data)" lines rather than simply being
-    omitted.  This prevents the LLM from 'inferring' multiples from margins
-    and FCF — an analytically unsound move the AAPL essay was caught doing.
-    """
+    """Render metrics as labelled lines, omitting missing values."""
     if not metrics:
         return "(no metrics available)"
 
@@ -351,7 +308,7 @@ def _format_metrics_block(metrics: Dict[str, Any]) -> str:
         v = _as_float(x)
         if v is not None:
             return f"{v:.2f}x"
-        return f"(not available in data — do NOT infer or estimate {label})"
+        return f"(not available — do NOT infer {label})"
 
     rows: List[tuple] = [
         ("Revenue growth (3Y CAGR)", _pct(metrics.get("revenue_growth_3y"))),
@@ -363,8 +320,9 @@ def _format_metrics_block(metrics: Dict[str, Any]) -> str:
         ("Debt / EBITDA", _ratio(metrics.get("debt_ebitda"))),
         ("Net debt / EBITDA", _ratio(metrics.get("net_debt_ebitda"))),
         ("Interest coverage (EBIT / Interest)", _ratio(metrics.get("interest_coverage"))),
-        # Valuation multiples — always rendered, missing = explicit warning
-        ("P / E", _ratio_required(metrics.get("p_e"), "P/E")),
+        # Valuation: always rendered, missing = explicit instruction
+        ("P / E (trailing)", _ratio_required(metrics.get("p_e"), "P/E")),
+        ("P / E (forward)", _ratio_required(metrics.get("forward_pe"), "forward P/E")),
         ("EV / EBITDA", _ratio_required(metrics.get("ev_ebitda"), "EV/EBITDA")),
         ("FCF yield", _pct(metrics.get("fcf_yield"))),
         ("Cash conversion (OCF / NI)", _ratio(metrics.get("cash_conversion"))),
@@ -382,18 +340,9 @@ def _format_metrics_block(metrics: Dict[str, Any]) -> str:
 
 
 def _format_filings_block(filings_summary: Dict[str, Any]) -> str:
-    """Render the filings summary: count, tone, years covered, red flags, risks.
-
-    When filings_considered == 0, emits an explicit data-gap warning so the
-    LLM cannot write a credible-sounding filings paragraph from nothing.
-    """
+    """Render the filings summary: count, tone, years covered, red flags, risks."""
     if not filings_summary:
-        return (
-            "⚠ DATA GAP: No filings data available. "
-            "You MUST state in the Filings section that no filings were "
-            "retrieved and that any management-tone or disclosure claims "
-            "are unsupported."
-        )
+        return "(no filings data)"
 
     considered = filings_summary.get("filings_considered", 0)
     tone = filings_summary.get("management_tone", "neutral")
@@ -402,20 +351,13 @@ def _format_filings_block(filings_summary: Dict[str, Any]) -> str:
     by_year = filings_summary.get("by_year") or {}
     prose_summary = filings_summary.get("summary") or ""
 
-    if considered == 0:
-        return (
-            "⚠ DATA GAP: filings_considered = 0. The pipeline fetched no "
-            "SEC filings for this ticker. The Filings & Management Signal "
-            "section of the memo MUST acknowledge this gap explicitly — "
-            "do not invent tone assessments or disclosure commentary."
-        )
-
     lines: List[str] = [
         f"Filings considered: {considered}",
-        f"Management tone (inferred from filing text): {tone}",
+        f"Management tone: {tone}",
     ]
 
     if by_year:
+        # Most recent first, list form counts e.g. "2024: 1x 10-K, 2x 10-Q, 1x 8-K"
         year_lines: List[str] = []
         for year in sorted(by_year.keys(), reverse=True):
             info = by_year[year] or {}
@@ -434,8 +376,6 @@ def _format_filings_block(filings_summary: Dict[str, Any]) -> str:
         lines.append("Disclosure red flags:")
         for rf in red_flags[:_MAX_RED_FLAGS_IN_PROMPT]:
             lines.append(f"  - {rf}")
-    else:
-        lines.append("Disclosure red flags: none detected")
 
     if risk_factors:
         lines.append("Notable risk-factor language from filings:")
@@ -449,17 +389,9 @@ def _format_filings_block(filings_summary: Dict[str, Any]) -> str:
 
 
 def _format_macro_block(macro: Dict[str, Any]) -> str:
-    """Render the macro dashboard.
-
-    When macro data is entirely absent, emits a hard warning so the LLM
-    writes a placeholder-free macro paragraph instead of inventing signals.
-    """
+    """Render the macro dashboard."""
     if not macro:
-        return (
-            "⚠ DATA GAP: No macro data available. "
-            "The Macro section MUST acknowledge this gap rather than "
-            "discussing hypothetical macro conditions."
-        )
+        return "(no macro data)"
 
     def _pct(x: Any) -> Optional[str]:
         v = _as_float(x)
@@ -481,14 +413,7 @@ def _format_macro_block(macro: Dict[str, Any]) -> str:
         ("USD index (DXY)", _num(macro.get("dxy"))),
     ]
     lines = [f"- {label}: {value}" for label, value in rows if value is not None]
-
-    if not lines:
-        return (
-            "⚠ DATA GAP: Macro dict present but all fields are None. "
-            "The Macro section MUST acknowledge the absence of macro data."
-        )
-
-    return "\n".join(lines)
+    return "\n".join(lines) if lines else "(no macro data)"
 
 
 def _format_risk_block(risk_flags: Dict[str, Any]) -> str:
@@ -548,8 +473,8 @@ def _call_ollama_text(prompt: str, model_name: str, config: Any) -> str:
     # Essays need a longer timeout than structured JSON calls. Override the
     # default if the user hasn't set a specifically long one. 180s is generous
     # for a 30B model running partially on CPU.
-    if timeout < 180:
-        timeout = 180.0
+    if timeout < 360:
+        timeout = 360.0
     max_tokens = int(getattr(config, "MAX_TOKENS", 4096))
 
     body = {
