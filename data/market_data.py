@@ -31,9 +31,103 @@ logger = logging.getLogger(__name__)
 class MarketData:
     """Yahoo Finance data with SQLite caching and technical analysis."""
 
-    def __init__(self, db_path: str = "data/hedgefund.db"):
+    def __init__(self, db_path: str = "data/hedgefund.db", registry=None):
         self.db_path = db_path
+        self._registry = registry
         self._init_db()
+        self._init_extended_db()
+        self._register_sources()
+
+    # ------------------------------------------------------------------
+    # Registry plumbing
+    # ------------------------------------------------------------------
+    @property
+    def registry(self):
+        if self._registry is None:
+            try:
+                from data.data_registry import get_default_registry
+                self._registry = get_default_registry(self.db_path)
+            except Exception as e:  # noqa: BLE001
+                logger.warning("market_data | could not load data_registry: %s", e)
+        return self._registry
+
+    def _register_sources(self) -> None:
+        reg = self.registry
+        if reg is None:
+            return
+        try:
+            reg.register_source("yfinance", "price", "hourly", base_priority=2,
+                                notes="Yahoo Finance prices/options/info")
+            reg.register_source("finra",    "short", "daily", base_priority=1,
+                                notes="FINRA short sale volume")
+            reg.register_source("ibkr_scrape", "borrow", "hourly", base_priority=3,
+                                notes="IBKR shortable shares (scrape, brittle)")
+            reg.register_source("issuer_csv", "etf", "daily", base_priority=2,
+                                notes="ETF issuer holdings CSVs")
+        except Exception as e:  # noqa: BLE001
+            logger.debug("market_data | source registration skipped: %s", e)
+
+    def _init_extended_db(self) -> None:
+        """Raw tables for options, short interest, borrow, ETF holdings."""
+        with sqlite3.connect(self.db_path) as conn:
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS options_chain (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    ticker TEXT NOT NULL,
+                    fetched_at TEXT NOT NULL DEFAULT (datetime('now')),
+                    expiry TEXT NOT NULL,
+                    option_type TEXT CHECK(option_type IN ('call','put')),
+                    strike REAL NOT NULL,
+                    last_price REAL,
+                    bid REAL, ask REAL,
+                    volume INTEGER, open_interest INTEGER,
+                    implied_volatility REAL,
+                    in_the_money INTEGER,
+                    UNIQUE(ticker, expiry, option_type, strike, fetched_at)
+                )
+            """)
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_opt_ticker ON options_chain(ticker, expiry)")
+
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS short_interest (
+                    ticker TEXT NOT NULL,
+                    as_of TEXT NOT NULL,
+                    short_interest REAL,
+                    short_pct_float REAL,
+                    days_to_cover REAL,
+                    avg_volume REAL,
+                    source TEXT,
+                    fetched_at TEXT NOT NULL DEFAULT (datetime('now')),
+                    PRIMARY KEY (ticker, as_of, source)
+                )
+            """)
+
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS borrow_data (
+                    ticker TEXT NOT NULL,
+                    as_of TEXT NOT NULL,
+                    borrow_fee_bps REAL,
+                    shares_available REAL,
+                    source TEXT,
+                    fetched_at TEXT NOT NULL DEFAULT (datetime('now')),
+                    PRIMARY KEY (ticker, as_of, source)
+                )
+            """)
+
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS etf_holdings (
+                    etf_ticker TEXT NOT NULL,
+                    holding_ticker TEXT NOT NULL,
+                    weight REAL,
+                    shares REAL,
+                    market_value REAL,
+                    as_of TEXT NOT NULL,
+                    source TEXT,
+                    fetched_at TEXT NOT NULL DEFAULT (datetime('now')),
+                    PRIMARY KEY (etf_ticker, holding_ticker, as_of)
+                )
+            """)
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_etfh_holding ON etf_holdings(holding_ticker)")
 
     # ------------------------------------------------------------------
     # Database
@@ -631,6 +725,455 @@ class MarketData:
                 """,
                 (ticker, json.dumps(data, default=str)),
             )
+
+
+    # ==================================================================
+    # === EXTENDED API: options, short interest, borrow, ETFs, registry sync ===
+    # ==================================================================
+
+    # ------------------------------------------------------------------
+    # Options chains and derived IV / put-call / unusual activity
+    # ------------------------------------------------------------------
+    def get_options_chain(self, ticker: str, max_expiries: int = 4) -> dict:
+        """Pull option chains for the next ``max_expiries`` expirations.
+
+        Returns a dict with one entry per expiry containing puts and calls
+        DataFrames plus computed ATM IV and put/call ratio.
+        """
+        ticker = ticker.upper()
+        t = yf.Ticker(ticker)
+        try:
+            expiries = list(t.options or [])[:max_expiries]
+        except Exception as e:  # noqa: BLE001
+            logger.warning("options | %s | could not list expiries: %s", ticker, e)
+            return {}
+        if not expiries:
+            return {}
+
+        spot = self._spot_price_safe(ticker, t)
+        out: dict = {"ticker": ticker, "spot": spot, "expiries": {}}
+
+        rows_to_cache: list[tuple] = []
+        for exp in expiries:
+            try:
+                chain = t.option_chain(exp)
+            except Exception as e:  # noqa: BLE001
+                logger.debug("options | %s | %s skipped: %s", ticker, exp, e)
+                continue
+            calls = chain.calls
+            puts = chain.puts
+            if calls is None or puts is None:
+                continue
+            atm_iv_call = self._atm_iv(calls, spot)
+            atm_iv_put = self._atm_iv(puts, spot)
+            atm_iv = (
+                (atm_iv_call + atm_iv_put) / 2
+                if atm_iv_call is not None and atm_iv_put is not None
+                else (atm_iv_call or atm_iv_put)
+            )
+            put_vol = float(puts["volume"].fillna(0).sum()) if "volume" in puts else 0.0
+            call_vol = float(calls["volume"].fillna(0).sum()) if "volume" in calls else 0.0
+            put_call_ratio = (put_vol / call_vol) if call_vol > 0 else None
+
+            # Unusual activity z-score: max(volume / open_interest)
+            ua_score = self._unusual_activity_score(pd.concat([calls, puts], ignore_index=True))
+
+            out["expiries"][exp] = {
+                "atm_iv": atm_iv,
+                "put_volume": put_vol,
+                "call_volume": call_vol,
+                "put_call_ratio": put_call_ratio,
+                "unusual_activity": ua_score,
+                "n_calls": len(calls),
+                "n_puts": len(puts),
+            }
+
+            for df_, otype in ((calls, "call"), (puts, "put")):
+                for _, r in df_.iterrows():
+                    rows_to_cache.append((
+                        ticker, exp, otype,
+                        float(r.get("strike", 0)),
+                        float(r.get("lastPrice", 0) or 0),
+                        float(r.get("bid", 0) or 0),
+                        float(r.get("ask", 0) or 0),
+                        int(r.get("volume", 0) or 0),
+                        int(r.get("openInterest", 0) or 0),
+                        float(r.get("impliedVolatility", 0) or 0),
+                        int(bool(r.get("inTheMoney", False))),
+                    ))
+
+        # Bulk insert with current timestamp grouped under the same fetched_at
+        if rows_to_cache:
+            now = datetime.now().isoformat(timespec="seconds")
+            with sqlite3.connect(self.db_path) as conn:
+                conn.executemany(
+                    """INSERT OR IGNORE INTO options_chain
+                        (ticker, expiry, option_type, strike, last_price, bid, ask,
+                         volume, open_interest, implied_volatility, in_the_money, fetched_at)
+                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                    [(*r, now) for r in rows_to_cache],
+                )
+
+        # Compute term-structure summary and write to registry
+        self._write_options_aggregates(ticker, out)
+        return out
+
+    def _spot_price_safe(self, ticker: str, t=None) -> Optional[float]:
+        try:
+            if t is None:
+                t = yf.Ticker(ticker)
+            info = getattr(t, "info", {}) or {}
+            return float(info.get("regularMarketPrice") or info.get("currentPrice") or 0) or None
+        except Exception:  # noqa: BLE001
+            return None
+
+    @staticmethod
+    def _atm_iv(df: pd.DataFrame, spot: Optional[float]) -> Optional[float]:
+        if df is None or len(df) == 0 or spot in (None, 0):
+            return None
+        if "strike" not in df or "impliedVolatility" not in df:
+            return None
+        # Closest strike to spot
+        idx = (df["strike"] - spot).abs().idxmin()
+        iv = df.loc[idx, "impliedVolatility"]
+        try:
+            iv = float(iv)
+        except (TypeError, ValueError):
+            return None
+        return iv if iv > 0 else None
+
+    @staticmethod
+    def _unusual_activity_score(df: pd.DataFrame) -> Optional[float]:
+        """Max ratio of volume to open_interest across the chain. Above ~3
+        is loosely 'unusual'."""
+        if df is None or len(df) == 0:
+            return None
+        if "volume" not in df or "openInterest" not in df:
+            return None
+        oi = df["openInterest"].replace(0, np.nan)
+        ratio = (df["volume"].fillna(0) / oi).replace([np.inf, -np.inf], np.nan)
+        if ratio.dropna().empty:
+            return None
+        return float(ratio.max())
+
+    def _write_options_aggregates(self, ticker: str, chain: dict) -> None:
+        """Compute IV term structure (30/60/90d), p/c ratio, UA, and push
+        into the data_registry."""
+        if self.registry is None or not chain.get("expiries"):
+            return
+
+        # Find expiries closest to 30/60/90 days
+        today = datetime.now().date()
+        targets = {30: None, 60: None, 90: None}
+        for exp_str, summary in chain["expiries"].items():
+            try:
+                exp_dt = datetime.strptime(exp_str, "%Y-%m-%d").date()
+            except ValueError:
+                continue
+            days = (exp_dt - today).days
+            for tgt in list(targets.keys()):
+                cur = targets[tgt]
+                if cur is None or abs(days - tgt) < abs(cur[1] - tgt):
+                    if summary.get("atm_iv"):
+                        targets[tgt] = (summary["atm_iv"], days)
+
+        as_of = datetime.now().isoformat(timespec="seconds")
+        if targets[30]:
+            self.registry.upsert_point(
+                ticker, "ticker", "ticker.options.iv_30d",
+                as_of=as_of, source_id="yfinance",
+                value_num=float(targets[30][0]), confidence=0.85,
+            )
+        if targets[60]:
+            self.registry.upsert_point(
+                ticker, "ticker", "ticker.options.iv_60d",
+                as_of=as_of, source_id="yfinance",
+                value_num=float(targets[60][0]), confidence=0.85,
+            )
+        if targets[90]:
+            self.registry.upsert_point(
+                ticker, "ticker", "ticker.options.iv_90d",
+                as_of=as_of, source_id="yfinance",
+                value_num=float(targets[90][0]), confidence=0.85,
+            )
+        if targets[30] and targets[90]:
+            slope = float(targets[90][0]) - float(targets[30][0])
+            self.registry.upsert_point(
+                ticker, "ticker", "ticker.options.iv_term_slope",
+                as_of=as_of, source_id="derived",
+                value_num=slope, confidence=0.85,
+            )
+
+        # Aggregate p/c ratio across expiries (volume-weighted)
+        total_put = sum(e.get("put_volume", 0) for e in chain["expiries"].values())
+        total_call = sum(e.get("call_volume", 0) for e in chain["expiries"].values())
+        if total_call > 0:
+            self.registry.upsert_point(
+                ticker, "ticker", "ticker.options.put_call_ratio",
+                as_of=as_of, source_id="yfinance",
+                value_num=float(total_put / total_call), confidence=0.85,
+            )
+
+        # Highest UA across expiries
+        ua_vals = [e.get("unusual_activity") for e in chain["expiries"].values()
+                   if e.get("unusual_activity") is not None]
+        if ua_vals:
+            self.registry.upsert_point(
+                ticker, "ticker", "ticker.options.unusual_activity",
+                as_of=as_of, source_id="derived",
+                value_num=float(max(ua_vals)), confidence=0.7,
+            )
+
+    # ------------------------------------------------------------------
+    # Short interest
+    # ------------------------------------------------------------------
+    def get_short_interest(self, ticker: str) -> dict:
+        """Read short interest from yfinance ``info``. FINRA's true bi-monthly
+        figures would be more authoritative; this is the best free fallback.
+        """
+        ticker = ticker.upper()
+        try:
+            info = yf.Ticker(ticker).info or {}
+        except Exception as e:  # noqa: BLE001
+            logger.warning("short_interest | %s | yfinance error: %s", ticker, e)
+            return {}
+        si = info.get("sharesShort")
+        si_pct_float = info.get("shortPercentOfFloat")
+        avg_vol = info.get("averageVolume10days") or info.get("averageVolume")
+        days_to_cover = info.get("shortRatio")
+        as_of = info.get("dateShortInterest")
+        if isinstance(as_of, (int, float)):
+            try:
+                as_of = datetime.utcfromtimestamp(int(as_of)).strftime("%Y-%m-%d")
+            except (OSError, ValueError):
+                as_of = None
+        if not as_of:
+            as_of = datetime.now().strftime("%Y-%m-%d")
+
+        result = {
+            "ticker": ticker,
+            "as_of": as_of,
+            "short_interest": float(si) if si else None,
+            "short_pct_float": float(si_pct_float) if si_pct_float else None,
+            "days_to_cover": float(days_to_cover) if days_to_cover else None,
+            "avg_volume": float(avg_vol) if avg_vol else None,
+        }
+
+        # Cache raw row
+        with sqlite3.connect(self.db_path) as conn:
+            conn.execute(
+                """INSERT OR REPLACE INTO short_interest
+                    (ticker, as_of, short_interest, short_pct_float,
+                     days_to_cover, avg_volume, source)
+                    VALUES (?, ?, ?, ?, ?, ?, 'yfinance')""",
+                (ticker, as_of, result["short_interest"], result["short_pct_float"],
+                 result["days_to_cover"], result["avg_volume"]),
+            )
+
+        # Push to registry
+        if self.registry:
+            if result["short_pct_float"] is not None:
+                self.registry.upsert_point(
+                    ticker, "ticker", "ticker.short.interest_pct_float",
+                    as_of=as_of, source_id="yfinance",
+                    value_num=float(result["short_pct_float"]), confidence=0.8,
+                )
+            if result["days_to_cover"] is not None:
+                self.registry.upsert_point(
+                    ticker, "ticker", "ticker.short.days_to_cover",
+                    as_of=as_of, source_id="yfinance",
+                    value_num=float(result["days_to_cover"]), confidence=0.8,
+                )
+        return result
+
+    # ------------------------------------------------------------------
+    # Borrow data (best-effort)
+    # ------------------------------------------------------------------
+    def set_borrow_data(
+        self,
+        ticker: str,
+        borrow_fee_bps: Optional[float] = None,
+        shares_available: Optional[float] = None,
+        source: str = "ibkr_scrape",
+        as_of: Optional[str] = None,
+    ) -> None:
+        """Externally-supplied borrow data point. The IBKR public availability
+        page (or a TWS API hook) is the typical caller. We don't try to scrape
+        it ourselves here because the page format changes frequently — this
+        keeps the borrow ingestion contract clean and lets the caller swap
+        sources without touching this file.
+        """
+        ticker = ticker.upper()
+        as_of = as_of or datetime.now().isoformat(timespec="seconds")
+        with sqlite3.connect(self.db_path) as conn:
+            conn.execute(
+                """INSERT OR REPLACE INTO borrow_data
+                    (ticker, as_of, borrow_fee_bps, shares_available, source)
+                   VALUES (?, ?, ?, ?, ?)""",
+                (ticker, as_of, borrow_fee_bps, shares_available, source),
+            )
+        if self.registry:
+            if borrow_fee_bps is not None:
+                self.registry.upsert_point(
+                    ticker, "ticker", "ticker.short.borrow_fee_bps",
+                    as_of=as_of, source_id=source,
+                    value_num=float(borrow_fee_bps), confidence=0.4,
+                )
+            if shares_available is not None:
+                self.registry.upsert_point(
+                    ticker, "ticker", "ticker.short.borrow_available",
+                    as_of=as_of, source_id=source,
+                    value_num=float(shares_available), confidence=0.4,
+                )
+
+    # ------------------------------------------------------------------
+    # ETF holdings (used downstream by sector heatmap + ETF overlap)
+    # ------------------------------------------------------------------
+    def set_etf_holdings(
+        self,
+        etf_ticker: str,
+        holdings: list[dict],
+        as_of: Optional[str] = None,
+        source: str = "issuer_csv",
+    ) -> int:
+        """Upsert ETF holdings rows. ``holdings`` is a list of dicts with
+        keys: ``ticker``, ``weight``, optional ``shares``, ``market_value``.
+
+        We accept holdings from any caller (issuer CSVs, yfinance funds_data,
+        manual lists). This keeps the file dependency-light.
+        """
+        etf_ticker = etf_ticker.upper()
+        as_of = as_of or datetime.now().strftime("%Y-%m-%d")
+        n = 0
+        with sqlite3.connect(self.db_path) as conn:
+            for h in holdings:
+                tk = (h.get("ticker") or "").upper()
+                if not tk:
+                    continue
+                conn.execute(
+                    """INSERT OR REPLACE INTO etf_holdings
+                        (etf_ticker, holding_ticker, weight, shares, market_value,
+                         as_of, source)
+                       VALUES (?, ?, ?, ?, ?, ?, ?)""",
+                    (etf_ticker, tk, h.get("weight"),
+                     h.get("shares"), h.get("market_value"),
+                     as_of, source),
+                )
+                n += 1
+        return n
+
+    def get_etf_overlap_for_ticker(self, ticker: str) -> list[dict]:
+        """Return the list of ETFs that hold a given ticker, ordered by weight."""
+        ticker = ticker.upper()
+        with sqlite3.connect(self.db_path) as conn:
+            conn.row_factory = sqlite3.Row
+            rows = conn.execute(
+                """SELECT etf_ticker, weight, market_value, as_of
+                     FROM etf_holdings WHERE holding_ticker = ?
+                  ORDER BY weight DESC NULLS LAST""",
+                (ticker,),
+            ).fetchall()
+        return [dict(r) for r in rows]
+
+    # ------------------------------------------------------------------
+    # Push prices + technicals into registry
+    # ------------------------------------------------------------------
+    def sync_prices_to_registry(
+        self, ticker: str, period: str = "6mo"
+    ) -> int:
+        """Pull recent prices and write the daily close + volume points
+        into ``data_points``. Returns rows written."""
+        ticker = ticker.upper()
+        df = self.get_prices(ticker, period=period, use_cache=True)
+        if df.empty or self.registry is None:
+            return 0
+        rows = []
+        for date, r in df.iterrows():
+            d = date.strftime("%Y-%m-%d") if hasattr(date, "strftime") else str(date)
+            for field, key in (
+                ("ticker.price.close", "Close"),
+                ("ticker.price.adj_close", "Close"),
+                ("ticker.price.volume", "Volume"),
+                ("ticker.price.high", "High"),
+                ("ticker.price.low", "Low"),
+                ("ticker.price.open", "Open"),
+            ):
+                val = r.get(key)
+                if pd.isna(val) or val is None:
+                    continue
+                rows.append({
+                    "entity_id": ticker, "entity_type": "ticker",
+                    "field": field, "as_of": d, "source_id": "yfinance",
+                    "value_num": float(val), "confidence": 0.9,
+                })
+        return self.registry.upsert_points_bulk(rows)
+
+    def sync_technicals_to_registry(self, ticker: str) -> int:
+        """Compute technicals and push the latest signal values to registry."""
+        if self.registry is None:
+            return 0
+        tech = self.get_technicals(ticker)
+        if not tech:
+            return 0
+        as_of = datetime.now().strftime("%Y-%m-%d")
+        n = 0
+        mapping = (
+            ("ticker.signal.rsi_14",  tech.get("rsi_14")),
+            ("ticker.signal.atr_14",  tech.get("atr_14")),
+            ("ticker.signal.sma_50",  tech.get("sma_50")),
+            ("ticker.signal.sma_200", tech.get("sma_200")),
+            ("ticker.signal.macd_hist", tech.get("macd", {}).get("histogram")),
+        )
+        for field, value in mapping:
+            if value is None or (isinstance(value, float) and np.isnan(value)):
+                continue
+            self.registry.upsert_point(
+                ticker.upper(), "ticker", field,
+                as_of=as_of, source_id="derived",
+                value_num=float(value), confidence=1.0,
+            )
+            n += 1
+
+        # Regime label
+        sig = tech.get("signal", {}).get("overall")
+        if sig:
+            regime = ("BULL" if "BULLISH" in sig
+                      else "BEAR" if "BEARISH" in sig
+                      else "CHOP")
+            self.registry.upsert_point(
+                ticker.upper(), "ticker", "ticker.signal.regime",
+                as_of=as_of, source_id="derived",
+                value_text=regime, confidence=1.0,
+            )
+            n += 1
+        return n
+
+    def refresh_ticker_market(self, ticker: str) -> dict[str, int]:
+        """Run all extended market fetches for one ticker."""
+        out: dict[str, int] = {}
+        try:
+            out["prices"] = self.sync_prices_to_registry(ticker, period="6mo")
+        except Exception as e:  # noqa: BLE001
+            logger.warning("market refresh | %s | prices failed: %s", ticker, e)
+            out["prices"] = 0
+        try:
+            self.get_options_chain(ticker)
+            out["options"] = 1
+        except Exception as e:  # noqa: BLE001
+            logger.warning("market refresh | %s | options failed: %s", ticker, e)
+            out["options"] = 0
+        try:
+            self.get_short_interest(ticker)
+            out["short"] = 1
+        except Exception as e:  # noqa: BLE001
+            logger.warning("market refresh | %s | short failed: %s", ticker, e)
+            out["short"] = 0
+        try:
+            out["technicals"] = self.sync_technicals_to_registry(ticker)
+        except Exception as e:  # noqa: BLE001
+            logger.warning("market refresh | %s | technicals failed: %s", ticker, e)
+            out["technicals"] = 0
+        return out
 
 
 # ---------------------------------------------------------------------------

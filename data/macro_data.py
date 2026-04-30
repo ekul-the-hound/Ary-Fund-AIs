@@ -97,6 +97,7 @@ class MacroData:
         self,
         api_key: Optional[str] = None,
         db_path: str = "data/hedgefund.db",
+        registry=None,
     ):
         self.api_key = api_key or os.getenv("FRED_API_KEY", "")
         if not self.api_key:
@@ -106,7 +107,34 @@ class MacroData:
                 "and set FRED_API_KEY environment variable."
             )
         self.db_path = db_path
+        self._registry = registry
         self._init_db()
+        self._register_sources()
+
+    # ------------------------------------------------------------------
+    # Registry plumbing
+    # ------------------------------------------------------------------
+    @property
+    def registry(self):
+        if self._registry is None:
+            try:
+                from data.data_registry import get_default_registry
+                self._registry = get_default_registry(self.db_path)
+            except Exception as e:  # noqa: BLE001
+                logger.warning("macro_data | could not load data_registry: %s", e)
+        return self._registry
+
+    def _register_sources(self) -> None:
+        reg = self.registry
+        if reg is None:
+            return
+        try:
+            reg.register_source("fred", "macro", "daily", base_priority=1,
+                                notes="St. Louis Fed FRED API")
+            reg.register_source("cboe", "macro", "daily", base_priority=2,
+                                notes="CBOE indices via yfinance proxy")
+        except Exception as e:  # noqa: BLE001
+            logger.debug("macro_data | source registration skipped: %s", e)
 
     # ------------------------------------------------------------------
     # Database
@@ -550,6 +578,153 @@ class MacroData:
                 """,
                 (series_id, datetime.now().isoformat()),
             )
+    # ==================================================================
+    # === EXTENDED API: VIX term structure, credit spreads, sentiment ===
+    # ==================================================================
+
+    EXTENDED_FRED_MAP: dict[str, tuple[str, float]] = {
+        "VIXCLS":              ("global.vix",                 1.0),
+        "VXVCLS":              ("global.vix_3m",              1.0),
+        "BAMLH0A0HYM2":        ("global.hy_oas",              1.0),
+        "BAMLC0A0CM":          ("global.ig_oas",              1.0),
+        "RECPROUSM156N":       ("global.recession_prob",      1.0),
+        "UMCSENT":             ("global.consumer_sentiment",  1.0),
+        "STLFSI4":             ("global.financial_stress",    1.0),
+        "T10Y2Y":              ("global.yield_curve_2y10y",   1.0),
+    }
+
+    def get_vix_term_structure(self) -> dict:
+        """Fetch VIX, VIX3M and compute term-structure slope. Ratio < 1
+        signals stress (backwardation).
+        """
+        out = {"as_of": datetime.now().strftime("%Y-%m-%d"),
+               "vix": None, "vix_3m": None, "ratio_3m_1m": None}
+        try:
+            vix = self.get_series_latest("VIXCLS")
+            vix3m = self.get_series_latest("VXVCLS")
+        except Exception as e:  # noqa: BLE001
+            logger.warning("macro vix | failed: %s", e)
+            return out
+        out["vix"] = vix
+        out["vix_3m"] = vix3m
+        if vix and vix3m and vix > 0:
+            out["ratio_3m_1m"] = float(vix3m) / float(vix)
+        if self.registry:
+            today = out["as_of"]
+            if vix is not None:
+                self.registry.upsert_point(
+                    "global", "global", "global.vix",
+                    as_of=today, source_id="fred",
+                    value_num=float(vix), confidence=1.0,
+                )
+            if vix3m is not None:
+                self.registry.upsert_point(
+                    "global", "global", "global.vix_3m",
+                    as_of=today, source_id="fred",
+                    value_num=float(vix3m), confidence=1.0,
+                )
+            if out["ratio_3m_1m"] is not None:
+                self.registry.upsert_point(
+                    "global", "global", "global.vix_term_3m_1m",
+                    as_of=today, source_id="derived",
+                    value_num=float(out["ratio_3m_1m"]), confidence=1.0,
+                )
+        return out
+
+    def get_credit_spreads(self) -> dict:
+        """Fetch HY OAS and IG OAS (used as CDS proxy in stress scoring)."""
+        out = {"as_of": datetime.now().strftime("%Y-%m-%d")}
+        for fred_id, (field, conf) in [
+            ("BAMLH0A0HYM2", ("global.hy_oas", 1.0)),
+            ("BAMLC0A0CM",   ("global.ig_oas", 1.0)),
+        ]:
+            try:
+                val = self.get_series_latest(fred_id)
+            except Exception as e:  # noqa: BLE001
+                logger.warning("macro credit | %s failed: %s", fred_id, e)
+                continue
+            out[field] = val
+            if self.registry and val is not None:
+                self.registry.upsert_point(
+                    "global", "global", field,
+                    as_of=out["as_of"], source_id="fred",
+                    value_num=float(val), confidence=conf,
+                )
+        return out
+
+    def get_consumer_sentiment(self) -> dict:
+        """U-Mich sentiment + financial stress index (with FRED series fallbacks)."""
+        out = {"as_of": datetime.now().strftime("%Y-%m-%d")}
+        try:
+            cs = self.get_series_latest("UMCSENT")
+            out["consumer_sentiment"] = cs
+            if self.registry and cs is not None:
+                self.registry.upsert_point(
+                    "global", "global", "global.consumer_sentiment",
+                    as_of=out["as_of"], source_id="fred",
+                    value_num=float(cs), confidence=1.0,
+                )
+        except Exception as e:  # noqa: BLE001
+            logger.warning("macro sentiment | UMCSENT failed: %s", e)
+        for sid in ("STLFSI4", "STLFSI3", "STLFSI2"):
+            try:
+                fs = self.get_series_latest(sid)
+            except Exception:  # noqa: BLE001
+                continue
+            if fs is not None:
+                out["financial_stress"] = fs
+                if self.registry:
+                    self.registry.upsert_point(
+                        "global", "global", "global.financial_stress",
+                        as_of=out["as_of"], source_id="fred",
+                        value_num=float(fs), confidence=1.0,
+                    )
+                break
+        return out
+
+    def sync_macro_to_registry(self) -> int:
+        """Walk EXTENDED_FRED_MAP and push every series to the registry."""
+        if self.registry is None:
+            return 0
+        today = datetime.now().strftime("%Y-%m-%d")
+        n = 0
+        for fred_id, (field, conf) in self.EXTENDED_FRED_MAP.items():
+            try:
+                val = self.get_series_latest(fred_id)
+            except Exception as e:  # noqa: BLE001
+                logger.debug("sync_macro | %s failed: %s", fred_id, e)
+                continue
+            if val is None:
+                continue
+            self.registry.upsert_point(
+                "global", "global", field,
+                as_of=today, source_id="fred",
+                value_num=float(val), confidence=conf,
+            )
+            n += 1
+        try:
+            self.get_vix_term_structure()
+        except Exception:
+            pass
+        return n
+
+    def refresh_macro(self) -> dict[str, int]:
+        """High-level orchestrator. Returns rows written per section."""
+        out: dict[str, int] = {}
+        try:
+            out["fred_canonical"] = self.sync_macro_to_registry()
+        except Exception as e:  # noqa: BLE001
+            logger.warning("refresh_macro | fred sync failed: %s", e)
+            out["fred_canonical"] = 0
+        try:
+            self.get_credit_spreads(); out["credit"] = 1
+        except Exception as e:  # noqa: BLE001
+            logger.warning("refresh_macro | credit failed: %s", e); out["credit"] = 0
+        try:
+            self.get_consumer_sentiment(); out["sentiment"] = 1
+        except Exception as e:  # noqa: BLE001
+            logger.warning("refresh_macro | sentiment failed: %s", e); out["sentiment"] = 0
+        return out
 
 
 # ---------------------------------------------------------------------------

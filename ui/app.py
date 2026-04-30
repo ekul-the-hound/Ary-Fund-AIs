@@ -1168,8 +1168,8 @@ def main() -> None:
 
     render_ticker_header(ticker, prices, context)
 
-    tab_overview, tab_briefing, tab_debug = st.tabs(
-        ["📊 Overview", "📝 ARY QUANT Briefing", "🔍 Debug"]
+    tab_overview, tab_briefing, tab_analyzer, tab_debug = st.tabs(
+        ["📊 Overview", "📝 ARY QUANT Briefing", "🔍 Data-Point Analyzer", "🛠 Debug"]
     )
 
     # ---------------- Overview tab ----------------
@@ -1202,6 +1202,24 @@ def main() -> None:
     # ---------------- ARY QUANT Briefing tab ----------------
     with tab_briefing:
         render_briefing_tab(ticker, context)
+
+    # ---------------- Data-Point Analyzer tab ----------------
+    with tab_analyzer:
+        try:
+            from ui.data_point_analyzer_section import render_data_point_analyzer_section
+            render_data_point_analyzer_section(
+                ticker=ticker,
+                context=context,
+                config=app_config,
+            )
+        except ImportError as e:
+            st.error(
+                f"Data-Point Analyzer module not available: {e}. "
+                "Place `agent/data_point_analyzer.py` and "
+                "`ui/data_point_analyzer_section.py` in your project."
+            )
+        except Exception as e:
+            st.error(f"Analyzer section failed to render: {e}")
 
     # ---------------- Debug tab ----------------
     with tab_debug:
