@@ -130,10 +130,19 @@ def summarize_filings_by_year(
         logger.info("filing_analyzer.summarize | %s | no filings", ticker)
         return _empty_summary(ticker)
 
-    # Bucket by fiscal year (parsed from filing_date YYYY-MM-DD).
+    # Bucket by fiscal year.
+    # sec_fetcher.get_filings() writes "filed_date" and "filing_type";
+    # older callers and manual test fixtures may use "filing_date" and
+    # "form_type". Accept both so neither side needs to change.
+    def _get_date(f: dict) -> Optional[str]:
+        return f.get("filing_date") or f.get("filed_date")
+
+    def _get_form(f: dict) -> str:
+        return str(f.get("form_type") or f.get("filing_type") or "UNKNOWN")
+
     by_year: Dict[str, List[dict]] = defaultdict(list)
     for f in safe_filings:
-        year = _extract_year(f.get("filing_date"))
+        year = _extract_year(_get_date(f))
         if year is not None:
             by_year[year].append(f)
 
@@ -152,12 +161,12 @@ def summarize_filings_by_year(
 
     by_year_out: Dict[str, Dict[str, Any]] = {}
     for year, group in sorted(by_year.items(), reverse=True):
-        form_counts = Counter(str(f.get("form_type") or "UNKNOWN") for f in group)
+        form_counts = Counter(_get_form(f) for f in group)
         by_year_out[year] = {
             "filing_count": len(group),
             "form_types": dict(form_counts),
             "latest_date": max(
-                (str(f.get("filing_date") or "") for f in group),
+                (_get_date(f) or "" for f in group),
                 default="",
             ),
             "latest_url": next(
@@ -335,6 +344,7 @@ def extract_key_metrics_for_agent(
         "interest_coverage": interest_coverage,
         "cash_flow_negative_3_years": cash_flow_negative_3_years,
         "market_cap": market_cap,
+        "profit_margin": profit_margin,         # net profit margin (was computed but missing)
     }
 
     logger.info(

@@ -1,218 +1,152 @@
 """
-End-to-end smoke test.
-
-Runs main() with every external boundary mocked, verifies the final
-saved payload is structurally valid, and verifies determinism across
-two identical runs.
+Unit tests for agent.filing_analyzer.
 """
 from __future__ import annotations
 
-from types import SimpleNamespace
-
 import pytest
 
-pytestmark = pytest.mark.smoke
+
+@pytest.fixture
+def filing_analyzer(require_module):
+    return require_module(
+        "agent.filing_analyzer",
+        "summarize_filings_by_year",
+        "extract_key_metrics_for_agent",
+    )
 
 
 # ---------------------------------------------------------------------------
-# Harness
+# summarize_filings_by_year
 # ---------------------------------------------------------------------------
-class SavedOpinionStore:
-    """In-memory replacement for portfolio_db.save_agent_opinion."""
+class TestSummarizeFilings:
+    def test_returns_a_dict(self, filing_analyzer, sample_filings):
+        out = filing_analyzer.summarize_filings_by_year("TEST", sample_filings)
+        assert isinstance(out, dict), "summary must be a dict"
 
-    def __init__(self):
-        self.rows: list[tuple[str, dict]] = []
+    def test_summary_is_non_empty_for_valid_input(
+        self, filing_analyzer, sample_filings
+    ):
+        out = filing_analyzer.summarize_filings_by_year("TEST", sample_filings)
+        assert len(out) > 0
 
-    def save(self, ticker, payload):
-        # tolerate either positional or unexpected shapes
-        if isinstance(ticker, dict) and not isinstance(payload, dict):
-            payload, ticker = ticker, payload
-        self.rows.append((ticker, dict(payload) if isinstance(payload, dict) else {"raw": payload}))
+    def test_summary_references_filing_types_or_years(
+        self, filing_analyzer, sample_filings
+    ):
+        """
+        We don't pin the schema too tightly, but the summary should
+        at minimum reference filing form types or filing years.
+        """
+        out = filing_analyzer.summarize_filings_by_year("TEST", sample_filings)
+        flat = str(out).lower()
+        hits_form = any(
+            ft.lower() in flat for ft in ("10-k", "10-q", "8-k")
+        )
+        hits_year = any(y in flat for y in ("2023", "2024"))
+        assert hits_form or hits_year, (
+            "summary should group or reference form types / years; got: "
+            f"{out!r}"
+        )
 
+    def test_empty_filings_list_is_handled_gracefully(self, filing_analyzer):
+        out = filing_analyzer.summarize_filings_by_year("TEST", [])
+        assert isinstance(out, dict), "must return a dict even on empty input"
 
-def _install_smoke_harness(
-    monkeypatch,
-    safe_import,
-    sample_context,
-    deterministic_agent_response,
-) -> SavedOpinionStore:
-    store = SavedOpinionStore()
+        # Empty contract: either the dict is literally empty, OR every value
+        # is itself empty/None, OR the output clearly signals emptiness via
+        # a sentinel string ("empty", "no filings", etc.). No real filing
+        # data — dates, form types, metric values — should leak through.
+        if out == {}:
+            return
 
-    # 1. pipeline boundaries
-    pipeline = safe_import("data.pipeline")
-    if pipeline is not None:
-        if hasattr(pipeline, "run_daily_refresh"):
-            monkeypatch.setattr(
-                pipeline, "run_daily_refresh", lambda *a, **k: None
-            )
-        if hasattr(pipeline, "build_agent_context"):
-            monkeypatch.setattr(
-                pipeline,
-                "build_agent_context",
-                lambda ticker, *a, **k: {**sample_context, "ticker": ticker},
-            )
+        values_are_empty = all(
+            v in (None, "", [], {}, 0) or v in ("empty", "no filings", "none")
+            for v in out.values()
+        )
+        flat = str(out).lower()
+        signals_empty = "empty" in flat or "no filings" in flat or "no data" in flat
 
-    # 2. main's local namespace, if any
-    main_mod = safe_import("main")
-    if main_mod is not None:
-        if hasattr(main_mod, "run_daily_refresh"):
-            monkeypatch.setattr(
-                main_mod, "run_daily_refresh", lambda *a, **k: None
-            )
-        if hasattr(main_mod, "build_agent_context"):
-            monkeypatch.setattr(
-                main_mod,
-                "build_agent_context",
-                lambda ticker, *a, **k: {**sample_context, "ticker": ticker},
-            )
-        if hasattr(main_mod, "save_agent_opinion"):
-            monkeypatch.setattr(main_mod, "save_agent_opinion", store.save)
+        # Belt-and-suspenders: none of the sample_filings dates/forms should
+        # appear, since we passed []. This catches accidental fixture bleed.
+        assert "2024" not in flat and "2023" not in flat, (
+            f"empty input must not reference filing years; got {out!r}"
+        )
+        assert "10-k" not in flat and "10-q" not in flat and "8-k" not in flat, (
+            f"empty input must not reference form types; got {out!r}"
+        )
 
-    # 3. portfolio_db save boundary
-    portfolio_db = safe_import("data.portfolio_db")
-    if portfolio_db is not None and hasattr(portfolio_db, "save_agent_opinion"):
-        monkeypatch.setattr(portfolio_db, "save_agent_opinion", store.save)
+        assert values_are_empty or signals_empty, (
+            f"empty-filings output must be empty, contain only empty values, "
+            f"or clearly signal 'empty'/'no filings'; got {out!r}"
+        )
 
-    # 4. LLM boundary
-    base_agent = safe_import("agent.base_agent")
-    if base_agent is not None and hasattr(base_agent, "ask_agent"):
-        AgentResponse = getattr(base_agent, "AgentResponse", None)
+    def test_respects_max_filings_cap(self, filing_analyzer, sample_filings):
+        """
+        With max_filings=2, the analyzer must not process more than two
+        filings. We detect this by counting how many filing dates / form
+        types end up referenced anywhere in the output.
+        """
+        out = filing_analyzer.summarize_filings_by_year(
+            "TEST", sample_filings, max_filings=2
+        )
+        flat = str(out)
 
-        def fake_ask(request, config):
-            payload = dict(deterministic_agent_response)
-            if AgentResponse is not None:
-                try:
-                    return AgentResponse(
-                        content=str(payload),
-                        raw_output=str(payload),
-                        generated_json=payload,
-                        model_used="mock",
-                        tokens_in=50,
-                        tokens_out=120,
-                        elapsed_ms=0.5,
-                    )
-                except TypeError:
-                    pass
-            return SimpleNamespace(
-                content=str(payload),
-                raw_output=str(payload),
-                generated_json=payload,
-                model_used="mock",
-                tokens_in=50,
-                tokens_out=120,
-                elapsed_ms=0.5,
-            )
-
-        monkeypatch.setattr(base_agent, "ask_agent", fake_ask)
-        if main_mod is not None and hasattr(main_mod, "ask_agent"):
-            monkeypatch.setattr(main_mod, "ask_agent", fake_ask)
-
-    return store
+        # Count how many of our 5 distinct filing dates appear in the output.
+        all_dates = [f["filing_date"] for f in sample_filings]
+        present = sum(1 for d in all_dates if d in flat)
+        assert present <= 2, (
+            f"expected <= 2 filings referenced, saw {present}. Output: {out!r}"
+        )
 
 
 # ---------------------------------------------------------------------------
-# Tests
+# extract_key_metrics_for_agent
 # ---------------------------------------------------------------------------
-def test_full_workflow_runs_and_saves_valid_opinion(
-    monkeypatch,
-    safe_import,
-    require_module,
-    sample_context,
-    sample_config,
-    deterministic_agent_response,
-    mock_db,
-    thesis_contract,
-):
-    main_mod = require_module("main", "main")
-    store = _install_smoke_harness(
-        monkeypatch, safe_import, sample_context, deterministic_agent_response
-    )
+class TestExtractMetrics:
+    CRITICAL_METRIC_KEYS = {
+        "revenue_growth_yoy",
+        "gross_margin",
+        "operating_margin",
+        "free_cash_flow",
+        "debt_to_ebitda",
+        "pe_ratio",
+    }
 
-    main_mod.main(["SMOKE"], mock_db, sample_config)
+    def test_returns_dict_with_critical_keys(
+        self, filing_analyzer, sample_metrics
+    ):
+        out = filing_analyzer.extract_key_metrics_for_agent(
+            "TEST", sample_metrics, price=sample_metrics["price"]
+        )
+        assert isinstance(out, dict)
+        present = self.CRITICAL_METRIC_KEYS & set(out.keys())
+        # At least half the critical keys must survive normalization.
+        assert len(present) >= len(self.CRITICAL_METRIC_KEYS) // 2, (
+            f"normalized metrics missing too many critical keys. "
+            f"Got: {sorted(out.keys())}"
+        )
 
-    assert len(store.rows) == 1, (
-        f"expected exactly one saved opinion, got {len(store.rows)}"
-    )
-    ticker, payload = store.rows[0]
-    assert ticker == "SMOKE"
-    assert isinstance(payload, dict)
+    def test_handles_missing_values_without_crashing(self, filing_analyzer):
+        """
+        Only a partial metrics dict should still produce output, not raise.
+        """
+        partial = {
+            "revenue_growth_yoy": 0.10,
+            "gross_margin": None,          # explicitly missing
+            # operating_margin absent entirely
+            "debt_to_ebitda": 2.1,
+        }
+        out = filing_analyzer.extract_key_metrics_for_agent(
+            "TEST", partial, price=100.0
+        )
+        assert isinstance(out, dict)
 
-    # The saved payload should carry the thesis contract either directly
-    # or nested under a recognizable key.
-    def _locate_thesis(p: dict) -> dict:
-        if thesis_contract["required_keys"].issubset(p.keys()):
-            return p
-        for v in p.values():
-            if isinstance(v, dict) and thesis_contract["required_keys"].issubset(v.keys()):
-                return v
-        return {}
-
-    thesis = _locate_thesis(payload)
-    assert thesis, (
-        f"could not find thesis contract in saved payload: {payload!r}"
-    )
-    assert thesis["time_horizon"] == "1Y"
-    assert 0.0 <= float(thesis["confidence"]) <= 1.0
-    assert thesis["outlook"] in thesis_contract["valid_outlooks"]
-    assert thesis["price_direction"] in thesis_contract["valid_price_directions"]
-
-
-def test_workflow_is_deterministic_across_runs(
-    monkeypatch,
-    safe_import,
-    require_module,
-    sample_context,
-    sample_config,
-    deterministic_agent_response,
-    mock_db,
-):
-    main_mod = require_module("main", "main")
-    store = _install_smoke_harness(
-        monkeypatch, safe_import, sample_context, deterministic_agent_response
-    )
-
-    main_mod.main(["SMOKE"], mock_db, sample_config)
-    main_mod.main(["SMOKE"], mock_db, sample_config)
-
-    assert len(store.rows) == 2
-    (t1, p1), (t2, p2) = store.rows
-    assert t1 == t2 == "SMOKE"
-
-    # Normalize any volatile fields before comparison.
-    def _normalize(d: dict) -> dict:
-        out = {}
-        for k, v in d.items():
-            if k in {"timestamp", "created_at", "elapsed_ms", "run_id", "as_of"}:
-                continue
-            if isinstance(v, dict):
-                out[k] = _normalize(v)
-            else:
-                out[k] = v
-        return out
-
-    assert _normalize(p1) == _normalize(p2), (
-        "two runs with identical inputs produced different saved opinions"
-    )
-
-
-def test_workflow_survives_multiple_tickers(
-    monkeypatch,
-    safe_import,
-    require_module,
-    sample_context,
-    sample_config,
-    deterministic_agent_response,
-    mock_db,
-):
-    main_mod = require_module("main", "main")
-    store = _install_smoke_harness(
-        monkeypatch, safe_import, sample_context, deterministic_agent_response
-    )
-
-    tickers = ["AAA", "BBB", "CCC"]
-    main_mod.main(tickers, mock_db, sample_config)
-
-    assert len(store.rows) == len(tickers)
-    assert [t for t, _ in store.rows] == tickers
-    for _, payload in store.rows:
-        assert isinstance(payload, dict) and payload
+    def test_price_is_propagated_or_preserved(
+        self, filing_analyzer, sample_metrics
+    ):
+        out = filing_analyzer.extract_key_metrics_for_agent(
+            "TEST", sample_metrics, price=123.45
+        )
+        # accept either a top-level `price` or embedded in any value
+        assert "price" in out or 123.45 in (
+            v for v in out.values() if isinstance(v, (int, float))
+        ) or "123.45" in str(out)

@@ -27,14 +27,18 @@ Response contract
 Every call returns an :class:`AgentResponse` whose ``generated_json`` contains
 at least these keys:
 
-    - ``risks``            : List[str]
-    - ``thesis``           : str   (e.g. "NEUTRAL 1Y")
-    - ``price_direction``  : str   (e.g. "slight_up", "neutral")
-    - ``confidence``       : float in [0.0, 1.0]
+    - ``outlook``           : str   — "bullish" | "neutral" | "bearish"
+    - ``time_horizon``      : str   — e.g. "1Y"
+    - ``price_direction``   : str   — "strong_up" | "moderate_up" | "flat"
+                                      | "moderate_down" | "strong_down"
+    - ``confidence``        : float in [0.0, 1.0]
+    - ``key_risks``         : List[str]
+    - ``key_opportunities`` : List[str]
+    - ``summary``           : str
 
-Callers downstream (``risk_scanner``, ``thesis_generator``) rely on those
-four keys being present. Mock mode, real Ollama success, and Ollama failure
-all produce the same shape.
+Legacy aliases (``risks``, ``thesis``) are also populated for backward
+compatibility. Mock mode, real Ollama success, and Ollama failure all
+produce the same shape.
 """
 
 from __future__ import annotations
@@ -105,27 +109,36 @@ class AgentResponse:
 # =============================================================================
 
 # Default payload returned when the backend fails or JSON parsing breaks.
-# Downstream code (risk_scanner, thesis_generator) depends on these keys
-# existing, so every code path must return at least this shape.
+# Downstream code (risk_scanner, thesis_generator, main.py, tests) depends
+# on these keys existing, so every code path must produce at least this shape.
 _SAFE_DEFAULT_JSON: Dict[str, Any] = {
-    "risks": [],
-    "thesis": "NEUTRAL 1Y",
-    "price_direction": "neutral",
-    "confidence": 0.5,
-}
-
-# Deterministic mock payload. Matches the contract in the project spec.
-_MOCK_JSON: Dict[str, Any] = {
-    "risks": ["HIGH: debt", "MEDIUM: macro"],
-    "thesis": "NEUTRAL 1Y",
-    "price_direction": "slight_up",
-    "confidence": 0.6,
-    # Extra keys that downstream consumers (thesis_generator) look for.
+    # New canonical schema.
     "outlook": "neutral",
     "time_horizon": "1Y",
-    "key_risks": ["HIGH: debt", "MEDIUM: macro"],
-    "key_opportunities": ["margin expansion"],
-    "summary": "Mock response for deterministic pipeline runs.",
+    "price_direction": "flat",
+    "confidence": 0.5,
+    "key_risks": [],
+    "key_opportunities": [],
+    "summary": "No data available; returning neutral default.",
+    # Legacy aliases kept for any caller still reading the pre-refactor shape.
+    "risks": [],
+    "thesis": "neutral 1Y",
+}
+
+# Deterministic mock payload. Shape must match ``_SAFE_DEFAULT_JSON`` and
+# the ``deterministic_agent_response`` / ``thesis_contract`` test fixtures.
+_MOCK_JSON: Dict[str, Any] = {
+    # New canonical schema.
+    "outlook": "neutral",
+    "time_horizon": "1Y",
+    "price_direction": "flat",
+    "confidence": 0.6,
+    "key_risks": ["debt load elevated", "macro backdrop mixed"],
+    "key_opportunities": ["margin expansion runway", "operating leverage"],
+    "summary": "Mock response for offline / deterministic pipeline runs.",
+    # Legacy aliases.
+    "risks": ["HIGH: debt", "MEDIUM: macro"],
+    "thesis": "neutral 1Y",
 }
 
 
@@ -172,24 +185,31 @@ def ask_agent(request: AgentRequest, config: Any) -> AgentResponse:
         )
         return response
 
-    # Real path: Ollama. Wrapped so any failure degrades to the safe default
-    # rather than taking down the whole pipeline.
+    # Real path: Ollama. Wrapped so any failure degrades to the safe default.
+    # ``_call_ollama`` is a narrow string-returning shim (monkeypatchable in
+    # tests). ``_invoke_model`` calls it and normalises the return shape.
     try:
-        response = _call_ollama(request, model_used, config, started_at)
+        raw_output, tokens_in, tokens_out = _invoke_model(request, model_used, config)
+        generated_json = _safe_parse_json(raw_output)
+        elapsed_ms = (time.perf_counter() - started_at) * 1000.0
         logger.info(
             "agent.done | mock=False | model=%s | elapsed_ms=%.1f | "
             "tokens_in=%d | tokens_out=%d",
-            model_used,
-            response.elapsed_ms,
-            response.tokens_in,
-            response.tokens_out,
+            model_used, elapsed_ms, tokens_in, tokens_out,
         )
-        return response
+        return AgentResponse(
+            content=raw_output,
+            raw_output=raw_output,
+            generated_json=generated_json,
+            model_used=model_used,
+            tokens_in=tokens_in,
+            tokens_out=tokens_out,
+            elapsed_ms=elapsed_ms,
+        )
     except Exception as exc:  # noqa: BLE001 — we intentionally catch all
         logger.warning(
             "agent.fail | model=%s | err=%s | falling back to safe default",
-            model_used,
-            exc,
+            model_used, exc, exc_info=True,
         )
         elapsed_ms = (time.perf_counter() - started_at) * 1000.0
         return AgentResponse(
@@ -270,29 +290,46 @@ def _mock_response(
 # INTERNAL: OLLAMA BACKEND
 # =============================================================================
 
+def _invoke_model(request: AgentRequest, model_name: str, config: Any) -> tuple:
+    """Call ``_call_ollama`` and normalise its output to (raw_str, tokens_in, tokens_out).
+
+    Kept separate so ``_call_ollama`` stays a narrow, monkeypatchable shim.
+    Tests patch ``_call_ollama`` to return a plain string; this wrapper
+    handles both that case and the real tuple return.
+    """
+    result = _call_ollama(request, model_name, config)
+    if isinstance(result, str):
+        raw = result
+        return raw, _estimate_tokens(request.prompt), _estimate_tokens(raw)
+    raw, prompt_eval, eval_count = result
+    return (
+        raw,
+        int(prompt_eval or _estimate_tokens(request.prompt)),
+        int(eval_count or _estimate_tokens(raw)),
+    )
+
+
 def _call_ollama(
     request: AgentRequest,
     model_name: str,
     config: Any,
-    started_at: float,
-) -> AgentResponse:
+):
     """Call a local Ollama server via its ``/api/generate`` endpoint.
 
-    This is kept as a thin, synchronous shim so it's easy to unit-test and
-    easy to swap (e.g. for ``ollama-python`` or a remote inference server).
+    Narrow shim that returns only the model's raw string output (plus token
+    counts from Ollama if available). Parsing, validation, and
+    :class:`AgentResponse` construction all live in :func:`ask_agent`.
 
-    ``urllib`` is used instead of ``requests`` to avoid adding a dependency;
-    swap it in if the project already depends on ``requests``.
+    Returns
+    -------
+    (raw_output, prompt_eval_count, eval_count) : (str, Optional[int], Optional[int])
 
     Raises
     ------
     Exception
         Any network, HTTP, or decoding error bubbles up to ``ask_agent``,
-        which downgrades it to the safe default response.
+        which downgrades to the safe default response.
     """
-    # Imports are local so test environments without these deps can still
-    # import the module and use mock mode.
-    import urllib.error
     import urllib.request
 
     base_url = getattr(config, "OLLAMA_BASE_URL", "http://localhost:11434")
@@ -303,15 +340,7 @@ def _call_ollama(
         "model": model_name,
         "prompt": request.prompt,
         "stream": False,
-        # Ollama passes options through to the underlying runtime. ``num_predict``
-        # caps generated tokens; matches our MAX_TOKENS budget.
-        "options": {
-            "num_predict": max_tokens,
-            # Deterministic-ish output; raise temperature if you want variety.
-            "temperature": 0.2,
-        },
-        # Ask Ollama to format as JSON where the model supports it. The model
-        # may still wrap output in prose — _safe_parse_json handles that.
+        "options": {"num_predict": max_tokens, "temperature": 0.2},
         "format": "json",
     }
 
@@ -326,22 +355,7 @@ def _call_ollama(
         payload = json.loads(resp.read().decode("utf-8"))
 
     raw_output: str = payload.get("response", "") or ""
-    generated_json = _safe_parse_json(raw_output)
-
-    # Ollama returns eval counts when available; fall back to estimates.
-    tokens_in = int(payload.get("prompt_eval_count") or _estimate_tokens(request.prompt))
-    tokens_out = int(payload.get("eval_count") or _estimate_tokens(raw_output))
-    elapsed_ms = (time.perf_counter() - started_at) * 1000.0
-
-    return AgentResponse(
-        content=raw_output,
-        raw_output=raw_output,
-        generated_json=generated_json,
-        model_used=model_name,
-        tokens_in=tokens_in,
-        tokens_out=tokens_out,
-        elapsed_ms=elapsed_ms,
-    )
+    return raw_output, payload.get("prompt_eval_count"), payload.get("eval_count")
 
 
 # =============================================================================
@@ -362,9 +376,11 @@ def _safe_parse_json(raw: str) -> Dict[str, Any]:
         3. Extract the first ``{...}`` substring, retry.
         4. Return :data:`_SAFE_DEFAULT_JSON`.
 
-    The returned dict is then **shape-enforced**: any missing required key
-    (``risks``, ``thesis``, ``price_direction``, ``confidence``) is filled
-    from the safe default so downstream consumers never KeyError.
+    The returned dict is shape-enforced: any key missing from
+    :data:`_SAFE_DEFAULT_JSON` (``outlook``, ``time_horizon``,
+    ``price_direction``, ``confidence``, ``key_risks``, ``key_opportunities``,
+    ``summary``, and legacy aliases ``risks``/``thesis``) is back-filled so
+    downstream consumers never KeyError.
     """
     result: Optional[Dict[str, Any]] = None
     text = (raw or "").strip()

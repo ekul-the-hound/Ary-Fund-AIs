@@ -65,7 +65,7 @@ import json
 import logging
 import re
 import time
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List
 
 from agent.base_agent import AgentRequest, _resolve_model
 
@@ -185,10 +185,7 @@ def revise_essay(
         }
 
     try:
-        text = _call_ollama_text(
-            prompt, model_used, config, temperature=_REVISION_TEMPERATURE,
-            min_output_tokens=6144,  # revision needs ~2100 tokens for 1500 words
-        )
+        text = _call_ollama_text(prompt, model_used, config, temperature=_REVISION_TEMPERATURE)
         if not text or len(text.split()) < 1400:
             raise RuntimeError(f"Revision too short ({len(text.split()) if text else 0} words)")
         elapsed_ms = (time.perf_counter() - started_at) * 1000.0
@@ -548,22 +545,13 @@ def _compact_risks(risk_flags: Dict[str, Any]) -> str:
 # =============================================================================
 
 def _call_ollama_text(
-    prompt: str, model_name: str, config: Any, temperature: float = 0.2,
-    min_output_tokens: int = 4096,
+    prompt: str, model_name: str, config: Any, temperature: float = 0.2
 ) -> str:
     import urllib.request
 
     base_url = getattr(config, "OLLAMA_BASE_URL", "http://localhost:11434")
-    # Revision calls need more time than essay calls.  On an RTX 2080 with a
-    # 30B model partially offloaded to CPU, generation runs at ~10 tok/s.
-    # 1500 words ≈ 2025 tokens → needs ~200s minimum, plus prompt processing.
-    # 360s is generous but safe; the model will stop at EOS well before this
-    # if it finishes normally.
-    timeout = max(float(getattr(config, "AGENT_TIMEOUT", 30)), 360.0)
-    # The caller can override min_output_tokens for longer outputs (e.g.
-    # revision pass needs ~2100 tokens for 1500 words, so we use 6144 to be
-    # safe).  Default remains 4096 for reviews.
-    max_tokens = max(int(getattr(config, "MAX_TOKENS", 4096)), min_output_tokens)
+    timeout = max(float(getattr(config, "AGENT_TIMEOUT", 30)), 180.0)
+    max_tokens = int(getattr(config, "MAX_TOKENS", 4096))
 
     body = {
         "model": model_name,
@@ -609,7 +597,6 @@ def _deterministic_review(
     """
     m = metrics or {}
     mc = macro or {}
-    issues: List[str] = []
     scores: Dict[str, int] = {}
 
     essay_lower = essay_text.lower()

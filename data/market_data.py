@@ -1194,7 +1194,7 @@ if __name__ == "__main__":
     # Technicals
     tech = md.get_technicals("AAPL")
     if tech:
-        print(f"\nTechnicals:")
+        print("\nTechnicals:")
         print(f"  RSI(14): {tech['rsi_14']:.1f}")
         print(f"  SMA(50): ${tech['sma_50']:.2f}")
         print(f"  Signal: {tech['signal']['overall']} ({tech['signal']['score']:+.1f})")
@@ -1203,7 +1203,7 @@ if __name__ == "__main__":
 
     # Fundamentals
     f = md.get_fundamentals("AAPL")
-    print(f"\nFundamentals:")
+    print("\nFundamentals:")
     print(f"  Sector: {f['sector']}")
     print(f"  P/E: {f['valuation']['trailing_pe']}")
     print(f"  Profit Margin: {f['financials']['profit_margin']}")

@@ -101,12 +101,14 @@ def build_agent_prompt(
     return (
         "You are a hedge-fund sell-side analyst. Analyse the ticker below and "
         "return ONLY a JSON object with the following keys:\n"
-        '  "risks": list of strings, each prefixed with "HIGH:", "MEDIUM:", '
-        'or "LOW:" and a short phrase.\n'
-        '  "thesis": short string like "BULLISH 1Y", "NEUTRAL 1Y", "BEARISH 1Y".\n'
-        '  "price_direction": one of "strong_up", "moderate_up", "neutral", '
+        '  "outlook": one of "bullish", "neutral", "bearish".\n'
+        '  "time_horizon": string, e.g. "1Y".\n'
+        '  "price_direction": one of "strong_up", "moderate_up", "flat", '
         '"moderate_down", "strong_down".\n'
-        '  "confidence": float in [0.0, 1.0].\n\n'
+        '  "confidence": float in [0.0, 1.0].\n'
+        '  "key_risks": list of short risk strings.\n'
+        '  "key_opportunities": list of short opportunity strings.\n'
+        '  "summary": one-sentence thesis summary.\n'
         "Do not include any prose outside the JSON object.\n\n"
         "CONTEXT:\n"
         f"{json.dumps(payload, default=str, indent=2)}"
@@ -221,7 +223,13 @@ def _process_ticker(
             tools=["filings", "prices", "macro"],
         )
         response = base_agent.ask_agent(request, cfg)
-        agent_risks: List[str] = list(response.generated_json.get("risks", []))
+        # Support both new schema ("key_risks") and legacy ("risks") so mock
+        # mode and real LLM responses both produce a valid risk list.
+        agent_risks: List[str] = list(
+            response.generated_json.get("key_risks")
+            or response.generated_json.get("risks")
+            or []
+        )
 
         # 4. Rule-based risk flags (reads the agent's risks).
         risk_flags = risk_scanner.compute_risk_flags(
@@ -480,6 +488,7 @@ def _cli_entry() -> int:
     """CLI wrapper. Returns an exit code."""
     args = _parse_args()
     _configure_logging(config)
+    config._warn_if_missing()  # safe here — logging handlers are now set up
 
     # Optional one-run override of the default model.
     if args.model is not None:

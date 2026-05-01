@@ -23,8 +23,11 @@ class SavedOpinionStore:
     def __init__(self):
         self.rows: list[tuple[str, dict]] = []
 
-    def save(self, ticker, payload):
-        # tolerate either positional or unexpected shapes
+    def save(self, ticker, payload=None, **kwargs):
+        # tolerate either positional or unexpected shapes, and extra kwargs
+        # like db_path that the real implementation accepts.
+        if payload is None:
+            payload = {}
         if isinstance(ticker, dict) and not isinstance(payload, dict):
             payload, ticker = ticker, payload
         self.rows.append((ticker, dict(payload) if isinstance(payload, dict) else {"raw": payload}))

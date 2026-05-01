@@ -16,8 +16,7 @@ Usage:
 """
 
 import logging
-import json
-from datetime import datetime, timedelta
+from datetime import datetime
 from typing import Optional
 
 from data.sec_fetcher import SECFetcher
@@ -47,6 +46,53 @@ logger = logging.getLogger(__name__)
 #
 # Tests monkeypatch these two names directly, so the wrappers must exist as
 # bindings at module scope.
+
+
+def _flatten_macro(nested: dict) -> dict:
+    """Flatten the nested macro dashboard into a single-level dict.
+
+    ``MacroData.get_macro_dashboard()`` returns a structure like::
+
+        {
+          "interest_rates": {"yield_spread_10y2y": 0.3, "fed_funds": 5.25, ...},
+          "inflation":       {"cpi_yoy_pct": 3.1, ...},
+          "employment":      {"unemployment_rate": 3.7, ...},
+          "growth":          {"gdp_growth": 2.1, ...},
+          "financial_conditions": {"vix": 18.5, ...},
+          "recession_signals":    {"recession_probability": 0.22, ...},
+        }
+
+    ``risk_scanner._score_macro_risk()`` and ``main.py`` expect a flat dict
+    with keys like ``"yield_curve_spread"``, ``"vix"``, ``"recession_probability"``.
+
+    This function:
+      1. Lifts all nested values to the top level.
+      2. Adds canonical aliases expected by the risk scanner.
+      3. Preserves the top-level ``"timestamp"`` key.
+    """
+    flat: dict = {}
+
+    # Lift every nested section's values to the top level.
+    for _section_name, section_val in nested.items():
+        if isinstance(section_val, dict):
+            flat.update(section_val)
+        else:
+            # Scalar top-level keys (e.g. "timestamp") pass through unchanged.
+            flat[_section_name] = section_val
+
+    # Add canonical aliases that risk_scanner and main.py expect.
+    # MacroData uses "yield_spread_10y2y"; scanner uses "yield_curve_spread".
+    for src, dst in (
+        ("yield_spread_10y2y",   "yield_curve_spread"),
+        ("yield_spread_10y3m",   "yield_curve_spread_10y3m"),
+        ("cpi_yoy_pct",          "cpi_yoy"),
+        ("unemployment_rate",    "unemployment"),
+        ("gdp_growth",           "gdp_growth_pct"),
+    ):
+        if src in flat and dst not in flat:
+            flat[dst] = flat[src]
+
+    return flat
 
 
 def _build_pipeline(db_path: str, cfg) -> "DataPipeline":
@@ -154,7 +200,10 @@ def build_agent_context(ticker: str, db_path: str, cfg) -> dict:
             "fifty_two_week_low": latest.get("fifty_two_week_low"),
         }
     except Exception as e:
-        logger.warning("build_agent_context | %s | price fetch failed: %s", ticker, e)
+        logger.warning(
+            "build_agent_context | %s | price fetch failed: %s",
+            ticker, e, exc_info=True,
+        )
 
     # --- Fundamentals (the raw dict the analyzer will normalize) ------------
     try:
@@ -162,20 +211,22 @@ def build_agent_context(ticker: str, db_path: str, cfg) -> dict:
         # Flatten the nested structure into a single-level dict that
         # filing_analyzer.extract_key_metrics_for_agent can consume.
         flat: dict = {}
-        # Include ALL sections — "overview" contains enterprise_value and
-        # market_cap which are required for EV/EBITDA and FCF yield.
-        for section in ("overview", "financials", "valuation", "growth", "analyst"):
+        # Include ALL sections — "overview" contains market_cap / enterprise_value
+        # needed for EV/EBITDA and FCF yield; "dividends" has dividend_yield.
+        for section in ("overview", "financials", "valuation", "growth", "analyst", "dividends"):
             sub = fund.get(section) if isinstance(fund, dict) else None
             if isinstance(sub, dict):
                 flat.update(sub)
-        # Keep a couple of top-level descriptors for the prompt builder.
+        # Keep top-level descriptors for the prompt builder.
         if isinstance(fund, dict):
             flat.setdefault("sector", fund.get("sector"))
             flat.setdefault("industry", fund.get("industry"))
+            flat.setdefault("name", fund.get("name"))
         ctx["metrics"] = flat
     except Exception as e:
         logger.warning(
-            "build_agent_context | %s | fundamentals fetch failed: %s", ticker, e
+            "build_agent_context | %s | fundamentals fetch failed: %s",
+            ticker, e, exc_info=True,
         )
 
     # --- Filings ------------------------------------------------------------
@@ -185,13 +236,24 @@ def build_agent_context(ticker: str, db_path: str, cfg) -> dict:
         filings_8k = pipe.sec.get_recent_8k_events(ticker, days_back=60) or []
         ctx["filings"] = [*filings_10k, *filings_10q, *filings_8k]
     except Exception as e:
-        logger.warning("build_agent_context | %s | filings fetch failed: %s", ticker, e)
+        logger.warning(
+            "build_agent_context | %s | filings fetch failed: %s",
+            ticker, e, exc_info=True,
+        )
 
     # --- Macro --------------------------------------------------------------
+    # get_macro_dashboard() returns a nested dict (sections like
+    # "interest_rates", "inflation", etc.). Flatten it so risk_scanner,
+    # main.py, and thesis_generator can read top-level keys like
+    # "yield_curve_spread", "vix", "recession_probability".
     try:
-        ctx["macro"] = pipe.macro.get_macro_dashboard() or {}
+        raw_macro = pipe.macro.get_macro_dashboard() or {}
+        ctx["macro"] = _flatten_macro(raw_macro)
     except Exception as e:
-        logger.warning("build_agent_context | %s | macro fetch failed: %s", ticker, e)
+        logger.warning(
+            "build_agent_context | %s | macro fetch failed: %s",
+            ticker, e, exc_info=True,
+        )
 
     # --- Portfolio position (if any) ---------------------------------------
     try:
@@ -206,7 +268,10 @@ def build_agent_context(ticker: str, db_path: str, cfg) -> dict:
                 }
                 break
     except Exception as e:
-        logger.debug("build_agent_context | %s | portfolio lookup skipped: %s", ticker, e)
+        logger.debug(
+            "build_agent_context | %s | portfolio lookup skipped: %s",
+            ticker, e, exc_info=True,
+        )
 
     return ctx
 

@@ -19,12 +19,16 @@ be touched.
 
 from __future__ import annotations
 
+# stdlib
 import logging
 import os
-from dotenv import load_dotenv
-load_dotenv()
 from pathlib import Path
 from typing import Dict, List
+
+# third-party
+from dotenv import load_dotenv
+
+load_dotenv()
 
 
 # =============================================================================
@@ -185,11 +189,20 @@ RISK_THRESHOLDS: Dict[str, float] = {
 
 
 # =============================================================================
-# SANITY CHECKS (run on import, non-fatal)
+# SANITY CHECKS (deferred — only emit if logging is already configured)
 # =============================================================================
 
 def _warn_if_missing() -> None:
-    """Log warnings for missing-but-not-fatal config at import time."""
+    """Emit warnings for missing-but-not-fatal config values.
+
+    Called by ``main.py`` and ``app.py`` after ``logging.basicConfig`` has
+    run, so the messages appear in the application log rather than on stderr
+    every time *any* script imports config.
+
+    Callers that set up logging before importing config will see these;
+    bare imports (pytest, interactive sessions, Streamlit startup) will not
+    get the spurious "FRED_API_KEY is empty" stderr message.
+    """
     logger = logging.getLogger(__name__)
     if not FRED_API_KEY:
         logger.warning(
@@ -204,4 +217,8 @@ def _warn_if_missing() -> None:
         )
 
 
-_warn_if_missing()
+# Only auto-emit if the root logger already has handlers (i.e. logging has
+# been configured by the caller). This avoids the "FRED_API_KEY is empty"
+# message being printed to stderr on every bare import.
+if logging.root.handlers:
+    _warn_if_missing()

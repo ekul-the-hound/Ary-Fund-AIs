@@ -174,9 +174,9 @@ def stream_chat_response(
         return
 
     base_url = getattr(config, "OLLAMA_BASE_URL", "http://localhost:11434")
-    # Chat turns should not inherit the essay's 180s minimum; 300s gives
-    # Qwen3-30B room for thoughtful answers on a partial-GPU setup without
-    # hanging the UI indefinitely on a hung call.
+    # Enforce a 300s floor: Qwen3-30B on a partial-GPU setup can take
+    # 30–90s per chat turn; raising the floor ensures the UI never
+    # dead-ends on a slow model. If AGENT_TIMEOUT is already > 300, honour it.
     timeout = float(getattr(config, "AGENT_TIMEOUT", 120))
     if timeout < 300:
         timeout = 300.0

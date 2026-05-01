@@ -16,7 +16,7 @@ def run(cmd, **kwargs):
     print(f"  > {cmd}")
     result = subprocess.run(cmd, shell=True, **kwargs, capture_output=False)
     if result.returncode != 0:
-        print(f"\n  ERROR: Command failed. Check the output above.")
+        print("\n  ERROR: Command failed. Check the output above.")
         sys.exit(1)
     return result
 
@@ -40,7 +40,6 @@ def main():
     # Step 2: Paths to pip and python inside the venv (robust quoting)
     pip_exe = VENV_DIR / "Scripts" / "pip.exe"
     pip = f'"{pip_exe.absolute()}"'  # Use absolute path for reliability
-    python_exe = VENV_DIR / "Scripts" / "python.exe"
 
     # Step 2.5: Upgrade pip FIRST (fixes ModuleNotFoundError in subprocesses)
     print("\n[2/5] Upgrading pip...")
@@ -79,7 +78,7 @@ def main():
         run(f'{pip} install {pkg} {flags}')
 
     # Step 4: Install the project itself in editable mode (now works post-pip upgrade)
-    print(f"\n[4/5] Installing hedgefund-ai in editable mode...")
+    print("\n[4/5] Installing hedgefund-ai in editable mode...")
     run(f'{pip} install -e "{PROJECT_DIR.absolute()}"')
 
     print("\nAll packages installed.")
