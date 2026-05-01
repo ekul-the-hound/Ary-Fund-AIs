@@ -124,10 +124,29 @@ def _fmt_str(v: Any) -> str:
 
 # Registry: key -> (display_name, category, formatter)
 # Categories drive UI grouping.
+#
+# IMPORTANT — key naming:
+#   The dotted paths below MUST exactly match the keys produced by
+#   ``data.pipeline.build_agent_context``. That function flattens
+#   ``market_data.get_fundamentals()`` sections (overview / valuation /
+#   financials / growth / analyst) into ``ctx["metrics"]`` using the
+#   snake_case keys those sections already use (e.g. ``free_cash_flow``,
+#   ``revenue_growth``, ``debt_to_equity``). A mismatch — for example
+#   looking up ``metrics.freeCashflow`` when the pipeline writes
+#   ``free_cash_flow`` — silently resolves to None and the UI shows
+#   "n/a", which was the original bug.
+#
+#   When you add a new entry: cross-check against the keys in
+#   ``market_data.get_fundamentals()`` (or, for macro entries, against
+#   ``macro_data.get_macro_dashboard()``). Run the smoke test in
+#   ``test_data_point_analyzer.py`` to catch regressions.
 AVAILABLE_DATA_POINTS: Dict[str, Tuple[str, str, Any]] = {
     # --- Price ---
     "prices.last": ("Last Price", "Price", _fmt_dollar),
-    "prices.change_pct": ("Daily Change %", "Price", _fmt_pct),
+    # MarketData.get_latest_price() already stores change_pct in percent
+    # units (e.g. -4.63), not as a decimal — use _fmt_pct_raw, NOT
+    # _fmt_pct (which would render -4.63 as "-463.00%").
+    "prices.change_pct": ("Daily Change %", "Price", _fmt_pct_raw),
     "prices.market_cap": ("Market Cap", "Price", _fmt_dollar_big),
     "prices.fifty_two_week_high": ("52-Week High", "Price", _fmt_dollar),
     "prices.fifty_two_week_low": ("52-Week Low", "Price", _fmt_dollar),
@@ -137,32 +156,35 @@ AVAILABLE_DATA_POINTS: Dict[str, Tuple[str, str, Any]] = {
     "metrics.forward_pe": ("Forward P/E", "Valuation", _fmt_ratio),
     "metrics.peg_ratio": ("PEG Ratio", "Valuation", _fmt_ratio),
     "metrics.price_to_sales": ("Price-to-Sales", "Valuation", _fmt_ratio),
-    "metrics.enterpriseToEbitda": ("EV / EBITDA", "Valuation", _fmt_ratio),
+    "metrics.ev_to_ebitda": ("EV / EBITDA", "Valuation", _fmt_ratio),
 
     # --- Margins ---
-    "metrics.grossMargins": ("Gross Margin", "Margins", _fmt_pct),
-    "metrics.operatingMargins": ("Operating Margin", "Margins", _fmt_pct),
-    "metrics.profitMargins": ("Profit Margin", "Margins", _fmt_pct),
+    "metrics.gross_margin": ("Gross Margin", "Margins", _fmt_pct),
+    "metrics.operating_margin": ("Operating Margin", "Margins", _fmt_pct),
+    "metrics.profit_margin": ("Profit Margin", "Margins", _fmt_pct),
 
     # --- Growth ---
-    "metrics.revenueGrowth": ("Revenue Growth (YoY)", "Growth", _fmt_pct),
-    "metrics.earningsGrowth": ("Earnings Growth (YoY)", "Growth", _fmt_pct),
+    "metrics.revenue_growth": ("Revenue Growth (YoY)", "Growth", _fmt_pct),
+    "metrics.earnings_growth": ("Earnings Growth (YoY)", "Growth", _fmt_pct),
 
     # --- Cash & Capital ---
-    "metrics.freeCashflow": ("Free Cash Flow", "Cash & Balance Sheet", _fmt_dollar_big),
-    "metrics.operatingCashflow": ("Operating Cash Flow", "Cash & Balance Sheet", _fmt_dollar_big),
-    "metrics.totalCash": ("Total Cash", "Cash & Balance Sheet", _fmt_dollar_big),
-    "metrics.totalDebt": ("Total Debt", "Cash & Balance Sheet", _fmt_dollar_big),
-    "metrics.debtToEquity": ("Debt-to-Equity", "Cash & Balance Sheet", _fmt_num),
-    "metrics.currentRatio": ("Current Ratio", "Cash & Balance Sheet", _fmt_ratio),
+    "metrics.free_cash_flow": ("Free Cash Flow", "Cash & Balance Sheet", _fmt_dollar_big),
+    "metrics.operating_cash_flow": ("Operating Cash Flow", "Cash & Balance Sheet", _fmt_dollar_big),
+    "metrics.total_cash": ("Total Cash", "Cash & Balance Sheet", _fmt_dollar_big),
+    "metrics.total_debt": ("Total Debt", "Cash & Balance Sheet", _fmt_dollar_big),
+    "metrics.debt_to_equity": ("Debt-to-Equity", "Cash & Balance Sheet", _fmt_num),
+    "metrics.current_ratio": ("Current Ratio", "Cash & Balance Sheet", _fmt_ratio),
 
     # --- Returns ---
-    "metrics.returnOnEquity": ("Return on Equity", "Returns", _fmt_pct),
-    "metrics.returnOnAssets": ("Return on Assets", "Returns", _fmt_pct),
+    "metrics.return_on_equity": ("Return on Equity", "Returns", _fmt_pct),
+    "metrics.return_on_assets": ("Return on Assets", "Returns", _fmt_pct),
 
     # --- Analyst ---
-    "metrics.targetMeanPrice": ("Analyst Target Price", "Analyst", _fmt_dollar),
-    "metrics.recommendationMean": ("Analyst Recommendation Score", "Analyst", _fmt_num),
+    "metrics.target_mean": ("Analyst Target Price", "Analyst", _fmt_dollar),
+    # Note: requires market_data.get_fundamentals() to capture
+    # info.get("recommendationMean"). If that field is absent the
+    # display will fall back to "n/a" gracefully.
+    "metrics.recommendation_mean": ("Analyst Recommendation Score", "Analyst", _fmt_num),
 
     # --- Macro: Rates ---
     "macro.interest_rates.fed_funds": ("Fed Funds Rate", "Macro / Rates", _fmt_pct_raw),
@@ -177,7 +199,12 @@ AVAILABLE_DATA_POINTS: Dict[str, Tuple[str, str, Any]] = {
 
     # --- Macro: Conditions ---
     "macro.financial_conditions.vix": ("VIX (Volatility Index)", "Macro / Conditions", _fmt_num),
-    "macro.recession_signals.recession_probability": ("Recession Probability (12M)", "Macro / Conditions", _fmt_pct),
+    # FRED RECPROUSM156N is reported in percent units already (e.g. 23.5
+    # means 23.5%) — use _fmt_pct_raw, NOT _fmt_pct (which would multiply
+    # by 100 and produce absurd values like "+2350.00%").
+    "macro.recession_signals.recession_probability": (
+        "Recession Probability (12M)", "Macro / Conditions", _fmt_pct_raw,
+    ),
 }
 
 
@@ -341,17 +368,36 @@ def analyze_data_points(
 
     try:
         text = _call_ollama_text(prompt, model_used, config, temperature=_PARAGRAPH_TEMPERATURE)
-        # Minimum: overview (150 words) + N paragraphs (150 words each)
-        min_words = 150 * (1 + len(valid_keys))
-        if not text or len(text.split()) < min_words // 2:
+        # Acceptance check — replaces the previous rigid
+        # ``len(text.split()) >= 150 * (1+N) // 2`` rule, which rejected
+        # perfectly usable concise output from smaller models like
+        # phi3:3.8b (a 350-word reply for 8 points would fail at the
+        # 675-word threshold even though it parsed cleanly into
+        # overview + 8 paragraphs).
+        #
+        # The new gate is structural: we parse the text first and accept
+        # it as long as (a) it has at least 100 words total AND (b) it
+        # contains either an Overview paragraph or at least one
+        # recognizable per-point paragraph. Truly broken responses
+        # ("I cannot help with that", empty string, prompt regurgitation)
+        # still fail.
+        word_count = len(text.split()) if text else 0
+        parsed_overview, parsed_paragraphs = _split_text(text or "", valid_keys)
+        has_structure = bool(parsed_overview) or len(parsed_paragraphs) >= 1
+        if word_count < 100 or not has_structure:
             raise RuntimeError(
-                f"Output too short ({len(text.split()) if text else 0} words, expected >={min_words // 2})"
+                f"Output unusable: {word_count} words, "
+                f"overview={'yes' if parsed_overview else 'no'}, "
+                f"paragraphs_parsed={len(parsed_paragraphs)}"
             )
         elapsed_ms = (time.perf_counter() - started_at) * 1000.0
-        overview, paragraphs = _split_text(text, valid_keys)
+        # Reuse the parse we already did.
+        overview, paragraphs = parsed_overview, parsed_paragraphs
         logger.info(
-            "data_point_analyzer | %s | model=%s | points=%d | words=%d | elapsed_ms=%.0f",
-            ticker, model_used, len(valid_keys), len(text.split()), elapsed_ms,
+            "data_point_analyzer | %s | model=%s | points=%d | words=%d | "
+            "paragraphs_parsed=%d | elapsed_ms=%.0f",
+            ticker, model_used, len(valid_keys), word_count,
+            len(paragraphs), elapsed_ms,
         )
         return {
             "text": text,
@@ -361,7 +407,7 @@ def analyze_data_points(
             "model_used": model_used,
             "elapsed_ms": round(elapsed_ms, 1),
             "fallback": False,
-            "word_count": len(text.split()),
+            "word_count": word_count,
         }
     except Exception as exc:
         logger.warning("data_point_analyzer | %s | LLM failed: %s -> fallback", ticker, exc)

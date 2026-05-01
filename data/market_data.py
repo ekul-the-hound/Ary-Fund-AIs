@@ -322,6 +322,9 @@ class MarketData:
                 "target_low": info.get("targetLowPrice"),
                 "target_high": info.get("targetHighPrice"),
                 "recommendation": info.get("recommendationKey"),
+                # Numeric mean recommendation score (1.0=Strong Buy ... 5.0=Strong Sell).
+                # Required by data_point_analyzer.AVAILABLE_DATA_POINTS["metrics.recommendation_mean"].
+                "recommendation_mean": info.get("recommendationMean"),
                 "num_analysts": info.get("numberOfAnalystOpinions"),
             },
         }
@@ -1194,7 +1197,7 @@ if __name__ == "__main__":
     # Technicals
     tech = md.get_technicals("AAPL")
     if tech:
-        print("\nTechnicals:")
+        print(f"\nTechnicals:")
         print(f"  RSI(14): {tech['rsi_14']:.1f}")
         print(f"  SMA(50): ${tech['sma_50']:.2f}")
         print(f"  Signal: {tech['signal']['overall']} ({tech['signal']['score']:+.1f})")
@@ -1203,7 +1206,7 @@ if __name__ == "__main__":
 
     # Fundamentals
     f = md.get_fundamentals("AAPL")
-    print("\nFundamentals:")
+    print(f"\nFundamentals:")
     print(f"  Sector: {f['sector']}")
     print(f"  P/E: {f['valuation']['trailing_pe']}")
     print(f"  Profit Margin: {f['financials']['profit_margin']}")

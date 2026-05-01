@@ -111,6 +111,15 @@ except Exception as e:
     ary_essay = None
     _BACKEND_ERRORS.append(f"ARY QUANT modules unavailable: {e}")
 
+# Screener module — fully self-contained TradingView-style stock screener.
+# Imports independently from chat/essay so a failure here doesn't take the
+# rest of the dashboard down.
+try:
+    from ui import screener as ary_screener
+except Exception as e:
+    ary_screener = None
+    _BACKEND_ERRORS.append(f"ARY QUANT screener unavailable: {e}")
+
 
 # ======================================================================
 # Page configuration
@@ -1099,9 +1108,48 @@ def build_sidebar(portfolio_summary: dict[str, Any]) -> dict[str, Any]:
     if not tickers:
         tickers = ["AAPL", "MSFT", "NVDA", "GOOGL", "AMZN", "META", "TSLA", "SPY"]
 
-    selected = st.sidebar.selectbox("Ticker", tickers, index=0)
-    custom = st.sidebar.text_input("…or enter another ticker", value="").strip().upper()
-    ticker = custom or selected
+    # ---- Active-ticker contract ------------------------------------------
+    # `st.session_state["active_ticker"]` is the *single source of truth*
+    # for which ticker the dashboard is analysing. main() initialises it
+    # before tabs render. Both the sidebar widgets below AND the screener
+    # row-click handler in ui.screener write to this key directly.
+    #
+    # We use on_change callbacks (rather than reading the widgets' return
+    # values) so that the persisted text_input value doesn't override an
+    # active_ticker that was just set by a screener row click. on_change
+    # only fires when the user actually changes the widget, not on every
+    # rerun, so the screener handoff survives intact.
+    # ----------------------------------------------------------------------
+    active = st.session_state.get("active_ticker") or tickers[0]
+    if active not in tickers:
+        # Make sure the dropdown can display whatever the screener picked,
+        # even if that ticker isn't in the portfolio.
+        tickers = [active] + tickers
+
+    def _on_select_change() -> None:
+        st.session_state["active_ticker"] = st.session_state["_sidebar_ticker_pick"]
+
+    def _on_text_change() -> None:
+        val = (st.session_state.get("_sidebar_ticker_text") or "").strip().upper()
+        if val:
+            st.session_state["active_ticker"] = val
+
+    st.sidebar.selectbox(
+        "Ticker",
+        tickers,
+        index=tickers.index(active),
+        key="_sidebar_ticker_pick",
+        on_change=_on_select_change,
+    )
+    st.sidebar.text_input(
+        "…or enter another ticker",
+        value="",
+        key="_sidebar_ticker_text",
+        on_change=_on_text_change,
+        help="Type a symbol and press Enter.",
+    )
+
+    ticker = st.session_state["active_ticker"]
 
     lookback = st.sidebar.slider("Lookback (days)", 30, 730, 180, step=30)
 
@@ -1138,6 +1186,14 @@ def main() -> None:
         "macro overlay · conversational Q&A"
     )
 
+    # Initialise the single source of truth for the active ticker. Both the
+    # sidebar widgets and the Screener tab write here; everything else reads
+    # it indirectly via build_sidebar() → controls["ticker"]. Setting this
+    # BEFORE any widget that uses it avoids the "value not yet in state on
+    # first render" race.
+    if "active_ticker" not in st.session_state:
+        st.session_state["active_ticker"] = "NVDA"
+
     if _BACKEND_ERRORS:
         with st.expander("⚠️ Backend import warnings", expanded=False):
             for msg in _BACKEND_ERRORS:
@@ -1168,9 +1224,29 @@ def main() -> None:
 
     render_ticker_header(ticker, prices, context)
 
-    tab_overview, tab_briefing, tab_analyzer, tab_debug = st.tabs(
-        ["📊 Overview", "📝 ARY QUANT Briefing", "🔍 Data-Point Analyzer", "🛠 Debug"]
+    tab_screener, tab_overview, tab_briefing, tab_analyzer, tab_debug = st.tabs(
+        [
+            "🔍 Screener",
+            "📊 Overview",
+            "📝 ARY QUANT Briefing",
+            "🔎 Data-Point Analyzer",
+            "🛠 Debug",
+        ]
     )
+
+    # ---------------- Screener tab ----------------
+    # The screener writes the clicked ticker into st.session_state["active_ticker"]
+    # and triggers a rerun. On the next render, build_sidebar() picks up the new
+    # value, controls["ticker"] reflects it, and load_ticker_context / the
+    # Overview / Briefing / Data-Point Analyzer tabs all refresh automatically.
+    with tab_screener:
+        if ary_screener is not None and hasattr(ary_screener, "render_screener_tab"):
+            ary_screener.render_screener_tab()
+        else:
+            st.error(
+                "Screener module is not importable. Check that "
+                "`ui/screener.py` exists and that there are no import errors."
+            )
 
     # ---------------- Overview tab ----------------
     with tab_overview:

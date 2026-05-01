@@ -140,6 +140,34 @@ def render_data_point_analyzer_section(
 
     st.session_state[state_key] = selected
 
+    # --- Empty-context guard --------------------------------------------
+    # If the pipeline failed to fetch fundamentals or macro for this
+    # ticker (network glitch, missing FRED key, yfinance rate-limit, …),
+    # ``ctx["metrics"]`` and/or ``ctx["macro"]`` come back as empty dicts
+    # and every selected point will resolve to None. Surface that BEFORE
+    # the user spends 30s waiting on an LLM call that's going to fall
+    # back to "n/a" anyway.
+    from agent.data_point_analyzer import get_data_point_value
+    n_missing = sum(
+        1 for k in selected
+        if get_data_point_value(context, k) is None
+    )
+    if n_missing and selected:
+        if n_missing == len(selected):
+            st.error(
+                f"None of the {len(selected)} selected data points have a "
+                f"value in the loaded context. The pipeline likely failed "
+                f"to fetch fundamentals or macro data for **{ticker}**. "
+                f"Check the Debug tab for the raw context dict, then "
+                f"verify yfinance / FRED / SEC credentials and retry."
+            )
+        else:
+            st.warning(
+                f"⚠️ **{n_missing} of {len(selected)}** selected data "
+                f"points have no value — they'll show as 'n/a' in the "
+                f"output. See the Debug tab for the raw context."
+            )
+
     # --- Status row ------------------------------------------------------
     n_selected = len(selected)
     total_paragraphs = 1 + n_selected  # overview + per-point
