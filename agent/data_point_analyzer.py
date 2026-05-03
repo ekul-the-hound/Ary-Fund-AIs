@@ -47,6 +47,7 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 import time
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -367,7 +368,11 @@ def analyze_data_points(
         }
 
     try:
-        text = _call_ollama_text(prompt, model_used, config, temperature=_PARAGRAPH_TEMPERATURE)
+        text = _call_ollama_text(
+            prompt, model_used, config,
+            temperature=_PARAGRAPH_TEMPERATURE,
+            system=_SYSTEM_PROMPT,
+        )
         # Acceptance check — replaces the previous rigid
         # ``len(text.split()) >= 150 * (1+N) // 2`` rule, which rejected
         # perfectly usable concise output from smaller models like
@@ -430,6 +435,19 @@ def analyze_data_points(
 # PROMPT
 # =============================================================================
 
+# System instruction sent separately from the user prompt.
+# phi3:3.8b follows system-level format rules far more reliably than
+# instructions buried inside a long user prompt.
+_SYSTEM_PROMPT = (
+    "You are a hedge fund equity analyst. "
+    "You write structured research notes. "
+    "You ALWAYS use the exact section headers given to you, each on its own line followed by a colon. "
+    "You NEVER write continuous prose without section headers. "
+    "You NEVER skip a section. "
+    "You NEVER add sections that were not requested."
+)
+
+
 def _build_prompt(
     ticker: str,
     sector: str,
@@ -438,99 +456,97 @@ def _build_prompt(
     selected_keys: List[str],
     context: Dict[str, Any],
 ) -> str:
-    # Build a compact "selected points" section: name = value
+    # Build the data block
     selected_lines: List[str] = []
     for k in selected_keys:
         display = get_display_name(k)
         value = get_formatted_value(context, k)
-        selected_lines.append(f"- {display}: {value}")
-    selected_block = "\n".join(selected_lines)
+        selected_lines.append(f"  {display}: {value}")
+    data_block = "\n".join(selected_lines)
 
-    # Brief supporting context (not the focus, just so the LLM has anchors
-    # if it needs to reference benchmarks like "vs sector average")
-    metrics = context.get("metrics") or {}
-    macro = context.get("macro") or {}
-    supporting_lines: List[str] = []
-    # Add a few high-signal anchors that aren't necessarily selected
-    if metrics.get("trailing_pe") is not None and "metrics.trailing_pe" not in selected_keys:
-        supporting_lines.append(f"  - Trailing P/E (context): {_fmt_ratio(metrics.get('trailing_pe'))}")
-    fed = (macro.get("interest_rates") or {}).get("fed_funds")
-    if fed is not None and "macro.interest_rates.fed_funds" not in selected_keys:
-        supporting_lines.append(f"  - Fed Funds (context): {_fmt_pct_raw(fed)}")
-    supporting_block = "\n".join(supporting_lines) if supporting_lines else "  (none)"
+    # Build the required sections list (just the names, no template filler)
+    section_names = ["Overview"] + [get_display_name(k) for k in selected_keys]
+    sections_list = "\n".join(f"  {i+1}. {name}" for i, name in enumerate(section_names))
 
-    n_points = len(selected_keys)
-    total_paragraphs = 1 + n_points
+    # Few-shot example using a DIFFERENT ticker so phi3 doesn't copy
+    # the values verbatim instead of using the real data block.
+    example_output = (
+        "Overview:\n"
+        "AAPL trades at a slight premium to peers but strong FCF and brand moat justify "
+        "the multiple. The 28.5x P/E is above the sector median but covered by 12% "
+        "earnings growth. Stance: HOLD with bullish bias.\n\n"
+        "Last Price:\n"
+        "At $171.21, AAPL sits 4% below its 52-week high of $178.19. "
+        "The recent pullback appears technical rather than fundamental. "
+        "This level supports buying.\n\n"
+        "Trailing P/E:\n"
+        "A 28.5x trailing multiple is elevated versus the S&P 500 median of 18x but "
+        "is in line with mega-cap tech peers. Given 12% EPS growth, the PEG ratio of "
+        "2.4x is acceptable. Neutral at current levels."
+    )
 
-    # Render the per-point output template — this drives the LLM toward the
-    # "Display Name:" header format we'll parse later.
-    output_template_lines = [
-        "Overview:",
-        "[150-200 word synthesis of all selected points]",
-        "",
-    ]
-    for k in selected_keys:
-        display = get_display_name(k)
-        output_template_lines.append(f"{display}:")
-        output_template_lines.append(f"[150-200 word analysis of {display}]")
-        output_template_lines.append("")
-    output_template = "\n".join(output_template_lines)
+    return f"""Data for {ticker} ({sector} / {industry}) as of {as_of}:
+{data_block}
 
-    return f"""You are writing an institutional-grade stock research note for a hedge fund analyst.
+Required sections ({len(section_names)} total):
+{sections_list}
 
-=== CONTEXT ===
-Ticker: {ticker}
-Sector: {sector}
-Industry: {industry}
-As of: {as_of}
+Here is an example of the EXACT output format you must produce (this example uses AAPL, not {ticker}):
 
-=== SELECTED DATA POINTS (the analyst checked these {n_points}) ===
-{selected_block}
+{example_output}
 
-=== SUPPORTING CONTEXT (available for benchmarking, not the focus) ===
-{supporting_block}
-
-=== TASK ===
-Produce {total_paragraphs} paragraphs total: ONE overview paragraph plus one paragraph per selected data point.
-
-1. OVERVIEW (150-200 words): Synthesize the selected points into a single investment thesis. State which selected metrics are most bullish, which are most bearish, and a clear BUY / HOLD / AVOID stance. Reference numbers from the selected points only — do not invent.
-
-2. PER-POINT PARAGRAPHS (150-200 words each): For each selected point, write one paragraph that:
-   - Quotes the exact value shown above.
-   - Compares it to a relevant benchmark (sector average, historical norm, peer, or macro context).
-   - Explains the investment implication: how it affects cash flow, valuation, growth, or risk.
-   - Ends with an explicit stance for that single metric: "supports buying," "is a sell signal," or "is neutral."
-
-=== RULES ===
-- Use the EXACT display names above as paragraph headers (e.g. "Trailing P/E:", "Fed Funds Rate:").
-- Every paragraph must include at least one number.
-- Do not invent metrics that are not in the data.
-- No bullet points inside paragraphs — write in prose.
-- No filler ("appears," "may," "could") unless paired with a specific number or condition.
-- Do not summarize the prompt or describe the task. Just write the paragraphs.
-
-=== OUTPUT FORMAT (use this exact structure) ===
-{output_template}
-
-Now write the analysis."""
+Now write the same format for {ticker}. Use ONLY the section headers listed above. Each header must appear on its own line followed by a colon. Write 3-5 sentences per section. Use the {ticker} data provided above — do not use the AAPL example values."""
 
 
 # =============================================================================
 # OUTPUT PARSING
 # =============================================================================
 
+def _normalize_header(line: str) -> Optional[str]:
+    """Normalize a candidate header line to its lowercase core text.
+
+    Accepts plain, colon-terminated, markdown (#/##/###), bold (**),
+    and any combination. Returns None for lines that are clearly prose
+    (too long, sentence punctuation, embedded values with $ or %).
+    """
+    if not line:
+        return None
+    stripped = line.strip()
+    if not stripped or len(stripped) > 80:
+        return None
+
+    # Iteratively strip markdown markers, bold wrappers, and trailing
+    # colons until stable — handles interleaved orderings like
+    # "**Overview**:", "## **Trailing P/E:**", etc.
+    core = stripped
+    while True:
+        before = core
+        core = re.sub(r"^#{1,6}\s+", "", core)
+        core = re.sub(r"^\*\*(.+?)\*\*$", r"\1", core)
+        core = re.sub(r"^\*(.+?)\*$",     r"\1", core)
+        core = re.sub(r"^__(.+?)__$",     r"\1", core)
+        core = core.strip()
+        if core.endswith(":"):
+            core = core[:-1].strip()
+        if core == before:
+            break
+
+    if not core:
+        return None
+
+    # Reject prose lines: sentence punctuation or embedded value chars.
+    if any(ch in core for ch in (".", ",", ";", "$", "%")):
+        return None
+
+    return core.lower()
+
+
 def _split_text(text: str, selected_keys: List[str]) -> Tuple[str, Dict[str, str]]:
     """Split the LLM output into overview + per-point paragraphs.
 
-    The model is instructed to produce headers like "Display Name:" (or
-    "Overview:") on their own line. We split on those headers.
-
-    Returns
-    -------
-    (overview_text, {key: paragraph_text})
+    Accepts headers in any format recognised by _normalize_header:
+    plain, colon-terminated, markdown (#/##/###), bold, or combined.
     """
-    # Build a header -> key map so we can match the LLM output's headers
-    # back to our canonical keys (case-insensitive, ignoring trailing colons).
     header_to_key: Dict[str, str] = {}
     for k in selected_keys:
         display = get_display_name(k)
@@ -538,7 +554,7 @@ def _split_text(text: str, selected_keys: List[str]) -> Tuple[str, Dict[str, str
 
     overview = ""
     paragraphs: Dict[str, str] = {}
-    current_header: Optional[str] = None  # "overview" or display name (lower)
+    current_header: Optional[str] = None
     current_lines: List[str] = []
 
     def _flush() -> None:
@@ -562,19 +578,16 @@ def _split_text(text: str, selected_keys: List[str]) -> Tuple[str, Dict[str, str
             current_lines.append(line)
             continue
 
-        # Detect a header line: short line ending in ":" (or "**Name:**").
-        # We strip markdown bold.
-        candidate = stripped.replace("**", "").strip()
-        if candidate.endswith(":") and len(candidate) <= 80:
-            potential = candidate[:-1].strip().lower()
-            if potential == "overview":
+        normalized = _normalize_header(stripped)
+        if normalized is not None:
+            if normalized == "overview":
                 _flush()
                 current_header = "overview"
                 current_lines = []
                 continue
-            if potential in header_to_key:
+            if normalized in header_to_key:
                 _flush()
-                current_header = potential
+                current_header = normalized
                 current_lines = []
                 continue
 
@@ -629,6 +642,7 @@ def _deterministic_fallback(
 
 def _call_ollama_text(
     prompt: str, model_name: str, config: Any, temperature: float = 0.3,
+    system: str = "",
 ) -> str:
     import urllib.request
 
@@ -645,6 +659,8 @@ def _call_ollama_text(
             "temperature": temperature,
         },
     }
+    if system:
+        body["system"] = system
 
     req = urllib.request.Request(
         url=f"{base_url.rstrip('/')}/api/generate",
