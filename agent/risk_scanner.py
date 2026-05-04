@@ -404,19 +404,34 @@ def _extract_severity_tag(s: str) -> Optional[str]:
 def _combine_levels(levels: Dict[str, str]) -> str:
     """Roll up component levels into a single combined risk level.
 
-    Policy:
-        - Any single HIGH          -> HIGH
-        - 2+ MEDIUM                -> HIGH
-        - Exactly 1 MEDIUM         -> MEDIUM
-        - Else                     -> LOW
+    Policy (revised so MEDIUM has real coverage):
+        - 2+ HIGH components         -> HIGH
+        - 1 HIGH + 1+ MEDIUM         -> HIGH
+        - 1 HIGH alone               -> MEDIUM   (single-domain stress)
+        - 3+ MEDIUM                  -> HIGH
+        - 1-2 MEDIUM, no HIGH        -> MEDIUM
+        - Else                       -> LOW
+
+    Rationale: with four components, the previous "any HIGH -> HIGH" plus
+    "2+ MEDIUM -> HIGH" rule made MEDIUM a narrow window. In real market
+    conditions (VIX > 20 + leverage > 2x, etc.) several components hit
+    MEDIUM simultaneously, escalating to HIGH and burying the gradient
+    that makes risk scoring useful. The new rules require *concentrated*
+    severity for HIGH and let mixed-evidence cases land at MEDIUM.
     """
     values = [levels.get(k, "LOW") for k in ("fundamental", "macro", "market", "agent")]
-    if any(v == "HIGH" for v in values):
-        return "HIGH"
+    high_count = sum(1 for v in values if v == "HIGH")
     medium_count = sum(1 for v in values if v == "MEDIUM")
-    if medium_count >= 2:
+
+    if high_count >= 2:
         return "HIGH"
-    if medium_count == 1:
+    if high_count == 1 and medium_count >= 1:
+        return "HIGH"
+    if high_count == 1:
+        return "MEDIUM"
+    if medium_count >= 3:
+        return "HIGH"
+    if medium_count >= 1:
         return "MEDIUM"
     return "LOW"
 

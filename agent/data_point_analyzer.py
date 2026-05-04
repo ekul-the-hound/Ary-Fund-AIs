@@ -47,7 +47,6 @@ from __future__ import annotations
 
 import json
 import logging
-import re
 import time
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -188,25 +187,387 @@ AVAILABLE_DATA_POINTS: Dict[str, Tuple[str, str, Any]] = {
     "metrics.recommendation_mean": ("Analyst Recommendation Score", "Analyst", _fmt_num),
 
     # --- Macro: Rates ---
-    "macro.interest_rates.fed_funds": ("Fed Funds Rate", "Macro / Rates", _fmt_pct_raw),
-    "macro.interest_rates.treasury_10y": ("10-Year Treasury Yield", "Macro / Rates", _fmt_pct_raw),
-    "macro.interest_rates.treasury_2y": ("2-Year Treasury Yield", "Macro / Rates", _fmt_pct_raw),
-    "macro.interest_rates.yield_spread_10y2y": ("Yield Curve (10Y-2Y)", "Macro / Rates", _fmt_pct_raw),
+    # NOTE: pipeline._flatten_macro lifts the nested macro_data sections
+    # ("interest_rates", "inflation", etc.) to top-level keys. So the
+    # context's macro dict is FLAT (e.g. ctx["macro"]["fed_funds"]), not
+    # nested. The keys below reflect that flattening.
+    "macro.fed_funds": ("Fed Funds Rate", "Macro / Rates", _fmt_pct_raw),
+    "macro.treasury_10y": ("10-Year Treasury Yield", "Macro / Rates", _fmt_pct_raw),
+    "macro.treasury_2y": ("2-Year Treasury Yield", "Macro / Rates", _fmt_pct_raw),
+    "macro.yield_curve_spread": ("Yield Curve (10Y-2Y)", "Macro / Rates", _fmt_pct_raw),
 
     # --- Macro: Inflation & Growth ---
-    "macro.inflation.cpi_yoy_pct": ("CPI YoY", "Macro / Inflation", _fmt_pct_raw),
-    "macro.employment.unemployment_rate": ("Unemployment Rate", "Macro / Employment", _fmt_pct_raw),
-    "macro.growth.gdp_growth_annualized": ("GDP Growth (Annualized)", "Macro / Growth", _fmt_pct_raw),
+    "macro.cpi_yoy_pct": ("CPI YoY", "Macro / Inflation", _fmt_pct_raw),
+    "macro.unemployment_rate": ("Unemployment Rate", "Macro / Employment", _fmt_pct_raw),
+    "macro.gdp_growth": ("GDP Growth (Annualized)", "Macro / Growth", _fmt_pct_raw),
 
     # --- Macro: Conditions ---
-    "macro.financial_conditions.vix": ("VIX (Volatility Index)", "Macro / Conditions", _fmt_num),
+    "macro.vix": ("VIX (Volatility Index)", "Macro / Conditions", _fmt_num),
     # FRED RECPROUSM156N is reported in percent units already (e.g. 23.5
     # means 23.5%) — use _fmt_pct_raw, NOT _fmt_pct (which would multiply
     # by 100 and produce absurd values like "+2350.00%").
-    "macro.recession_signals.recession_probability": (
+    "macro.recession_probability": (
         "Recession Probability (12M)", "Macro / Conditions", _fmt_pct_raw,
     ),
 }
+
+
+# =============================================================================
+# METRIC-SPECIFIC PROMPT GUIDANCE
+# =============================================================================
+#
+# Each entry tells the LLM how to reason about that specific metric. The
+# guidance is injected inline in the prompt next to the metric's value so
+# the model has the right interpretive frame for each data point. Without
+# this, the model produced vague output for less-common fields (e.g. it
+# would treat "Recommendation Score 1.8" as a generic number rather than
+# knowing 1=Strong Buy / 5=Strong Sell on the Wall Street scale).
+#
+# Format per entry: 2-4 sentences covering what the metric means, how to
+# interpret high/low values, what historical/peer context matters, and
+# how to phrase the conclusion.
+
+METRIC_GUIDANCE: Dict[str, str] = {
+    # --- Price ---
+    "prices.last": (
+        "The current share price is most useful when paired with valuation "
+        "multiples and 52-week range. A price near the 52-week high suggests "
+        "momentum but also limited margin of safety; a price near the low "
+        "may indicate value or genuine deterioration — the metrics will tell "
+        "you which. Reference the company's recent price action, not the "
+        "absolute level."
+    ),
+    "prices.change_pct": (
+        "Daily change is noise on its own; only meaningful in context. A "
+        "+5% move on no news is suspect; a -5% move into earnings carries "
+        "different information than -5% on a quiet macro day. Cite whether "
+        "the move is consistent with sector or VIX behavior, and whether "
+        "it aligns with or contradicts the longer-term trend."
+    ),
+    "prices.market_cap": (
+        "Market cap defines the universe a stock plays in. <$2B = small "
+        "cap (illiquid, higher volatility), $2-10B = mid cap, $10-200B = "
+        "large cap, >$200B = mega cap. Compare to the leader of the same "
+        "sector. Mega caps are typically less mispriced; smaller caps offer "
+        "more alpha but more risk."
+    ),
+    "prices.fifty_two_week_high": (
+        "Distance from 52-week high signals momentum and crowding. Within "
+        "5% of the high = overheated/popular; 20%+ off = either a value "
+        "opportunity or a falling knife. Pair with revenue growth and "
+        "margin trend to decide which."
+    ),
+    "prices.fifty_two_week_low": (
+        "Proximity to 52-week low is a contrarian signal. Within 10% of "
+        "the low merits a value-vs-deterioration check: are fundamentals "
+        "intact (FCF positive, margins stable) or impaired (FCF negative, "
+        "leverage rising)? State which case applies."
+    ),
+
+    # --- Valuation ---
+    "metrics.trailing_pe": (
+        "Trailing P/E is past 12-month earnings yield. S&P 500 long-term "
+        "average ~16x; current ~22x. <15x = cheap, 15-25x = fair for "
+        "average growth, >30x = expensive unless growth is exceptional. "
+        "ALWAYS pair with growth: a 30x P/E is reasonable at 25% growth, "
+        "punitive at 5%. Sector matters: tech runs higher, financials lower."
+    ),
+    "metrics.forward_pe": (
+        "Forward P/E uses next-year analyst estimates. Compare to trailing "
+        "P/E: if forward < trailing, analysts expect earnings to grow; if "
+        "forward > trailing, they expect contraction. A wide gap (forward "
+        "much lower than trailing) signals either strong growth or analyst "
+        "over-optimism — verify against revenue_growth and earnings_growth."
+    ),
+    "metrics.peg_ratio": (
+        "PEG = P/E divided by earnings growth rate. PEG < 1 = arguably "
+        "cheap relative to growth; PEG = 1 fair; PEG > 2 = expensive even "
+        "for the growth. Caveat: PEG breaks down for low-growth (<5%) or "
+        "negative-earnings companies — say so if either applies."
+    ),
+    "metrics.price_to_sales": (
+        "P/S is most useful when earnings are negative or volatile (early-"
+        "stage tech, cyclicals at trough). S&P average ~2-3x. >10x demands "
+        "exceptional gross margins (>60%) or hypergrowth. For mature "
+        "businesses with stable earnings, P/E is the better lens."
+    ),
+    "metrics.ev_to_ebitda": (
+        "EV/EBITDA captures the whole-company value (debt + equity) per "
+        "dollar of operating cash earnings. Industry-average ~10-12x. "
+        "<8x = cheap; 12-18x = full; >20x = priced for perfection. "
+        "Better than P/E for capital-heavy or leveraged businesses because "
+        "it neutralizes capital structure differences."
+    ),
+
+    # --- Margins ---
+    "metrics.gross_margin": (
+        "Gross margin = (Revenue − COGS) / Revenue. Reflects pricing power "
+        "and cost structure. Software/SaaS: >70%. Branded consumer: 30-50%. "
+        "Retail: 20-35%. Commodities/distribution: 5-15%. Year-over-year "
+        "compression of 200+ bps signals input-cost pressure or pricing "
+        "loss; expansion signals scale or premium positioning."
+    ),
+    "metrics.operating_margin": (
+        "Operating margin reflects core profitability after SG&A and R&D. "
+        "Cite the gap between gross and operating: a wide gap means high "
+        "fixed costs, scale matters; narrow gap means lean ops. <5% = "
+        "thin/risky; 10-20% = healthy; >25% = exceptional (typically "
+        "software, payment networks, or monopoly assets)."
+    ),
+    "metrics.profit_margin": (
+        "Net profit margin includes tax and interest. Compare to operating "
+        "margin: if much lower, the company is heavily taxed or interest-"
+        "burdened. <3% = thin; 5-10% = average; >15% = high-quality. "
+        "Trend matters more than absolute level — direction signals "
+        "operating leverage."
+    ),
+
+    # --- Growth ---
+    "metrics.revenue_growth": (
+        "Year-over-year revenue growth. Critical to pair with the company's "
+        "size: 30% growth on $200M is great, on $200B is extraordinary. "
+        "S&P 500 long-term ~5-7%. <0% = contracting (concerning unless "
+        "cyclical trough), 0-10% = mature, 10-20% = strong, >20% = high-"
+        "growth. Compare to trailing P/E to assess if growth justifies "
+        "the multiple."
+    ),
+    "metrics.earnings_growth": (
+        "Earnings growth amplifies or dampens revenue growth based on "
+        "operating leverage. EPS growth >> revenue growth means margin "
+        "expansion (good); EPS growth << revenue growth means margin "
+        "compression or higher share count (bad). Negative earnings "
+        "growth on positive revenue growth is a yellow flag."
+    ),
+
+    # --- Cash & Capital ---
+    "metrics.free_cash_flow": (
+        "FCF = operating cash flow minus capex. The cleanest measure of "
+        "cash returnable to shareholders. Compare to net income: if FCF "
+        "approximates net income, earnings are real; if FCF lags, watch "
+        "for working-capital strain or aggressive accruals. Negative FCF "
+        "is acceptable for hypergrowth (Amazon early years) but a warning "
+        "for mature businesses."
+    ),
+    "metrics.operating_cash_flow": (
+        "Operating cash flow before capex. Direction matters most: rising "
+        "OCF with stable margins = healthy; falling OCF on growing revenue "
+        "= working capital deterioration. Always cite OCF / Net Income "
+        "ratio: above 1.0 is high quality; below 0.7 deserves scrutiny."
+    ),
+    "metrics.total_cash": (
+        "Cash and equivalents on the balance sheet. Useful as a dry-powder "
+        "indicator and downside cushion. Compare to total debt and to "
+        "annual operating cash flow: cash > debt = net cash position "
+        "(strong); cash < 1 year of OCF and debt growing = potential "
+        "liquidity issue."
+    ),
+    "metrics.total_debt": (
+        "Total interest-bearing debt. The absolute number matters less "
+        "than debt/EBITDA (covered separately). Year-over-year increase "
+        "in debt without a corresponding revenue or asset increase is a "
+        "yellow flag. Refinancing risk rises when rates are elevated — "
+        "cite the current Fed Funds rate context if available."
+    ),
+    "metrics.debt_to_equity": (
+        "Debt/Equity. <0.5 = conservative; 0.5-1.5 = typical; >2.0 = "
+        "leveraged. Banks and utilities run higher by design. The metric "
+        "can mislead with negative book equity (buybacks, persistent "
+        "losses) — note if equity is negative or shrinking."
+    ),
+    "metrics.current_ratio": (
+        "Current assets / current liabilities. >1.5 = liquid and safe; "
+        "1.0-1.5 = adequate; <1.0 = potential short-term squeeze. "
+        "Different industries normalize at different levels — software "
+        "and subscription businesses often run high; retailers run lower "
+        "because inventory turns fast."
+    ),
+
+    # --- Returns ---
+    "metrics.return_on_equity": (
+        "Net income / shareholders' equity. >15% = high-quality; 10-15% = "
+        "average; <8% = capital-inefficient. Caveats: ROE is inflated by "
+        "leverage (high debt makes ROE rise without underlying improvement) "
+        "— always cross-check ROIC, which neutralizes capital structure."
+    ),
+    "metrics.return_on_assets": (
+        "Net income / total assets. Less affected by leverage than ROE. "
+        ">5% = solid; >10% = excellent. Asset-heavy businesses (retailers, "
+        "industrials) run lower; asset-light (software, services) run "
+        "higher. Compare to peers, not absolute thresholds."
+    ),
+
+    # --- Analyst ---
+    "metrics.target_mean": (
+        "Mean analyst price target for the next 12 months. Implied upside "
+        "= (target / current price - 1). Anything >20% upside or >20% "
+        "downside is meaningful; tighter ranges suggest consensus and "
+        "less alpha opportunity. Caveat: analyst targets are anchored to "
+        "current price and trend-follow — treat as one input, not a "
+        "decision driver."
+    ),
+    "metrics.recommendation_mean": (
+        "Mean analyst rating on the standard 1-5 scale: 1.0 = Strong Buy, "
+        "2.0 = Buy, 3.0 = Hold, 4.0 = Sell, 5.0 = Strong Sell. Most stocks "
+        "cluster between 1.8 and 2.8 (sell-side has buy-bias). Below 1.5 "
+        "= unanimous buy (often crowded); above 3.0 = unloved (potential "
+        "contrarian setup). State the rating and what it implies about "
+        "consensus crowding."
+    ),
+
+    # --- Macro ---
+    "macro.fed_funds": (
+        "The Federal Reserve's benchmark short rate. Above 4-5% = restrictive "
+        "(slows borrowing, equities). Below 2% = accommodative (supports "
+        "risk assets). The transmission to equities depends on duration: "
+        "long-duration assets (high-growth tech) feel rates more than "
+        "short-duration (utilities, staples). Reference the rate level "
+        "and direction of recent moves."
+    ),
+    "macro.treasury_10y": (
+        "10-year Treasury yield. The discount rate baseline for equities. "
+        ">5% = headwind for valuations; 3-5% = normal range; <3% = supportive. "
+        "Direction matters: rising yields compress P/E multiples even if "
+        "earnings hold. Cite the level AND whether it's risen/fallen recently."
+    ),
+    "macro.treasury_2y": (
+        "2-year Treasury yield. Reflects near-term Fed expectations. "
+        "Compare to the 10Y: if 2Y > 10Y, the curve is inverted (recession "
+        "signal, ~85% historical hit rate within 18 months). If 2Y < 10Y, "
+        "curve is normal."
+    ),
+    "macro.yield_curve_spread": (
+        "10Y minus 2Y Treasury yield. Negative (inverted) historically "
+        "precedes recessions by 6-18 months — though the lag and false-"
+        "positive rate vary. Above +0.5% = normal; 0 to +0.5% = flat; "
+        "below 0 = inverted. Cite the spread and what it implies for the "
+        "growth backdrop the company operates in."
+    ),
+    "macro.cpi_yoy_pct": (
+        "Year-over-year CPI inflation. Fed target = 2%. Above 4% = elevated "
+        "(supports tighter policy and valuation pressure); 2-4% = manageable; "
+        "<2% = soft (supportive of growth assets). Direction matters: "
+        "decelerating inflation is bullish for risk assets even at high "
+        "absolute levels."
+    ),
+    "macro.unemployment_rate": (
+        "U-3 unemployment. <4% = tight labor market (supports consumer "
+        "spending, wage pressure); 4-5% = healthy; >5% = soft and "
+        "deteriorating. Rising 0.5%+ over six months has historically "
+        "preceded recessions (Sahm rule). Cite the level and the trend."
+    ),
+    "macro.gdp_growth": (
+        "Annualized real GDP growth. >3% = strong expansion; 1-3% = "
+        "trend growth; <1% = stagnation; negative = contraction. "
+        "Cyclical sectors (industrials, materials, consumer discretionary) "
+        "benefit most from above-trend growth; defensive sectors (staples, "
+        "utilities, healthcare) less sensitive."
+    ),
+    "macro.vix": (
+        "CBOE Volatility Index — the market's 30-day forward expected "
+        "volatility from S&P 500 options. <15 = complacent; 15-20 = "
+        "normal; 20-30 = elevated stress; >30 = panic. High-beta names "
+        "feel VIX more; low-beta defensives less. Cite the level and "
+        "what it implies about position sizing."
+    ),
+    "macro.recession_probability": (
+        "NY Fed model probability of recession in 12 months, derived from "
+        "the yield curve. Reported in percent units (e.g. 23.5 = 23.5%). "
+        "<15% = benign; 15-30% = elevated; 30-50% = high-risk; >50% = "
+        "near-certain. Cyclical companies (industrials, financials, "
+        "consumer discretionary) are most exposed; staples and healthcare "
+        "less so."
+    ),
+}
+
+
+# =============================================================================
+# DERIVED-VALUE FALLBACKS
+# =============================================================================
+#
+# When a key returns None (the metric isn't in context), some fields can be
+# reconstructed from related fields. This is the second source of "n/a" the
+# review flagged — values that look unavailable but can be derived. We only
+# return a derived value when the math is clean and uncontroversial; when
+# in doubt, return None and let the formatter show "n/a".
+
+def _derive_value(context: Dict[str, Any], key: str) -> Any:
+    """Try to compute ``key`` from related fields. Return None on failure."""
+    metrics = context.get("metrics") or {}
+    prices = context.get("prices") or {}
+
+    # Trailing P/E from price and EPS, if both present.
+    if key == "metrics.trailing_pe":
+        last = prices.get("last") or context.get("price")
+        eps = metrics.get("trailingEps") or metrics.get("eps_trailing")
+        if last and eps:
+            try:
+                eps_f = float(eps)
+                if eps_f != 0:
+                    return float(last) / eps_f
+            except (TypeError, ValueError):
+                pass
+
+    # Forward P/E from price and forward EPS.
+    if key == "metrics.forward_pe":
+        last = prices.get("last") or context.get("price")
+        feps = metrics.get("forwardEps") or metrics.get("eps_forward")
+        if last and feps:
+            try:
+                feps_f = float(feps)
+                if feps_f != 0:
+                    return float(last) / feps_f
+            except (TypeError, ValueError):
+                pass
+
+    # PEG from forward P/E and earnings growth (if pegRatio absent).
+    if key == "metrics.peg_ratio":
+        fpe = metrics.get("forward_pe") or metrics.get("forwardPE")
+        eg = metrics.get("earnings_growth") or metrics.get("earningsGrowth")
+        if fpe and eg:
+            try:
+                eg_pct = float(eg) * 100  # decimal -> percent
+                if eg_pct > 0:
+                    return float(fpe) / eg_pct
+            except (TypeError, ValueError):
+                pass
+
+    # Profit margin from net income / revenue.
+    if key == "metrics.profit_margin":
+        ni = metrics.get("net_income") or metrics.get("netIncomeToCommon")
+        rev = metrics.get("revenue") or metrics.get("totalRevenue")
+        if ni and rev:
+            try:
+                rev_f = float(rev)
+                if rev_f != 0:
+                    return float(ni) / rev_f
+            except (TypeError, ValueError):
+                pass
+
+    # FCF yield from FCF and market cap.
+    if key == "metrics.fcf_yield":
+        fcf = metrics.get("free_cash_flow") or metrics.get("freeCashflow")
+        mc = metrics.get("market_cap") or prices.get("market_cap") or metrics.get("marketCap")
+        if fcf and mc:
+            try:
+                mc_f = float(mc)
+                if mc_f > 0:
+                    return float(fcf) / mc_f
+            except (TypeError, ValueError):
+                pass
+
+    # Current ratio from current assets / current liabilities.
+    if key == "metrics.current_ratio":
+        ca = metrics.get("currentAssets") or metrics.get("current_assets")
+        cl = metrics.get("currentLiabilities") or metrics.get("current_liabilities")
+        if ca and cl:
+            try:
+                cl_f = float(cl)
+                if cl_f > 0:
+                    return float(ca) / cl_f
+            except (TypeError, ValueError):
+                pass
+
+    return None
 
 
 # =============================================================================
@@ -225,11 +586,15 @@ _TARGET_WORDS_PER_PARA_MAX: int = 200
 def get_data_point_value(context: Dict[str, Any], key: str) -> Any:
     """Look up a dotted-path key in the agent context.
 
+    First tries direct lookup. If that returns None, tries to derive the
+    value from related fields via :func:`_derive_value`. Only returns
+    None when both lookup and derivation fail.
+
     Examples
     --------
     >>> get_data_point_value(ctx, "prices.last")
     215.43
-    >>> get_data_point_value(ctx, "macro.interest_rates.fed_funds")
+    >>> get_data_point_value(ctx, "macro.fed_funds")
     5.33
     """
     parts = key.split(".")
@@ -238,10 +603,16 @@ def get_data_point_value(context: Dict[str, Any], key: str) -> Any:
         if isinstance(cursor, dict):
             cursor = cursor.get(p)
         else:
-            return None
+            cursor = None
+            break
         if cursor is None:
-            return None
-    return cursor
+            break
+
+    if cursor is not None:
+        return cursor
+
+    # Direct lookup failed — try a derived fallback.
+    return _derive_value(context, key)
 
 
 def get_display_name(key: str) -> str:
@@ -368,11 +739,7 @@ def analyze_data_points(
         }
 
     try:
-        text = _call_ollama_text(
-            prompt, model_used, config,
-            temperature=_PARAGRAPH_TEMPERATURE,
-            system=_SYSTEM_PROMPT,
-        )
+        text = _call_ollama_text(prompt, model_used, config, temperature=_PARAGRAPH_TEMPERATURE)
         # Acceptance check — replaces the previous rigid
         # ``len(text.split()) >= 150 * (1+N) // 2`` rule, which rejected
         # perfectly usable concise output from smaller models like
@@ -435,19 +802,6 @@ def analyze_data_points(
 # PROMPT
 # =============================================================================
 
-# System instruction sent separately from the user prompt.
-# phi3:3.8b follows system-level format rules far more reliably than
-# instructions buried inside a long user prompt.
-_SYSTEM_PROMPT = (
-    "You are a hedge fund equity analyst. "
-    "You write structured research notes. "
-    "You ALWAYS use the exact section headers given to you, each on its own line followed by a colon. "
-    "You NEVER write continuous prose without section headers. "
-    "You NEVER skip a section. "
-    "You NEVER add sections that were not requested."
-)
-
-
 def _build_prompt(
     ticker: str,
     sector: str,
@@ -456,97 +810,123 @@ def _build_prompt(
     selected_keys: List[str],
     context: Dict[str, Any],
 ) -> str:
-    # Build the data block
+    # Build a compact "selected points" section: name = value, plus
+    # per-metric reasoning guidance so the model has the right interpretive
+    # frame for each data point.
     selected_lines: List[str] = []
     for k in selected_keys:
         display = get_display_name(k)
         value = get_formatted_value(context, k)
-        selected_lines.append(f"  {display}: {value}")
-    data_block = "\n".join(selected_lines)
+        guidance = METRIC_GUIDANCE.get(k, "")
+        selected_lines.append(f"- {display}: {value}")
+        if guidance:
+            selected_lines.append(f"  GUIDANCE: {guidance}")
+    selected_block = "\n".join(selected_lines)
 
-    # Build the required sections list (just the names, no template filler)
-    section_names = ["Overview"] + [get_display_name(k) for k in selected_keys]
-    sections_list = "\n".join(f"  {i+1}. {name}" for i, name in enumerate(section_names))
+    # Brief supporting context (not the focus, just so the LLM has anchors
+    # if it needs to reference benchmarks like "vs sector average")
+    metrics = context.get("metrics") or {}
+    macro = context.get("macro") or {}
+    supporting_lines: List[str] = []
+    # Add a few high-signal anchors that aren't necessarily selected.
+    # Note: macro is now a FLAT dict (post-_flatten_macro), so we look
+    # up "fed_funds" directly, not "interest_rates.fed_funds".
+    if metrics.get("trailing_pe") is not None and "metrics.trailing_pe" not in selected_keys:
+        supporting_lines.append(f"  - Trailing P/E (context): {_fmt_ratio(metrics.get('trailing_pe'))}")
+    fed = macro.get("fed_funds")
+    if fed is not None and "macro.fed_funds" not in selected_keys:
+        supporting_lines.append(f"  - Fed Funds (context): {_fmt_pct_raw(fed)}")
+    supporting_block = "\n".join(supporting_lines) if supporting_lines else "  (none)"
 
-    # Few-shot example using a DIFFERENT ticker so phi3 doesn't copy
-    # the values verbatim instead of using the real data block.
-    example_output = (
-        "Overview:\n"
-        "AAPL trades at a slight premium to peers but strong FCF and brand moat justify "
-        "the multiple. The 28.5x P/E is above the sector median but covered by 12% "
-        "earnings growth. Stance: HOLD with bullish bias.\n\n"
-        "Last Price:\n"
-        "At $171.21, AAPL sits 4% below its 52-week high of $178.19. "
-        "The recent pullback appears technical rather than fundamental. "
-        "This level supports buying.\n\n"
-        "Trailing P/E:\n"
-        "A 28.5x trailing multiple is elevated versus the S&P 500 median of 18x but "
-        "is in line with mega-cap tech peers. Given 12% EPS growth, the PEG ratio of "
-        "2.4x is acceptable. Neutral at current levels."
+    # Resolve the company's full name for stock-specific framing. Without
+    # this, briefings drift into generic sector commentary on less-famous
+    # tickers (the COST -> "discount retailer" boilerplate problem).
+    company_name = (
+        metrics.get("name")
+        or metrics.get("shortName")
+        or metrics.get("longName")
+        or ticker
     )
 
-    return f"""Data for {ticker} ({sector} / {industry}) as of {as_of}:
-{data_block}
+    n_points = len(selected_keys)
+    total_paragraphs = 1 + n_points
 
-Required sections ({len(section_names)} total):
-{sections_list}
+    # Render the per-point output template — this drives the LLM toward the
+    # "Display Name:" header format we'll parse later.
+    output_template_lines = [
+        "Overview:",
+        "[150-200 word synthesis of all selected points]",
+        "",
+    ]
+    for k in selected_keys:
+        display = get_display_name(k)
+        output_template_lines.append(f"{display}:")
+        output_template_lines.append(f"[150-200 word analysis of {display}]")
+        output_template_lines.append("")
+    output_template = "\n".join(output_template_lines)
 
-Here is an example of the EXACT output format you must produce (this example uses AAPL, not {ticker}):
+    return f"""You are writing an institutional-grade stock research note for a hedge fund analyst.
 
-{example_output}
+=== COMPANY ===
+Ticker: {ticker}
+Company name: {company_name}
+Sector: {sector}
+Industry: {industry}
+As of: {as_of}
 
-Now write the same format for {ticker}. Use ONLY the section headers listed above. Each header must appear on its own line followed by a colon. Write 3-5 sentences per section. Use the {ticker} data provided above — do not use the AAPL example values."""
+=== SELECTED DATA POINTS (the analyst checked these {n_points}) ===
+Each item below has a value and a GUIDANCE line telling you how to reason
+about that specific metric. Use the guidance — do not substitute generic
+analyst boilerplate.
+
+{selected_block}
+
+=== SUPPORTING CONTEXT (available for benchmarking, not the focus) ===
+{supporting_block}
+
+=== TASK ===
+Produce {total_paragraphs} paragraphs total: ONE overview paragraph plus one paragraph per selected data point. Every paragraph must be specifically about **{company_name} ({ticker})**, not its sector or industry in general.
+
+1. OVERVIEW (150-200 words): Synthesize the selected points into a single investment thesis for {company_name} ({ticker}). State which selected metrics are most bullish, which are most bearish, and a clear BUY / HOLD / AVOID stance. Reference numbers from the selected points only — do not invent.
+
+2. PER-POINT PARAGRAPHS (150-200 words each): For each selected point, write one paragraph that:
+   - Quotes the exact value shown above.
+   - Applies the GUIDANCE for that metric — interpret high/low correctly for that specific field.
+   - Compares the value to a relevant benchmark (sector average, historical norm, peer, or macro context).
+   - Explains the investment implication for {company_name} ({ticker}): how it affects cash flow, valuation, growth, or risk for THIS company.
+   - Ends with an explicit stance for that single metric: "supports buying," "is a sell signal," or "is neutral."
+
+=== RULES ===
+- Use the EXACT display names above as paragraph headers (e.g. "Trailing P/E:", "Fed Funds Rate:").
+- Every paragraph must include at least one number AND mention {company_name} or {ticker} by name.
+- Apply the GUIDANCE attached to each metric — don't fall back to generic sector commentary.
+- Do not invent metrics that are not in the data.
+- No bullet points inside paragraphs — write in prose.
+- No filler ("appears," "may," "could") unless paired with a specific number or condition.
+- Do not summarize the prompt or describe the task. Just write the paragraphs.
+
+=== OUTPUT FORMAT (use this exact structure) ===
+{output_template}
+
+Now write the analysis for {company_name} ({ticker})."""
 
 
 # =============================================================================
 # OUTPUT PARSING
 # =============================================================================
 
-def _normalize_header(line: str) -> Optional[str]:
-    """Normalize a candidate header line to its lowercase core text.
-
-    Accepts plain, colon-terminated, markdown (#/##/###), bold (**),
-    and any combination. Returns None for lines that are clearly prose
-    (too long, sentence punctuation, embedded values with $ or %).
-    """
-    if not line:
-        return None
-    stripped = line.strip()
-    if not stripped or len(stripped) > 80:
-        return None
-
-    # Iteratively strip markdown markers, bold wrappers, and trailing
-    # colons until stable — handles interleaved orderings like
-    # "**Overview**:", "## **Trailing P/E:**", etc.
-    core = stripped
-    while True:
-        before = core
-        core = re.sub(r"^#{1,6}\s+", "", core)
-        core = re.sub(r"^\*\*(.+?)\*\*$", r"\1", core)
-        core = re.sub(r"^\*(.+?)\*$",     r"\1", core)
-        core = re.sub(r"^__(.+?)__$",     r"\1", core)
-        core = core.strip()
-        if core.endswith(":"):
-            core = core[:-1].strip()
-        if core == before:
-            break
-
-    if not core:
-        return None
-
-    # Reject prose lines: sentence punctuation or embedded value chars.
-    if any(ch in core for ch in (".", ",", ";", "$", "%")):
-        return None
-
-    return core.lower()
-
-
 def _split_text(text: str, selected_keys: List[str]) -> Tuple[str, Dict[str, str]]:
     """Split the LLM output into overview + per-point paragraphs.
 
-    Accepts headers in any format recognised by _normalize_header:
-    plain, colon-terminated, markdown (#/##/###), bold, or combined.
+    The model is instructed to produce headers like "Display Name:" (or
+    "Overview:") on their own line. We split on those headers.
+
+    Returns
+    -------
+    (overview_text, {key: paragraph_text})
     """
+    # Build a header -> key map so we can match the LLM output's headers
+    # back to our canonical keys (case-insensitive, ignoring trailing colons).
     header_to_key: Dict[str, str] = {}
     for k in selected_keys:
         display = get_display_name(k)
@@ -554,7 +934,7 @@ def _split_text(text: str, selected_keys: List[str]) -> Tuple[str, Dict[str, str
 
     overview = ""
     paragraphs: Dict[str, str] = {}
-    current_header: Optional[str] = None
+    current_header: Optional[str] = None  # "overview" or display name (lower)
     current_lines: List[str] = []
 
     def _flush() -> None:
@@ -578,16 +958,19 @@ def _split_text(text: str, selected_keys: List[str]) -> Tuple[str, Dict[str, str
             current_lines.append(line)
             continue
 
-        normalized = _normalize_header(stripped)
-        if normalized is not None:
-            if normalized == "overview":
+        # Detect a header line: short line ending in ":" (or "**Name:**").
+        # We strip markdown bold.
+        candidate = stripped.replace("**", "").strip()
+        if candidate.endswith(":") and len(candidate) <= 80:
+            potential = candidate[:-1].strip().lower()
+            if potential == "overview":
                 _flush()
                 current_header = "overview"
                 current_lines = []
                 continue
-            if normalized in header_to_key:
+            if potential in header_to_key:
                 _flush()
-                current_header = normalized
+                current_header = potential
                 current_lines = []
                 continue
 
@@ -642,7 +1025,6 @@ def _deterministic_fallback(
 
 def _call_ollama_text(
     prompt: str, model_name: str, config: Any, temperature: float = 0.3,
-    system: str = "",
 ) -> str:
     import urllib.request
 
@@ -659,8 +1041,6 @@ def _call_ollama_text(
             "temperature": temperature,
         },
     }
-    if system:
-        body["system"] = system
 
     req = urllib.request.Request(
         url=f"{base_url.rstrip('/')}/api/generate",

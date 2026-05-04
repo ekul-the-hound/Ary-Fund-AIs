@@ -391,41 +391,74 @@ def _compute_confidence(
 ) -> float:
     """Compute confidence from signal strength, agreement, and data coverage.
 
-    Three factors, multiplied:
+    Returns a value in [0.10, 0.95]. Designed to **move visibly** between
+    tickers — sparse-data tickers should land below 0.40, conviction-
+    plus-clean-data tickers above 0.75.
 
-        1. Strength:      |bias|, rewarded for conviction.
-        2. Agreement:     how aligned the three components are (std dev proxy).
-        3. Coverage:      fraction of expected metric fields actually present.
+    Five factors, weighted-sum:
 
-    Further dampened by combined risk level so HIGH risk caps confidence.
+        1. Strength      (weight 0.30): |bias|, rewarded for conviction.
+        2. Agreement     (weight 0.20): how aligned the three sub-biases are.
+        3. Coverage      (weight 0.25): fraction of core metrics present.
+        4. Signal count  (weight 0.15): how many sub-biases are non-trivial.
+        5. Risk dampener (multiplicative): HIGH=0.7, MEDIUM=0.9, LOW=1.0.
+
+    The previous formula (``0.3 + 0.7 * weighted_sum``) compressed the
+    output band into roughly [0.45, 0.65] for typical inputs, which is
+    why every ticker's confidence looked the same. The new band is
+    [0.10, 0.95] with a 0.5 mid-point only when factors are genuinely
+    middling.
     """
-    # Strength: 0.0 when bias is 0, 1.0 at extreme.
-    strength = min(1.0, abs(bias) * 1.5)
+    # Strength: 0.0 when bias is 0, 1.0 at |bias| >= 0.5. Scaled up from
+    # 1.5 -> 2.0 so a bias of 0.25 reaches strength=0.50 instead of 0.38.
+    strength = min(1.0, abs(bias) * 2.0)
 
-    # Agreement: punish high variance between components. Same-sign components
-    # with similar magnitudes score near 1.0; opposite signs collapse this.
+    # Agreement: low variance across sub-biases means components agree.
     components = [fund_bias, macro_bias, filings_bias]
     mean = sum(components) / len(components)
     variance = sum((c - mean) ** 2 for c in components) / len(components)
-    # variance in [0, ~1]; map to agreement in [0, 1].
-    agreement = max(0.0, 1.0 - variance)
+    agreement = max(0.0, 1.0 - variance * 4.0)  # variance ~0.25 -> agreement 0
 
     # Coverage: how many of the key metric fields are non-None.
     coverage = _metric_coverage(metrics)
 
-    # Combine, then cap by risk.
-    base = 0.3 + 0.7 * (0.4 * strength + 0.3 * agreement + 0.3 * coverage)
-    combined = _get_combined_level(risk_flags)
-    risk_cap = {"HIGH": 0.65, "MEDIUM": 0.85, "LOW": 1.0}.get(combined, 1.0)
+    # Signal count: how many sub-biases are meaningful (|x| >= 0.05).
+    # If only one of three components has a real signal, drop confidence.
+    nontrivial = sum(1 for c in components if abs(c) >= 0.05)
+    signal_count_score = nontrivial / 3.0
 
-    return _clip(base * risk_cap, 0.0, 1.0)
+    # Weighted sum (weights sum to 0.90; remaining 0.10 is the floor).
+    weighted = (
+        0.10
+        + 0.30 * strength
+        + 0.20 * agreement
+        + 0.25 * coverage
+        + 0.15 * signal_count_score
+    )
+
+    # Risk dampener (less aggressive than before so MEDIUM doesn't crush
+    # confidence on its own).
+    combined = _get_combined_level(risk_flags)
+    risk_mult = {"HIGH": 0.70, "MEDIUM": 0.90, "LOW": 1.0}.get(combined, 1.0)
+
+    return _clip(weighted * risk_mult, 0.10, 0.95)
 
 
 def _metric_coverage(metrics: Dict[str, Any]) -> float:
-    """Fraction of core metric fields that are present (non-None)."""
+    """Fraction of core metric fields that are present (non-None).
+
+    Returns a value in [0.0, 1.0]. With the expanded snapshot from
+    ``filing_analyzer`` (which now also carries ``revenue_growth_yoy``,
+    ``gross_margin``, ``operating_margin``, ``profit_margin``, and
+    ``free_cash_flow``), the expected list is broader so coverage is
+    a more honest signal than before.
+    """
     expected = (
-        "revenue_growth_3y", "debt_ebitda", "p_e", "ev_ebitda",
+        "revenue_growth_3y", "revenue_growth_yoy",
+        "gross_margin", "operating_margin",
+        "debt_ebitda", "p_e", "ev_ebitda",
         "fcf_yield", "cash_conversion", "roic", "interest_coverage",
+        "free_cash_flow", "market_cap",
     )
     if not metrics:
         return 0.0

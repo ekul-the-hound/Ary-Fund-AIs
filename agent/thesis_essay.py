@@ -217,10 +217,29 @@ def _build_essay_prompt(
     risk_block = _format_risk_block(risk_flags)
     thesis_block = _format_thesis_block(thesis)
 
+    # Build a strong identity header. The previous prompt passed only the
+    # ticker symbol, which led the LLM to fall back on sector boilerplate
+    # for less-famous tickers (e.g. writing generic retail commentary for
+    # COST instead of Costco-specific analysis).
+    company_name = (
+        (metrics or {}).get("name")
+        or (metrics or {}).get("shortName")
+        or (metrics or {}).get("longName")
+        or "Unknown Company"
+    )
+    sector = (metrics or {}).get("sector") or "Unknown Sector"
+    industry = (metrics or {}).get("industry") or "Unknown Industry"
+    company_block = (
+        f"Ticker: {ticker}\n"
+        f"Company name: {company_name}\n"
+        f"Sector: {sector}\n"
+        f"Industry: {industry}"
+    )
+
     return f"""You are a senior equity analyst writing a formal investment memo for a hedge-fund investment committee. Your job is to interpret the provided financial data and deliver a decisive analytical verdict. Every major claim must be grounded in a specific number from the context below.
 
-=== TICKER ===
-{ticker}
+=== COMPANY ===
+{company_block}
 
 === HEURISTIC VERDICT (from quant model) ===
 {thesis_block}
@@ -238,25 +257,26 @@ def _build_essay_prompt(
 {risk_block}
 
 === WRITING INSTRUCTIONS ===
-Write an institutional-quality investment memo of {_TARGET_WORDS_MIN}-{_TARGET_WORDS_SOFT_MAX} words. The memo must read like a committee-ready document, not a data dump. Structure it as follows:
+Write an institutional-quality investment memo of {_TARGET_WORDS_MIN}-{_TARGET_WORDS_SOFT_MAX} words about **{company_name} ({ticker})**. The memo must read like a committee-ready document about this specific company, not a sector or industry summary. Structure it as follows:
 
-1. **Executive Summary** (2-3 sentences). Open with a single clear thesis statement in this form: "[TICKER] is [quality assessment], but at current valuation [return expectation] unless [key condition]." Follow with the single biggest risk and the single strongest catalyst.
+1. **Executive Summary** (2-3 sentences). Open with a single clear thesis statement in this form: "{company_name} ({ticker}) is [quality assessment], but at current valuation [return expectation] unless [key condition]." Follow with the single biggest risk and the single strongest catalyst — both specific to {company_name}, not the sector.
 
-2. **Business & Financial Performance** (2-3 paragraphs). Interpret the metrics as a connected story about the business, not a list of numbers. For each metric you cite, explain what it implies — e.g. "Gross margin of X% alongside operating margin of Y% implies operating expenses consume Z percentage points, which is [high/low/typical] for [industry context]." Discuss revenue growth trajectory, margin health, cash conversion quality, and capital efficiency (ROIC). If any metric is missing, note it briefly and move on — do not dwell on data gaps.
+2. **Business & Financial Performance** (2-3 paragraphs). Interpret the metrics as a connected story about {company_name} specifically. For each metric you cite, explain what it implies — e.g. "{company_name}'s gross margin of X% alongside operating margin of Y% implies operating expenses consume Z percentage points, which is [high/low/typical] for {industry}." Discuss revenue growth trajectory, margin health, cash conversion quality, and capital efficiency (ROIC). If any metric is missing, note it briefly and move on — do not dwell on data gaps.
 
-3. **Valuation** (1-2 paragraphs). State the actual P/E, forward P/E, and EV/EBITDA from the data. Compare them against reasonable benchmarks — the S&P 500 average (~20-22x trailing P/E), the sector, or the company's own historical range. State clearly whether the stock looks cheap, fair, or expensive for its quality and growth profile, and why. If a valuation metric is unavailable, say so in one sentence and base the assessment on what IS available (e.g. FCF yield alone). Never infer or reconstruct unavailable multiples.
+3. **Valuation** (1-2 paragraphs). State the actual P/E, forward P/E, and EV/EBITDA from the data. Compare them against reasonable benchmarks — the S&P 500 average (~20-22x trailing P/E), the {sector} sector, or {company_name}'s own historical range. State clearly whether {ticker} looks cheap, fair, or expensive for its quality and growth profile, and why. If a valuation metric is unavailable, say so in one sentence and base the assessment on what IS available (e.g. FCF yield alone). Never infer or reconstruct unavailable multiples.
 
 4. **Filings & Management Signal** (1 paragraph). If filings were analyzed, comment on management tone and notable disclosures. If no filings were retrieved, state that in one sentence and move on — do not write speculative analysis from an empty data set.
 
-5. **Macro & Industry Context** (1 paragraph). Connect specific macro variables (recession probability, VIX, yield curve, rates) to this specific company's exposure. For example: "A fed funds rate of X% pressures consumer discretionary demand, but [TICKER]'s services mix provides partial insulation." If macro data is absent, say so briefly and move on.
+5. **Macro & Industry Context** (1 paragraph). Connect specific macro variables (recession probability, VIX, yield curve, rates) to {company_name}'s specific exposure. For example: "A fed funds rate of X% pressures {industry} demand, but {company_name}'s [specific business attribute] provides partial insulation." If macro data is absent, say so briefly and move on.
 
-6. **Risks** (1 paragraph). Rank the top 3 risks from most to least impactful. For each: name it specifically (e.g. "iPhone demand slowdown in China" not "revenue growth risk"), explain the transmission mechanism to earnings or stock price, and note what data you would watch to see it materializing.
+6. **Risks** (1 paragraph). Rank the top 3 risks from most to least impactful. For each: name it specifically to {company_name} (e.g. "iPhone demand slowdown in China" not "revenue growth risk"), explain the transmission mechanism to earnings or stock price, and note what data you would watch to see it materializing.
 
-7. **Catalysts** (1 short paragraph). List 2-3 specific catalysts that could drive upside, with rough timing if possible (e.g. "next earnings report", "product launch cycle", "buyback acceleration").
+7. **Catalysts** (1 short paragraph). List 2-3 specific catalysts that could drive upside for {ticker}, with rough timing if possible (e.g. "next earnings report", "product launch cycle", "buyback acceleration").
 
 8. **Verdict** (2-3 sentences). Deliver a clear, decisive recommendation: BUY, HOLD, or AVOID at current levels. State the one-year return expectation qualitatively (strong upside / modest upside / flat / downside). Name the single data point that would change this verdict.
 
 STYLE RULES:
+- Refer to the company by its full name ({company_name}) and ticker ({ticker}) repeatedly throughout the memo. Do not write a generic sector memo.
 - Prose paragraphs only. No bullet points anywhere except in Risks and Catalysts where ranking is essential.
 - Every quantitative claim must cite a specific number from the context. If a metric is unavailable, acknowledge it in ONE sentence then move on. Never repeat data-gap warnings.
 - If the heuristic shows a signal tension (bullish outlook + flat direction), reconcile it in the Executive Summary: typically "high business quality but stretched valuation" or "strong fundamentals dampened by elevated risk."
@@ -264,7 +284,7 @@ STYLE RULES:
 - The thesis in the Executive Summary and the verdict in the Conclusion must be logically consistent. If the business is strong but the stock is expensive, say "HOLD" or "AVOID" — not "bullish."
 - Do not repeat heuristic bias scores verbatim. Do not use generic filler.
 
-Now write the memo."""
+Now write the memo about {company_name} ({ticker})."""
 
 
 def _format_thesis_block(thesis: Dict[str, Any]) -> str:

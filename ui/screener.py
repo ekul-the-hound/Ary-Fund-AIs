@@ -33,6 +33,26 @@ import numpy as np
 import pandas as pd
 import streamlit as st
 
+# Issue #4 fix: pull tickers from the full curated US universe (~560 names)
+# rather than the original 22-stock seed. Free-text search adds anything
+# else.
+try:
+    from data.universe import (
+        US_UNIVERSE,
+        is_valid_us_ticker,
+        normalize_ticker,
+    )
+except ImportError:
+    # Defensive fallback in case the universe module is missing — keep
+    # the screener working with just the seed list rather than crashing.
+    US_UNIVERSE: tuple = ()  # type: ignore[no-redef]
+
+    def is_valid_us_ticker(symbol: str) -> bool:  # type: ignore[no-redef]
+        return bool(symbol) and symbol.strip().isalpha() and len(symbol.strip()) <= 5
+
+    def normalize_ticker(symbol: str) -> str:  # type: ignore[no-redef]
+        return (symbol or "").strip().upper()
+
 
 # ======================================================================
 # Theme / styling
@@ -594,12 +614,100 @@ def _build_screener_frame() -> pd.DataFrame:
     Cached so synthetic fills + per-symbol RNG seeds stay stable across
     reruns. Cleared automatically every 5min and on Streamlit's "Refresh
     data" button (which calls `st.cache_data.clear()`).
+
+    Universe expansion (Issue #4 fix)
+    ---------------------------------
+    Previously this used only the 22 hand-coded ``_SEED_STOCKS``. The
+    screener now seeds from the full ``US_UNIVERSE`` (~560 names: S&P 500
+    + extra large/mid caps), keeps the hand-curated values for the 22
+    popular tickers, and synthesizes plausible price/market_cap for the
+    rest. Any additional symbols the user types into the search box are
+    appended on top of this base.
+
+    Synthetic values are deliberately rough — once the live MarketData
+    batch fetch lands, the real price/cap fields will overwrite these.
     """
-    df = pd.DataFrame(_SEED_STOCKS)
+    base = _build_full_universe_seed()
+    df = pd.DataFrame(base)
     df = _enrich_with_synthetic_fields(df)
     # Default sort: market cap desc, matching TradingView's default.
     df = df.sort_values("market_cap", ascending=False, na_position="last").reset_index(drop=True)
     return df
+
+
+def _build_full_universe_seed() -> list[dict[str, Any]]:
+    """Merge the 22 hand-curated seed stocks with the full US universe.
+
+    Returns a list of dicts shaped for ``_enrich_with_synthetic_fields``,
+    one per ticker in ``US_UNIVERSE`` plus any user-added tickers stored
+    in ``st.session_state["custom_tickers"]``. The 22 tickers in
+    ``_SEED_STOCKS`` keep their hand-curated values so the most popular
+    names display the right price/cap; the other ~538 get synthesized.
+    """
+    # Start with the curated rows (real-ish values for the popular 22).
+    by_symbol: dict[str, dict[str, Any]] = {row["symbol"]: dict(row) for row in _SEED_STOCKS}
+
+    # Per-ticker deterministic RNG so synthesized rows don't reshuffle
+    # between reruns. Seeded off the symbol so AAPL always gets the same
+    # synthetic numbers.
+    def _rng_for(sym: str) -> np.random.Generator:
+        return np.random.default_rng(31 + (hash(sym) & 0xFFFF))
+
+    # Fill in the rest of the US universe.
+    for sym in US_UNIVERSE:
+        if sym in by_symbol:
+            continue
+        rng = _rng_for(sym)
+        # Plausible large-cap defaults; the table looks reasonable even
+        # before live data arrives. Numbers below are intentionally mid-
+        # range so no row sticks out as a synthetic artifact.
+        market_cap = float(abs(rng.normal(50e9, 80e9))) + 5e9
+        price = float(abs(rng.normal(120, 80))) + 5
+        by_symbol[sym] = {
+            "symbol": sym,
+            "name": sym,                  # display name; real name fills via live fetch
+            "price": price,
+            "change_pct": float(rng.normal(0, 1.8)),
+            "volume": float(abs(rng.normal(8_000_000, 6_000_000))) + 100_000,
+            "rel_volume": float(abs(rng.normal(1.0, 0.5))),
+            "market_cap": market_cap,
+            "pe": float(abs(rng.normal(22, 12))),
+            "eps_dil": float(rng.normal(5, 4)),
+            "eps_dil_growth": float(rng.normal(8, 18)),
+            "div_yield": max(0.0, float(rng.normal(1.2, 1.0))),
+            "sector": "Other",            # real sector fills via live fetch
+            "analyst_rating": "Hold",
+        }
+
+    # Append any user-added custom tickers from session state.
+    custom = []
+    try:
+        custom = st.session_state.get("custom_tickers", []) or []
+    except Exception:
+        # Outside Streamlit context (e.g. unit tests) — fine, just skip.
+        pass
+
+    for sym in custom:
+        if sym in by_symbol:
+            continue
+        rng = _rng_for(sym)
+        by_symbol[sym] = {
+            "symbol": sym,
+            "name": sym,
+            "price": float(abs(rng.normal(80, 50))) + 5,
+            "change_pct": float(rng.normal(0, 1.8)),
+            "volume": float(abs(rng.normal(2_000_000, 2_000_000))) + 50_000,
+            "rel_volume": 1.0,
+            "market_cap": float(abs(rng.normal(10e9, 15e9))) + 1e8,
+            "pe": float(abs(rng.normal(20, 10))),
+            "eps_dil": float(rng.normal(4, 3)),
+            "eps_dil_growth": float(rng.normal(5, 15)),
+            "div_yield": 0.0,
+            "sector": "Other",
+            "analyst_rating": "Neutral",
+        }
+
+    return list(by_symbol.values())
 
 
 # ======================================================================
@@ -907,8 +1015,75 @@ def render_screener_tab() -> None:
     """Render the entire Screener tab. Safe to call inside a `with tab_x:`."""
     st.markdown(_SCREENER_CSS, unsafe_allow_html=True)
     _render_header()
+    _render_search_box()  # Issue #4: free-text ticker search
     _render_filter_bar()
     st.markdown("")  # spacer
     category = _render_category_tabs()
     df = _build_screener_frame()
     _render_results_table(df, category)
+
+
+def _render_search_box() -> None:
+    """Free-text ticker search.
+
+    Lets users research any US-listed ticker, not just the ~560 in the
+    curated universe. Validates loosely (must look like a US ticker
+    symbol) — yfinance handles the actual existence check downstream.
+
+    Workflow:
+      1. User types a symbol (e.g. "PLTR", "BRK.B", "abcde").
+      2. On submit, the symbol is normalized (uppercase, dot/hyphen
+         handling) and validated.
+      3. Valid symbols are added to ``st.session_state["custom_tickers"]``
+         so they appear in the screener table on the next render, AND
+         set as ``active_ticker`` so the rest of the app jumps straight
+         to that stock's analysis tabs.
+      4. Cache is cleared so the new ticker shows up immediately.
+    """
+    st.session_state.setdefault("custom_tickers", [])
+
+    with st.container():
+        col_input, col_btn, col_info = st.columns([3, 1, 4])
+        with col_input:
+            typed = st.text_input(
+                "Search any US ticker",
+                value="",
+                placeholder="e.g. AAPL, COST, BRK.B, PLTR...",
+                key="_screener_search_input",
+                label_visibility="collapsed",
+            )
+        with col_btn:
+            submitted = st.button("Add / Open", use_container_width=True)
+        with col_info:
+            n_universe = len(US_UNIVERSE)
+            n_custom = len(st.session_state.get("custom_tickers", []))
+            st.markdown(
+                f"<div class='ary-screener-meta'>"
+                f"Universe: {n_universe} S&P + large-caps · "
+                f"+{n_custom} added by you"
+                f"</div>",
+                unsafe_allow_html=True,
+            )
+
+        if submitted and typed:
+            symbol = normalize_ticker(typed)
+            if not is_valid_us_ticker(symbol):
+                st.warning(
+                    f"'{typed}' doesn't look like a US ticker symbol. "
+                    "Tickers are 1-5 letters, optionally with a dot suffix "
+                    "(e.g. BRK.B)."
+                )
+                return
+
+            # Add to custom tickers if not already in the universe.
+            customs = list(st.session_state.get("custom_tickers", []))
+            if symbol not in US_UNIVERSE and symbol not in customs:
+                customs.append(symbol)
+                st.session_state["custom_tickers"] = customs
+                # Bust the cache so _build_screener_frame picks up the
+                # new ticker on next render.
+                _build_screener_frame.clear()
+
+            # Hand off to the rest of the app.
+            st.session_state["active_ticker"] = symbol
+            st.rerun()
