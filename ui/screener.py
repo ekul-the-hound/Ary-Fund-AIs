@@ -1,21 +1,29 @@
 """TradingView-style stock screener tab for ARY QUANT.
 
-Base-layout pass. This module is intentionally self-contained:
+Data sources
+------------
+This module renders the screener table from **real market data**:
 
-    - All data is seeded from `_SEED_STOCKS` so the layout renders instantly
-      with no live-data dependency. Hooks are marked with `# TODO`.
-    - Filter pill controls are rendered as `st.popover` widgets so they have
-      the right look and behaviour, but their callbacks are placeholders.
-    - Category tabs (Overview, Performance, Valuation, …) change which
-      columns the table renders, not the underlying data.
-    - Row click writes the selected symbol to `st.session_state['active_ticker']`
-      and reruns the app — the rest of `ui/app.py` (which reads from the same
-      session_state key) picks it up automatically and the Overview / Briefing /
-      Data-Point Analyzer tabs all refresh for the new ticker with zero extra
-      plumbing.
+    1. Live prices, volume, and 1-day change come from a single
+       ``yf.download`` batch call (``_fetch_live_prices_batch``),
+       cached for 5 minutes. One HTTP round trip covers the whole
+       universe (~560 symbols).
 
-Wire-up contract with `ui/app.py`:
+    2. Fundamentals (P/E, market cap, sector, margins, growth, etc.)
+       come from ``MarketData.get_fundamentals`` via yfinance, lazy-
+       loaded for the visible/filtered subset and SQLite-cached for
+       24 hours so re-renders are instant.
 
+    3. ``_OFFLINE_FALLBACK_STOCKS`` is the *last-resort* list used
+       only when both yfinance and MarketData fail (no network,
+       missing modules). A banner makes this state visible to the
+       user so they know they're seeing stale data.
+
+There is **no synthetic / RNG-generated data** in the default flow.
+Cells that aren't yet loaded display "—" rather than fabricated values.
+
+Wire-up contract with `ui/app.py`
+---------------------------------
     * `app.py` initialises `st.session_state['active_ticker']` before tabs are
       rendered.
     * `app.py` reads from that same key when calling `load_ticker_context`.
@@ -43,15 +51,237 @@ try:
         normalize_ticker,
     )
 except ImportError:
-    # Defensive fallback in case the universe module is missing — keep
-    # the screener working with just the seed list rather than crashing.
-    US_UNIVERSE: tuple = ()  # type: ignore[no-redef]
+    # Flat-layout fallback (file lives next to data/universe.py).
+    try:
+        from universe import (  # type: ignore[no-redef]
+            US_UNIVERSE,
+            is_valid_us_ticker,
+            normalize_ticker,
+        )
+    except ImportError:
+        # Defensive fallback in case the universe module is missing — keep
+        # the screener working with just the seed list rather than crashing.
+        US_UNIVERSE: tuple = ()  # type: ignore[no-redef]
 
-    def is_valid_us_ticker(symbol: str) -> bool:  # type: ignore[no-redef]
-        return bool(symbol) and symbol.strip().isalpha() and len(symbol.strip()) <= 5
+        def is_valid_us_ticker(symbol: str) -> bool:  # type: ignore[no-redef]
+            return bool(symbol) and symbol.strip().isalpha() and len(symbol.strip()) <= 5
 
-    def normalize_ticker(symbol: str) -> str:  # type: ignore[no-redef]
-        return (symbol or "").strip().upper()
+        def normalize_ticker(symbol: str) -> str:  # type: ignore[no-redef]
+            return (symbol or "").strip().upper()
+
+
+# ----------------------------------------------------------------------
+# MarketData (real-data fundamentals via yfinance, SQLite-cached)
+# ----------------------------------------------------------------------
+# Importing under a try/except so a missing market_data module degrades
+# gracefully to the offline-fallback path rather than crashing the tab.
+try:
+    from data.market_data import MarketData  # type: ignore
+except ImportError:
+    try:
+        from market_data import MarketData  # type: ignore
+    except ImportError:
+        MarketData = None  # type: ignore[misc, assignment]
+
+
+# ======================================================================
+# Real-data fetchers
+# ======================================================================
+# These functions provide *real* data for the screener via two layers:
+#
+#   1. ``_fetch_live_prices_batch`` — one call to ``yf.download`` returns
+#      last-close, prev-close, and volume for the entire universe in a
+#      single HTTP round trip. Cached for 5 minutes.
+#
+#   2. ``_fetch_fundamentals_one`` — wraps the existing MarketData
+#      fundamentals fetcher (already SQLite-cached for 24h). Called
+#      lazily for the visible/filtered subset to avoid 500+ HTTP calls
+#      on every render.
+#
+# Together they replace the previous synthetic RNG fills. Synthetic data
+# is now only used as a last-resort offline fallback (see
+# ``_OFFLINE_FALLBACK_STOCKS`` below) — never silently in normal flow.
+# ======================================================================
+def _normalize_recommendation(rec: Any) -> str:
+    """Map yfinance's `recommendationKey` to the labels the screener uses."""
+    if not rec:
+        return "—"
+    s = str(rec).strip().lower()
+    return {
+        "strong_buy":  "Strong buy",
+        "buy":         "Buy",
+        "hold":        "Neutral",
+        "neutral":     "Neutral",
+        "underperform":"Sell",
+        "sell":        "Sell",
+        "strong_sell": "Strong sell",
+    }.get(s, str(rec).title())
+
+
+@st.cache_data(ttl=300, show_spinner="Fetching live prices…")
+def _fetch_live_prices_batch(symbols: tuple[str, ...]) -> pd.DataFrame:
+    """Last-close + previous-close + volume for the whole universe in one
+    HTTP call via ``yf.download``.
+
+    Returns a DataFrame indexed by symbol with columns:
+        price, change_pct, volume, prev_close
+
+    On any failure (no network, yfinance hiccup), returns an empty frame
+    so the caller can fall back to the offline seed.
+    """
+    if not symbols:
+        return pd.DataFrame(columns=["symbol", "price", "change_pct", "volume", "prev_close"])
+
+    try:
+        import yfinance as yf  # local import — keeps the module importable
+                                # in environments where yfinance is missing.
+    except ImportError:
+        return pd.DataFrame()
+
+    try:
+        # period="5d" covers weekends / market holidays so we always have at
+        # least 2 trading sessions worth of closes.
+        px = yf.download(
+            list(symbols),
+            period="5d",
+            progress=False,
+            group_by="ticker",
+            auto_adjust=False,
+            threads=True,
+        )
+    except Exception:
+        return pd.DataFrame()
+
+    rows: list[dict[str, Any]] = []
+    multi = isinstance(px.columns, pd.MultiIndex)
+    for sym in symbols:
+        try:
+            sub = px[sym] if multi else px
+            closes = sub["Close"].dropna()
+            vols   = sub["Volume"].dropna() if "Volume" in sub.columns else pd.Series(dtype=float)
+            if len(closes) == 0:
+                continue
+            price = float(closes.iloc[-1])
+            prev  = float(closes.iloc[-2]) if len(closes) >= 2 else price
+            change_pct = ((price / prev) - 1.0) * 100.0 if prev else 0.0
+            volume = float(vols.iloc[-1]) if len(vols) else float("nan")
+            rows.append({
+                "symbol": sym,
+                "price": price,
+                "change_pct": change_pct,
+                "volume": volume,
+                "prev_close": prev,
+            })
+        except Exception:
+            # Skip individual failures — one missing symbol shouldn't
+            # take down the whole screener.
+            continue
+    return pd.DataFrame(rows)
+
+
+@st.cache_data(ttl=86400, show_spinner=False)
+def _fetch_fundamentals_one(symbol: str) -> dict[str, Any]:
+    """Real fundamentals for one symbol via ``MarketData.get_fundamentals``.
+
+    MarketData wraps yfinance and already SQLite-caches for 24h, so this
+    decorator is mostly belt-and-suspenders against re-renders.
+
+    Returns a flat dict shaped to the column names the screener expects.
+    Empty dict if MarketData is unavailable or yfinance fails.
+    """
+    if MarketData is None:
+        return {}
+    try:
+        md = MarketData()
+        f = md.get_fundamentals(symbol, use_cache=True)
+    except Exception:
+        return {}
+
+    ov  = f.get("overview", {})    or {}
+    val = f.get("valuation", {})   or {}
+    fin = f.get("financials", {})  or {}
+    gr  = f.get("growth", {})      or {}
+    div = f.get("dividends", {})   or {}
+    an  = f.get("analyst", {})     or {}
+
+    def _pct(x: Any) -> float:
+        """yfinance returns ratios as decimals (e.g. 0.23 = 23%); convert."""
+        try:
+            return float(x) * 100.0
+        except (TypeError, ValueError):
+            return float("nan")
+
+    def _num(x: Any) -> float:
+        try:
+            return float(x)
+        except (TypeError, ValueError):
+            return float("nan")
+
+    return {
+        "symbol":           symbol,
+        "name":             f.get("name") or symbol,
+        "sector":           f.get("sector") or "—",
+        # Overview
+        "market_cap":       _num(ov.get("market_cap")),
+        "beta":             _num(ov.get("beta")),
+        # Valuation
+        "pe":               _num(val.get("trailing_pe")),
+        "forward_pe":       _num(val.get("forward_pe")),
+        "peg":              _num(val.get("peg_ratio")),
+        "ps":               _num(val.get("price_to_sales")),
+        "pb":               _num(val.get("price_to_book")),
+        "ev_ebitda":        _num(val.get("ev_to_ebitda")),
+        # Financials
+        "revenue":          _num(fin.get("revenue")),
+        "gross_profit":     _num(fin.get("gross_profit")),
+        "ebitda":           _num(fin.get("ebitda")),
+        "net_income":       _num(fin.get("net_income")),
+        "fcf":              _num(fin.get("free_cash_flow")),
+        "op_cash_flow":     _num(fin.get("operating_cash_flow")),
+        "total_debt":       _num(fin.get("total_debt")),
+        # yfinance returns debtToEquity as a percent already (e.g. 60.5),
+        # not a decimal — keep as-is for display.
+        "debt_to_equity":   _num(fin.get("debt_to_equity")),
+        "current_ratio":    _num(fin.get("current_ratio")),
+        "roe":              _pct(fin.get("return_on_equity")),
+        "roa":              _pct(fin.get("return_on_assets")),
+        "profit_margin":    _pct(fin.get("profit_margin")),
+        "gross_margin":     _pct(fin.get("gross_margin")),
+        "op_margin":        _pct(fin.get("operating_margin")),
+        # Growth
+        "revenue_growth":   _pct(gr.get("revenue_growth")),
+        "eps_dil_growth":   _pct(gr.get("earnings_growth")),
+        # Dividends
+        # yfinance: dividendYield is already a percent in newer versions
+        # (e.g. 0.74 = 0.74%), but historically was a decimal (0.0074).
+        # We probe and normalize: a value < 1 is treated as decimal.
+        "div_yield":        _div_yield_normalize(div.get("dividend_yield")),
+        "div_payout":       _pct(div.get("payout_ratio")),
+        "ex_div_date":      str(div.get("ex_dividend_date") or "—"),
+        # Analyst
+        "analyst_rating":   _normalize_recommendation(an.get("recommendation")),
+    }
+
+
+def _div_yield_normalize(raw: Any) -> float:
+    """yfinance's dividend yield reporting changed mid-2024.
+
+    Old format:  0.0074  (decimal, meaning 0.74%)
+    New format:  0.74    (already a percentage)
+
+    Heuristic: if the value is between 0 and 1 it's almost certainly the
+    decimal form; if > 1 it's already a percentage. This avoids the
+    common bug where AAPL shows "0.38%" (correct) vs "38%" (decimal *100).
+    """
+    if raw is None:
+        return float("nan")
+    try:
+        v = float(raw)
+    except (TypeError, ValueError):
+        return float("nan")
+    if 0 < v < 1:
+        return v * 100.0
+    return v
 
 
 # ======================================================================
@@ -156,30 +386,20 @@ _SECTOR_COLORS: dict[str, str] = {
 # ======================================================================
 # Seed data
 # ======================================================================
-# TODO(luke): replace with a live MarketData batch fetch — yfinance supports
-# `download(["NVDA","AAPL",...], period="2d")` which gets last close + prev
-# close in one round trip. Wrap in `@st.cache_data(ttl=300)`. Rough sketch:
+# ======================================================================
+# Offline fallback seed data
+# ======================================================================
+# This block is *only* used when the live data path fails entirely:
+# yfinance unreachable, no network, MarketData import broken, etc. The
+# values below are last-known reasonable numbers — the screener will
+# render with these so the UI doesn't crash, but a banner is shown so
+# the user knows they're seeing stale data instead of live.
 #
-#     @st.cache_data(ttl=300, show_spinner=False)
-#     def _fetch_screener_frame(symbols: tuple[str, ...]) -> pd.DataFrame:
-#         px = yf.download(list(symbols), period="2d", progress=False,
-#                          group_by="ticker", auto_adjust=False)
-#         rows = []
-#         for sym in symbols:
-#             try:
-#                 last_two = px[sym]["Close"].dropna().tail(2)
-#                 price = float(last_two.iloc[-1])
-#                 prev  = float(last_two.iloc[0])
-#                 rows.append({"symbol": sym, "price": price,
-#                              "change_pct": (price/prev - 1) * 100})
-#             except Exception:
-#                 rows.append({"symbol": sym, "price": np.nan,
-#                              "change_pct": np.nan})
-#         return pd.DataFrame(rows)
-#
-# For now the table is populated from the static dict below so the UI is
-# fast and deterministic during layout iteration.
-_SEED_STOCKS: list[dict[str, Any]] = [
+# In the normal flow, ``_build_screener_frame`` calls
+# ``_fetch_live_prices_batch`` (one HTTP round-trip via yf.download)
+# for prices/volume/change, then lazy-loads fundamentals via
+# ``_fetch_fundamentals_one`` for the visible/filtered subset.
+_OFFLINE_FALLBACK_STOCKS: list[dict[str, Any]] = [
     {"symbol":"NVDA", "name":"NVIDIA Corporation",        "price":199.57, "change_pct":-4.63, "volume":225_240_000, "rel_volume":1.56, "market_cap":4.85e12, "pe":40.72, "eps_dil":4.90,    "eps_dil_growth":66.75,  "div_yield":0.02, "sector":"Electronic Technology",   "analyst_rating":"Strong buy"},
     {"symbol":"GOOG", "name":"Alphabet Inc.",             "price":381.94, "change_pct": 9.97, "volume": 44_570_000, "rel_volume":2.72, "market_cap":4.65e12, "pe":29.14, "eps_dil":13.11,   "eps_dil_growth":46.15,  "div_yield":0.24, "sector":"Technology Services",     "analyst_rating":"Strong buy"},
     {"symbol":"AAPL", "name":"Apple Inc.",                "price":271.35, "change_pct": 0.42, "volume": 91_840_000, "rel_volume":2.20, "market_cap":3.98e12, "pe":34.33, "eps_dil":7.90,    "eps_dil_growth":25.65,  "div_yield":0.38, "sector":"Electronic Technology",   "analyst_rating":"Buy"},
@@ -503,211 +723,201 @@ _FORMATTERS: dict[str, Callable[[Any], str]] = {
 
 
 # ======================================================================
-# Frame construction
+# Frame construction (real data only)
 # ======================================================================
-def _enrich_with_synthetic_fields(df: pd.DataFrame) -> pd.DataFrame:
-    """Fill in fields the seed dict doesn't carry, deterministically.
+# The full set of columns the screener can render across all category
+# tabs. Any column not populated by the live data path is left as NaN
+# (which the formatters render as "—") rather than synthesized.
+_ALL_SCREENER_COLUMNS: tuple[str, ...] = (
+    # Core identity
+    "symbol", "name", "sector",
+    # Price (live: yf.download)
+    "price", "change_pct", "volume", "rel_volume", "prev_close",
+    # Overview / valuation (lazy: MarketData.get_fundamentals)
+    "market_cap", "pe", "forward_pe", "peg", "ps", "pb", "ev_ebitda",
+    "eps_dil", "eps_dil_growth",
+    # Dividends
+    "div_yield", "div_per_share", "div_payout", "div_growth_5y", "ex_div_date",
+    # Profitability
+    "gross_margin", "op_margin", "profit_margin", "fcf_margin",
+    "roa", "roe", "roic",
+    # Income statement
+    "revenue", "revenue_growth", "gross_profit", "operating_income",
+    "net_income", "ebitda",
+    # Balance sheet
+    "total_assets", "total_debt", "debt_to_equity", "current_ratio",
+    "cash_per_share", "book_per_share",
+    # Cash flow
+    "op_cash_flow", "capex", "fcf", "fcf_per_share", "fcf_yield",
+    "sales_per_share",
+    # Performance / technicals (not yet pulled — left blank)
+    "perf_1w", "perf_1m", "perf_3m", "perf_6m", "perf_ytd", "perf_1y",
+    "volatility_1m", "rsi_14", "ma_50", "ma_200", "beta", "atr_14",
+    # Extended hours (not yet pulled — left blank)
+    "premarket_close", "premarket_chg_pct", "premarket_vol",
+    "postmarket_close", "postmarket_chg_pct", "postmarket_vol",
+    # Analyst
+    "analyst_rating",
+)
 
-    Per-symbol seeded RNG so the synthetic numbers are stable across
-    reruns — the table doesn't flicker when categories change.
 
-    Columns are assigned via lists (not `out.at[i, col] = …`) so pandas
-    infers dtype from the values rather than coercing into a pre-existing
-    float64 NaN-filled column. That matters for `ex_div_date`, which is a
-    string — newer pandas raises `LossySetitemError` if we try to write
-    strings into a float column.
+# Cap on lazy fundamentals fetches per render. Each call is a yfinance
+# round trip; even with 24h SQLite caching, the *first* render after a
+# clean start can hit dozens of network calls for the visible page.
+# 60 covers the default Streamlit dataframe height comfortably without
+# stalling the UI on cold caches.
+_FUNDAMENTALS_LAZY_LIMIT = 60
 
-    TODO(luke): replace these synthetic fills with real values when the
-    live MarketData / fundamentals fetch lands. The keys here are exactly
-    the columns referenced by the non-Overview category tabs.
+
+def _empty_screener_row(symbol: str) -> dict[str, Any]:
+    """Row template for a symbol with no real data yet.
+
+    Every column from ``_ALL_SCREENER_COLUMNS`` is present so the
+    DataFrame schema is stable. Numeric fields are NaN (formatters
+    show "—"); string fields default to the symbol or em-dash.
     """
-    out = df.copy()
-    rng_seed_base = 17
-
-    def _rng_for(sym: str) -> np.random.Generator:
-        return np.random.default_rng(rng_seed_base + (hash(sym) & 0xFFFF))
-
-    def _gen(col_default: dict[str, Callable[[np.random.Generator, dict[str, Any]], Any]]) -> None:
-        for col, fn in col_default.items():
-            existing = out[col] if col in out.columns else None
-            values: list[Any] = []
-            for i, row in out.iterrows():
-                current = existing.iloc[i] if existing is not None else np.nan
-                if pd.notna(current):
-                    values.append(current)
-                else:
-                    values.append(fn(_rng_for(str(row["symbol"])), row.to_dict()))
-            # Assign as a fresh column — dtype is inferred from values,
-            # so string columns stay object-typed and float columns float.
-            out[col] = values
-
-    _gen({
-        # Performance (anchored on change_pct so the day move stays consistent)
-        "perf_1w":          lambda r, _: float(r.normal(2.0, 4.5)),
-        "perf_1m":          lambda r, _: float(r.normal(4.0, 8.0)),
-        "perf_3m":          lambda r, _: float(r.normal(8.0, 14.0)),
-        "perf_6m":          lambda r, _: float(r.normal(12.0, 20.0)),
-        "perf_ytd":         lambda r, _: float(r.normal(18.0, 25.0)),
-        "perf_1y":          lambda r, _: float(r.normal(22.0, 30.0)),
-        "volatility_1m":    lambda r, _: float(abs(r.normal(28.0, 12.0))),
-        # Extended hours
-        "premarket_close":   lambda r, row: float(row.get("price") or 0) * (1 + r.normal(0, 0.005)),
-        "premarket_chg_pct": lambda r, _: float(r.normal(0, 0.4)),
-        "premarket_vol":     lambda r, _: float(abs(r.normal(2_000_000, 1_500_000))),
-        "postmarket_close":  lambda r, row: float(row.get("price") or 0) * (1 + r.normal(0, 0.004)),
-        "postmarket_chg_pct":lambda r, _: float(r.normal(0, 0.3)),
-        "postmarket_vol":    lambda r, _: float(abs(r.normal(1_200_000, 900_000))),
-        # Valuation
-        "peg": lambda r, row: float(row.get("pe") or 25) / max(abs(float(row.get("eps_dil_growth") or 10)), 1),
-        "ps":  lambda r, _: float(abs(r.normal(8.0, 6.0))),
-        "pb":  lambda r, _: float(abs(r.normal(6.0, 5.0))),
-        "p_fcf": lambda r, _: float(abs(r.normal(35.0, 25.0))),
-        "ev_ebitda": lambda r, _: float(abs(r.normal(22.0, 12.0))),
-        # Dividends
-        "div_per_share": lambda r, row: float(row.get("price") or 100) * float(row.get("div_yield") or 0) / 100,
-        "div_payout":    lambda r, _: float(abs(r.normal(35.0, 20.0))),
-        "div_growth_5y": lambda r, _: float(r.normal(8.0, 6.0)),
-        "ex_div_date":   lambda r, _: f"2026-{int(r.integers(1,13)):02d}-{int(r.integers(1,28)):02d}",
-        # Profitability
-        "gross_margin":  lambda r, _: float(abs(r.normal(45.0, 18.0))),
-        "op_margin":     lambda r, _: float(abs(r.normal(22.0, 12.0))),
-        "profit_margin": lambda r, _: float(abs(r.normal(15.0, 10.0))),
-        "fcf_margin":    lambda r, _: float(abs(r.normal(18.0, 10.0))),
-        "roa":           lambda r, _: float(abs(r.normal(10.0, 6.0))),
-        "roe":           lambda r, _: float(abs(r.normal(20.0, 12.0))),
-        "roic":           lambda r, _: float(abs(r.normal(15.0, 9.0))),
-        # Income statement (scale to market cap so numbers feel plausible)
-        "revenue":        lambda r, row: float(row.get("market_cap") or 1e10) * float(abs(r.normal(0.20, 0.10))),
-        "revenue_growth": lambda r, _: float(r.normal(8.0, 12.0)),
-        "gross_profit":   lambda r, row: float(row.get("market_cap") or 1e10) * float(abs(r.normal(0.10, 0.05))),
-        "operating_income": lambda r, row: float(row.get("market_cap") or 1e10) * float(abs(r.normal(0.05, 0.03))),
-        "net_income":     lambda r, row: float(row.get("market_cap") or 1e10) * float(abs(r.normal(0.04, 0.02))),
-        "ebitda":         lambda r, row: float(row.get("market_cap") or 1e10) * float(abs(r.normal(0.07, 0.04))),
-        # Balance sheet
-        "total_assets":   lambda r, row: float(row.get("market_cap") or 1e10) * float(abs(r.normal(1.2, 0.5))),
-        "total_debt":     lambda r, row: float(row.get("market_cap") or 1e10) * float(abs(r.normal(0.25, 0.15))),
-        "debt_to_equity": lambda r, _: float(abs(r.normal(0.6, 0.4))),
-        "current_ratio":  lambda r, _: float(abs(r.normal(1.5, 0.6))),
-        "cash_per_share": lambda r, row: float(row.get("price") or 100) * float(abs(r.normal(0.08, 0.05))),
-        "book_per_share": lambda r, row: float(row.get("price") or 100) * float(abs(r.normal(0.20, 0.10))),
-        # Cash flow
-        "op_cash_flow":   lambda r, row: float(row.get("market_cap") or 1e10) * float(abs(r.normal(0.06, 0.03))),
-        "capex":          lambda r, row: -float(row.get("market_cap") or 1e10) * float(abs(r.normal(0.02, 0.012))),
-        "fcf":            lambda r, row: float(row.get("market_cap") or 1e10) * float(abs(r.normal(0.04, 0.025))),
-        "fcf_per_share":  lambda r, row: float(row.get("price") or 100) * float(abs(r.normal(0.04, 0.02))),
-        "fcf_yield":      lambda r, _: float(abs(r.normal(3.5, 2.0))),
-        "sales_per_share":lambda r, row: float(row.get("price") or 100) * float(abs(r.normal(0.30, 0.15))),
-        # Technicals
-        "rsi_14":         lambda r, _: float(np.clip(r.normal(55, 15), 5, 95)),
-        "ma_50":          lambda r, row: float(row.get("price") or 100) * (1 + float(r.normal(-0.02, 0.04))),
-        "ma_200":         lambda r, row: float(row.get("price") or 100) * (1 + float(r.normal(-0.06, 0.08))),
-        "beta":           lambda r, _: float(abs(r.normal(1.1, 0.4))),
-        "atr_14":         lambda r, row: float(row.get("price") or 100) * 0.025,
-    })
-    return out
+    row: dict[str, Any] = {col: float("nan") for col in _ALL_SCREENER_COLUMNS}
+    row["symbol"] = symbol
+    row["name"] = symbol
+    row["sector"] = "—"
+    row["analyst_rating"] = "—"
+    row["ex_div_date"] = "—"
+    return row
 
 
 @st.cache_data(ttl=300, show_spinner=False)
 def _build_screener_frame() -> pd.DataFrame:
-    """Build the canonical screener DataFrame (all columns, all symbols).
+    """Build the canonical screener DataFrame using **live data only**.
 
-    Cached so synthetic fills + per-symbol RNG seeds stay stable across
-    reruns. Cleared automatically every 5min and on Streamlit's "Refresh
-    data" button (which calls `st.cache_data.clear()`).
+    Flow:
+        1. Enumerate the universe (US_UNIVERSE + any user-added tickers).
+        2. Fetch live prices/volume/change for all symbols in one
+           ``yf.download`` batch (cached 5min).
+        3. Lazy-load fundamentals (P/E, market cap, sector, margins, etc.)
+           for the top ``_FUNDAMENTALS_LAZY_LIMIT`` symbols by symbol
+           order. The remaining rows have NaN for fundamentals and
+           render as "—" until they fall into a filtered/visible page
+           on a future render.
+        4. If both yfinance and MarketData fail entirely (e.g. no
+           network), fall back to ``_OFFLINE_FALLBACK_STOCKS`` so the
+           UI still renders. A banner makes this state visible.
 
-    Universe expansion (Issue #4 fix)
-    ---------------------------------
-    Previously this used only the 22 hand-coded ``_SEED_STOCKS``. The
-    screener now seeds from the full ``US_UNIVERSE`` (~560 names: S&P 500
-    + extra large/mid caps), keeps the hand-curated values for the 22
-    popular tickers, and synthesizes plausible price/market_cap for the
-    rest. Any additional symbols the user types into the search box are
-    appended on top of this base.
-
-    Synthetic values are deliberately rough — once the live MarketData
-    batch fetch lands, the real price/cap fields will overwrite these.
+    Cached for 5 minutes — clear with ``_build_screener_frame.clear()``
+    when adding a custom ticker.
     """
-    base = _build_full_universe_seed()
-    df = pd.DataFrame(base)
-    df = _enrich_with_synthetic_fields(df)
-    # Default sort: market cap desc, matching TradingView's default.
-    df = df.sort_values("market_cap", ascending=False, na_position="last").reset_index(drop=True)
-    return df
-
-
-def _build_full_universe_seed() -> list[dict[str, Any]]:
-    """Merge the 22 hand-curated seed stocks with the full US universe.
-
-    Returns a list of dicts shaped for ``_enrich_with_synthetic_fields``,
-    one per ticker in ``US_UNIVERSE`` plus any user-added tickers stored
-    in ``st.session_state["custom_tickers"]``. The 22 tickers in
-    ``_SEED_STOCKS`` keep their hand-curated values so the most popular
-    names display the right price/cap; the other ~538 get synthesized.
-    """
-    # Start with the curated rows (real-ish values for the popular 22).
-    by_symbol: dict[str, dict[str, Any]] = {row["symbol"]: dict(row) for row in _SEED_STOCKS}
-
-    # Per-ticker deterministic RNG so synthesized rows don't reshuffle
-    # between reruns. Seeded off the symbol so AAPL always gets the same
-    # synthetic numbers.
-    def _rng_for(sym: str) -> np.random.Generator:
-        return np.random.default_rng(31 + (hash(sym) & 0xFFFF))
-
-    # Fill in the rest of the US universe.
-    for sym in US_UNIVERSE:
-        if sym in by_symbol:
-            continue
-        rng = _rng_for(sym)
-        # Plausible large-cap defaults; the table looks reasonable even
-        # before live data arrives. Numbers below are intentionally mid-
-        # range so no row sticks out as a synthetic artifact.
-        market_cap = float(abs(rng.normal(50e9, 80e9))) + 5e9
-        price = float(abs(rng.normal(120, 80))) + 5
-        by_symbol[sym] = {
-            "symbol": sym,
-            "name": sym,                  # display name; real name fills via live fetch
-            "price": price,
-            "change_pct": float(rng.normal(0, 1.8)),
-            "volume": float(abs(rng.normal(8_000_000, 6_000_000))) + 100_000,
-            "rel_volume": float(abs(rng.normal(1.0, 0.5))),
-            "market_cap": market_cap,
-            "pe": float(abs(rng.normal(22, 12))),
-            "eps_dil": float(rng.normal(5, 4)),
-            "eps_dil_growth": float(rng.normal(8, 18)),
-            "div_yield": max(0.0, float(rng.normal(1.2, 1.0))),
-            "sector": "Other",            # real sector fills via live fetch
-            "analyst_rating": "Hold",
-        }
-
-    # Append any user-added custom tickers from session state.
-    custom = []
+    # --- Step 1: figure out the universe ---------------------------
+    custom: list[str] = []
     try:
-        custom = st.session_state.get("custom_tickers", []) or []
+        custom = list(st.session_state.get("custom_tickers", []) or [])
     except Exception:
-        # Outside Streamlit context (e.g. unit tests) — fine, just skip.
+        # Outside a Streamlit context (e.g. unit tests).
         pass
 
-    for sym in custom:
-        if sym in by_symbol:
-            continue
-        rng = _rng_for(sym)
-        by_symbol[sym] = {
-            "symbol": sym,
-            "name": sym,
-            "price": float(abs(rng.normal(80, 50))) + 5,
-            "change_pct": float(rng.normal(0, 1.8)),
-            "volume": float(abs(rng.normal(2_000_000, 2_000_000))) + 50_000,
-            "rel_volume": 1.0,
-            "market_cap": float(abs(rng.normal(10e9, 15e9))) + 1e8,
-            "pe": float(abs(rng.normal(20, 10))),
-            "eps_dil": float(rng.normal(4, 3)),
-            "eps_dil_growth": float(rng.normal(5, 15)),
-            "div_yield": 0.0,
-            "sector": "Other",
-            "analyst_rating": "Neutral",
-        }
+    # Universe = curated US universe ∪ user-added customs ∪ offline-fallback
+    # symbols (so popular tickers always appear even on a cold cache).
+    fallback_syms = [r["symbol"] for r in _OFFLINE_FALLBACK_STOCKS]
+    all_symbols: list[str] = []
+    seen: set[str] = set()
+    for sym in list(US_UNIVERSE) + custom + fallback_syms:
+        if sym and sym not in seen:
+            all_symbols.append(sym)
+            seen.add(sym)
 
-    return list(by_symbol.values())
+    if not all_symbols:
+        # Empty universe — return an empty schema-stable frame.
+        return pd.DataFrame(columns=list(_ALL_SCREENER_COLUMNS))
+
+    # --- Step 2: live prices via one yf.download batch -------------
+    prices_df = _fetch_live_prices_batch(tuple(all_symbols))
+    have_live_prices = not prices_df.empty
+
+    # --- Step 3: build the base frame (one row per symbol) ---------
+    rows: list[dict[str, Any]] = [_empty_screener_row(s) for s in all_symbols]
+    df = pd.DataFrame(rows, columns=list(_ALL_SCREENER_COLUMNS))
+
+    # Merge in live prices.
+    if have_live_prices:
+        idx = {s: i for i, s in enumerate(df["symbol"].tolist())}
+        for _, prow in prices_df.iterrows():
+            i = idx.get(prow["symbol"])
+            if i is None:
+                continue
+            df.at[i, "price"]      = prow.get("price", float("nan"))
+            df.at[i, "change_pct"] = prow.get("change_pct", float("nan"))
+            df.at[i, "volume"]     = prow.get("volume", float("nan"))
+            df.at[i, "prev_close"] = prow.get("prev_close", float("nan"))
+
+    # --- Step 4: merge offline fallback for symbols that have it ---
+    # Real data takes precedence; the offline values only fill cells
+    # that are still NaN (i.e. we couldn't fetch live data for them).
+    for fb_row in _OFFLINE_FALLBACK_STOCKS:
+        sym = fb_row["symbol"]
+        mask = df["symbol"] == sym
+        if not mask.any():
+            continue
+        ridx = df.index[mask][0]
+        for col, val in fb_row.items():
+            if col not in df.columns:
+                continue
+            existing = df.at[ridx, col]
+            is_blank = (
+                pd.isna(existing)
+                or (isinstance(existing, str) and existing in ("—", ""))
+                or (col == "name" and existing == sym)  # placeholder name
+            )
+            if is_blank:
+                df.at[ridx, col] = val
+
+    # --- Step 5: lazy fundamentals for the top-N symbols -----------
+    # We sort by market_cap (where known) so the largest names get
+    # their fundamentals filled first — that's what the user sees on
+    # the default sort.
+    sort_key = df["market_cap"].fillna(-1.0)
+    df_for_lazy = df.assign(_mcap=sort_key).sort_values(
+        "_mcap", ascending=False, kind="mergesort"
+    ).drop(columns=["_mcap"])
+
+    fetched = 0
+    for ridx in df_for_lazy.index:
+        if fetched >= _FUNDAMENTALS_LAZY_LIMIT:
+            break
+        sym = df.at[ridx, "symbol"]
+        if not sym:
+            continue
+        # Skip if we already have fundamentals (market_cap + pe + sector).
+        already = (
+            pd.notna(df.at[ridx, "market_cap"])
+            and pd.notna(df.at[ridx, "pe"])
+            and df.at[ridx, "sector"] not in (None, "", "—")
+        )
+        if already:
+            continue
+        fund = _fetch_fundamentals_one(sym)
+        if not fund:
+            continue
+        for col, val in fund.items():
+            if col in df.columns and val is not None:
+                # Don't overwrite a real live value with a None/NaN.
+                if isinstance(val, float) and np.isnan(val):
+                    continue
+                df.at[ridx, col] = val
+        fetched += 1
+
+    # --- Step 6: derive rel_volume from volume / 30-day average ----
+    # We don't have the 30-day average here without a second fetch,
+    # so leave as NaN. (Adding it would mean another yf.download with
+    # period="2mo"; defer until requested.)
+
+    # --- Step 7: stable sort by market cap desc --------------------
+    df = df.sort_values(
+        "market_cap", ascending=False, na_position="last", kind="mergesort"
+    ).reset_index(drop=True)
+
+    # Surface a flag so the UI can show a banner if the live path
+    # failed entirely (we're rendering only fallback rows).
+    df.attrs["live_data_ok"] = have_live_prices
+    df.attrs["lazy_fetched"] = fetched
+    return df
 
 
 # ======================================================================
@@ -797,90 +1007,179 @@ def _render_header() -> None:
     )
 
 
-# Each entry: (label, popover_render_fn) where the render fn emits the
-# inputs inside the popover. These are PLACEHOLDERS — they don't filter
-# the underlying frame yet. Wire them up one at a time as needed.
+# ======================================================================
+# Filter pills — real filters
+# ======================================================================
+# Each filter writes its value to ``st.session_state`` under a stable
+# key. ``_apply_filters(df)`` reads those keys and returns the filtered
+# DataFrame. A "Clear all filters" button resets every key.
+#
+# Sentinel values (the default ranges below) mean "no filter" — the
+# corresponding column passes through untouched.
+# ======================================================================
+_FILTER_DEFAULTS: dict[str, Any] = {
+    "_flt_price":   (0.0, 1_000_000.0),
+    "_flt_change":  (-100.0, 100.0),
+    "_flt_mcap":    [],   # empty multiselect = all
+    "_flt_pe":      (0.0, 1000.0),
+    "_flt_epsg":    (-1000.0, 1000.0),
+    "_flt_dy":      (0.0, 100.0),
+    "_flt_sector":  [],   # empty multiselect = all
+    "_flt_rating":  [],   # empty multiselect = all
+    "_flt_revg":    (-1000.0, 1000.0),
+    "_flt_peg":     (0.0, 100.0),
+    "_flt_roe":     (-1000.0, 1000.0),
+    "_flt_beta":    (0.0, 10.0),
+}
+
+
+# Market-cap bucket boundaries (USD). Used by both the popover label
+# and the filter logic so they stay in sync.
+_MCAP_BUCKETS: dict[str, tuple[float, float]] = {
+    "Mega ≥ $200B":   (200e9, float("inf")),
+    "Large $10–200B": (10e9,  200e9),
+    "Mid $2–10B":     (2e9,   10e9),
+    "Small $300M–2B": (300e6, 2e9),
+    "Micro < $300M":  (0.0,   300e6),
+}
+
+
 def _filter_watchlist() -> None:
-    st.caption("Watchlist filter — placeholder.")
-    st.selectbox("Select watchlist", ["All stocks", "My core picks", "AI semiconductors"], key="_flt_watchlist")
+    st.caption("Watchlist filter — coming soon.")
+    st.selectbox(
+        "Select watchlist",
+        ["All stocks", "My core picks", "AI semiconductors"],
+        key="_flt_watchlist",
+        help="Watchlist filtering will be enabled once portfolio_db "
+             "watchlists are wired in. Currently informational.",
+    )
 
 
 def _filter_index() -> None:
-    st.caption("Filter by index membership.")
-    st.multiselect("Index", ["S&P 500", "Nasdaq 100", "Dow 30", "Russell 1000"], key="_flt_index")
+    st.caption("Filter by index membership — coming soon.")
+    st.multiselect(
+        "Index",
+        ["S&P 500", "Nasdaq 100", "Dow 30", "Russell 1000"],
+        key="_flt_index",
+        help="Index membership data is not yet wired. The screener "
+             "currently uses the curated US universe (S&P 500 + extras).",
+    )
 
 
 def _filter_price() -> None:
-    st.caption("Price range (USD).")
+    st.caption("Live last-close price (USD).")
     a, b = st.columns(2)
-    a.number_input("Min", value=0.0, key="_flt_price_min")
-    b.number_input("Max", value=10_000.0, key="_flt_price_max")
+    a.number_input("Min", value=0.0, key="_flt_price_min", step=1.0)
+    b.number_input("Max", value=1_000_000.0, key="_flt_price_max", step=100.0)
+    # Mirror into a tuple key for _apply_filters.
+    st.session_state["_flt_price"] = (
+        float(st.session_state.get("_flt_price_min", 0.0) or 0.0),
+        float(st.session_state.get("_flt_price_max", 1_000_000.0) or 1_000_000.0),
+    )
 
 
 def _filter_change() -> None:
-    st.caption("1-day % change range.")
-    st.slider("Change %", -20.0, 20.0, (-20.0, 20.0), step=0.1, key="_flt_change")
+    st.caption("1-day % change range (live).")
+    rng = st.slider(
+        "Change %", -50.0, 50.0, (-50.0, 50.0), step=0.1, key="_flt_change_widget",
+    )
+    st.session_state["_flt_change"] = rng
 
 
 def _filter_marketcap() -> None:
-    st.caption("Market capitalization.")
+    st.caption("Market capitalization buckets.")
     st.multiselect(
         "Bucket",
-        ["Mega ≥ $200B", "Large $10–200B", "Mid $2–10B", "Small $300M–2B", "Micro < $300M"],
+        list(_MCAP_BUCKETS.keys()),
         key="_flt_mcap",
+        help="Multiple buckets are OR'd together. Empty = no filter.",
     )
 
 
 def _filter_pe() -> None:
-    st.caption("Price/Earnings ratio.")
-    st.slider("P/E", 0.0, 200.0, (0.0, 200.0), key="_flt_pe")
+    st.caption("Trailing P/E (negative earnings excluded).")
+    rng = st.slider("P/E", 0.0, 200.0, (0.0, 200.0), key="_flt_pe_widget")
+    st.session_state["_flt_pe"] = rng
 
 
 def _filter_eps_growth() -> None:
-    st.caption("Diluted EPS YoY growth.")
-    st.slider("EPS dil growth %", -100.0, 500.0, (-100.0, 500.0), key="_flt_epsg")
+    st.caption("Diluted EPS YoY growth (%).")
+    rng = st.slider(
+        "EPS dil growth %", -100.0, 500.0, (-100.0, 500.0), key="_flt_epsg_widget",
+    )
+    st.session_state["_flt_epsg"] = rng
 
 
 def _filter_div_yield() -> None:
-    st.caption("Forward dividend yield.")
-    st.slider("Div yield %", 0.0, 15.0, (0.0, 15.0), key="_flt_dy")
+    st.caption("Forward dividend yield (%).")
+    rng = st.slider("Div yield %", 0.0, 15.0, (0.0, 15.0), key="_flt_dy_widget")
+    st.session_state["_flt_dy"] = rng
 
 
 def _filter_sector() -> None:
-    st.caption("Sector / industry.")
-    sectors = sorted({s for s in pd.DataFrame(_SEED_STOCKS)["sector"].unique() if s})
+    st.caption("Sector — live values from yfinance fundamentals.")
+    # Pull sector list from the actual screener frame so it matches what
+    # the user sees rather than a hardcoded list.
+    try:
+        live_df = _build_screener_frame()
+        sectors = sorted({
+            s for s in live_df["sector"].dropna().unique()
+            if s and s not in ("—", "Other", "")
+        })
+    except Exception:
+        sectors = []
+    if not sectors:
+        st.info("Sectors are populated lazily — open the table once to load.")
+        return
     st.multiselect("Sector", sectors, key="_flt_sector")
 
 
 def _filter_analyst() -> None:
     st.caption("Aggregate analyst rating.")
-    st.multiselect("Analyst Rating", ["Strong buy", "Buy", "Neutral", "Sell", "Strong sell"], key="_flt_rating")
+    st.multiselect(
+        "Analyst Rating",
+        ["Strong buy", "Buy", "Neutral", "Sell", "Strong sell"],
+        key="_flt_rating",
+    )
 
 
 def _filter_perf() -> None:
-    st.caption("Period performance.")
-    st.selectbox("Window", ["1W", "1M", "3M", "6M", "YTD", "1Y", "5Y"], key="_flt_perf_window")
+    st.caption("Period performance — coming soon.")
+    st.selectbox(
+        "Window", ["1W", "1M", "3M", "6M", "YTD", "1Y", "5Y"],
+        key="_flt_perf_window",
+    )
     st.slider("Range %", -100.0, 1000.0, (-100.0, 1000.0), key="_flt_perf_range")
+    st.info(
+        "Period performance values are not yet pulled from yfinance. "
+        "This filter is informational until the perf-history fetch lands."
+    )
 
 
 def _filter_revenue_growth() -> None:
-    st.caption("Trailing revenue growth YoY.")
-    st.slider("Revenue growth %", -100.0, 500.0, (-100.0, 500.0), key="_flt_revg")
+    st.caption("Trailing revenue growth YoY (%).")
+    rng = st.slider(
+        "Revenue growth %", -100.0, 500.0, (-100.0, 500.0), key="_flt_revg_widget",
+    )
+    st.session_state["_flt_revg"] = rng
 
 
 def _filter_peg() -> None:
     st.caption("PEG ratio (lower is cheaper relative to growth).")
-    st.slider("PEG", 0.0, 10.0, (0.0, 10.0), key="_flt_peg")
+    rng = st.slider("PEG", 0.0, 10.0, (0.0, 10.0), key="_flt_peg_widget")
+    st.session_state["_flt_peg"] = rng
 
 
 def _filter_roe() -> None:
-    st.caption("Return on Equity.")
-    st.slider("ROE %", -50.0, 200.0, (-50.0, 200.0), key="_flt_roe")
+    st.caption("Return on Equity (%).")
+    rng = st.slider("ROE %", -50.0, 200.0, (-50.0, 200.0), key="_flt_roe_widget")
+    st.session_state["_flt_roe"] = rng
 
 
 def _filter_beta() -> None:
-    st.caption("Levered beta.")
-    st.slider("Beta", 0.0, 5.0, (0.0, 5.0), key="_flt_beta")
+    st.caption("Levered 5Y beta.")
+    rng = st.slider("Beta", 0.0, 5.0, (0.0, 5.0), key="_flt_beta_widget")
+    st.session_state["_flt_beta"] = rng
 
 
 # Order matches the TradingView screenshot.
@@ -903,8 +1202,66 @@ _FILTERS: list[tuple[str, Callable[[], None]]] = [
 ]
 
 
+def _apply_filters(df: pd.DataFrame) -> pd.DataFrame:
+    """Apply the current filter-pill state to the screener DataFrame.
+
+    Each filter is a no-op if the user hasn't moved it off its default.
+    NaN values are kept (a row with NaN P/E shouldn't be excluded by a
+    P/E filter — the user hasn't seen real data yet).
+    """
+    if df.empty:
+        return df
+
+    out = df.copy()
+    ss = st.session_state
+
+    def _between(col: str, key: str) -> None:
+        nonlocal out
+        rng = ss.get(key)
+        default = _FILTER_DEFAULTS[key]
+        if not isinstance(rng, tuple) or rng == default:
+            return
+        lo, hi = rng
+        # Keep NaN rows (data not yet loaded — don't punish them).
+        mask = out[col].isna() | ((out[col] >= lo) & (out[col] <= hi))
+        out = out[mask]
+
+    _between("price",          "_flt_price")
+    _between("change_pct",     "_flt_change")
+    _between("pe",             "_flt_pe")
+    _between("eps_dil_growth", "_flt_epsg")
+    _between("div_yield",      "_flt_dy")
+    _between("revenue_growth", "_flt_revg")
+    _between("peg",            "_flt_peg")
+    _between("roe",            "_flt_roe")
+    _between("beta",           "_flt_beta")
+
+    # Market cap buckets (multiselect, OR'd together)
+    buckets = ss.get("_flt_mcap") or []
+    if buckets:
+        ranges = [_MCAP_BUCKETS[b] for b in buckets if b in _MCAP_BUCKETS]
+        if ranges:
+            mask = out["market_cap"].isna()
+            for lo, hi in ranges:
+                mask = mask | ((out["market_cap"] >= lo) & (out["market_cap"] < hi))
+            out = out[mask]
+
+    # Sector multiselect
+    sectors = ss.get("_flt_sector") or []
+    if sectors:
+        out = out[out["sector"].isin(sectors) | out["sector"].isna()]
+
+    # Analyst rating multiselect
+    ratings = ss.get("_flt_rating") or []
+    if ratings:
+        out = out[out["analyst_rating"].isin(ratings) | out["analyst_rating"].isna()]
+
+    return out.reset_index(drop=True)
+
+
 def _render_filter_bar() -> None:
-    """Render the row of filter pill chips. Placeholder logic for now."""
+    """Render the row of filter pill chips. Filters apply to the
+    rendered DataFrame via ``_apply_filters`` in ``_render_results_table``."""
     n_per_row = 8  # Streamlit columns wrap awkwardly past ~8 pill buttons.
     for chunk_start in range(0, len(_FILTERS), n_per_row):
         chunk = _FILTERS[chunk_start : chunk_start + n_per_row]
@@ -913,6 +1270,22 @@ def _render_filter_bar() -> None:
             with col:
                 with st.popover(label, use_container_width=True):
                     render_fn()
+
+
+def _reset_filters() -> None:
+    """Clear all filter state. Bound to a 'Clear filters' button."""
+    for k, default in _FILTER_DEFAULTS.items():
+        st.session_state[k] = default
+        # Also clear paired widget keys (sliders use a separate _widget key
+        # so we can mirror values into the canonical state key).
+        st.session_state.pop(f"{k}_widget", None)
+    # Multiselect-only keys
+    for k in ("_flt_mcap", "_flt_sector", "_flt_rating"):
+        st.session_state[k] = []
+    # Price min/max number inputs
+    st.session_state["_flt_price_min"] = 0.0
+    st.session_state["_flt_price_max"] = 1_000_000.0
+
 
 
 # ======================================================================
@@ -1008,6 +1381,37 @@ def _render_results_table(df: pd.DataFrame, category: str) -> None:
             st.rerun()
 
 
+def _render_data_source_banner(df: pd.DataFrame) -> None:
+    """Surface the data-source state so the user knows whether they're
+    looking at live or fallback data.
+
+    - Live OK + fundamentals lazy-loaded:  green check (silent if all good)
+    - Live OK but fundamentals empty:       blue info note
+    - Live data fetch failed:               yellow warning (using fallback)
+    """
+    live_ok = bool(df.attrs.get("live_data_ok", False))
+    lazy_n  = int(df.attrs.get("lazy_fetched", 0))
+
+    if not live_ok:
+        st.warning(
+            "⚠️ Live price fetch unavailable — showing fallback data for "
+            f"{len(_OFFLINE_FALLBACK_STOCKS)} popular tickers. "
+            "Check your network connection or yfinance install. "
+            "Other rows will display \"—\" until live data is reachable."
+        )
+        return
+
+    # Live data ok, but fundamentals only filled for top-N. Show a small
+    # info caption so the user understands why some cells are blank.
+    if lazy_n > 0:
+        st.caption(
+            f"✓ Live prices for {len(df):,} symbols · "
+            f"fundamentals loaded for top {lazy_n} by market cap. "
+            "Use filters or sort to surface other rows; their fundamentals "
+            "load on the next render (24h cached)."
+        )
+
+
 # ======================================================================
 # Public entrypoint
 # ======================================================================
@@ -1017,10 +1421,48 @@ def render_screener_tab() -> None:
     _render_header()
     _render_search_box()  # Issue #4: free-text ticker search
     _render_filter_bar()
+
+    # Clear-filters control + active filter count.
+    active_filters = _count_active_filters()
+    fcol1, fcol2 = st.columns([5, 1])
+    with fcol1:
+        if active_filters:
+            st.caption(f"🔎 {active_filters} active filter{'s' if active_filters != 1 else ''}.")
+    with fcol2:
+        if st.button(
+            "Clear filters",
+            use_container_width=True,
+            key="_screener_clear_filters",
+            disabled=(active_filters == 0),
+        ):
+            _reset_filters()
+            st.rerun()
+
     st.markdown("")  # spacer
     category = _render_category_tabs()
-    df = _build_screener_frame()
-    _render_results_table(df, category)
+
+    # Build the canonical (real-data) frame, then apply the filter pills.
+    df_full = _build_screener_frame()
+    _render_data_source_banner(df_full)
+    df_filtered = _apply_filters(df_full)
+    _render_results_table(df_filtered, category)
+
+
+def _count_active_filters() -> int:
+    """How many filter pills are currently moved off their default?"""
+    n = 0
+    ss = st.session_state
+    for k, default in _FILTER_DEFAULTS.items():
+        v = ss.get(k)
+        if v is None:
+            continue
+        if isinstance(default, list):
+            if v:
+                n += 1
+        elif v != default:
+            n += 1
+    return n
+
 
 
 def _render_search_box() -> None:

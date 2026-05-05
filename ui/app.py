@@ -1101,12 +1101,26 @@ def build_sidebar(portfolio_summary: dict[str, Any]) -> dict[str, Any]:
     st.sidebar.title("⚙️ Controls")
 
     # Ticker selection — prefer tickers from the portfolio if present.
+    # Falls back to config.WATCHLIST (the project's canonical default
+    # universe) so we don't ship a hardcoded list that drifts out of
+    # sync with the real watchlist used by main.py and the agent chain.
     holdings = portfolio_summary.get("holdings", pd.DataFrame())
     tickers: list[str] = []
     if isinstance(holdings, pd.DataFrame) and "ticker" in holdings.columns:
         tickers = sorted(holdings["ticker"].astype(str).unique().tolist())
     if not tickers:
-        tickers = ["AAPL", "MSFT", "NVDA", "GOOGL", "AMZN", "META", "TSLA", "SPY"]
+        # Pull the watchlist from config (real, user-editable) rather than
+        # a hardcoded list that lived only in the sidebar.
+        watchlist = (
+            list(getattr(app_config, "WATCHLIST", []) or [])
+            if app_config is not None
+            else []
+        )
+        # Final fallback — if config is unreachable too, use a minimal set
+        # so the dropdown still renders. These five mirror config.WATCHLIST's
+        # default but exist solely to keep the UI alive when config import
+        # has failed; under normal conditions the watchlist above is used.
+        tickers = watchlist or ["AAPL", "MSFT", "NVDA", "GOOGL", "AMZN"]
 
     # ---- Active-ticker contract ------------------------------------------
     # `st.session_state["active_ticker"]` is the *single source of truth*
