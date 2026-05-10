@@ -47,6 +47,7 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 import time
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -915,11 +916,88 @@ Now write the analysis for {company_name} ({ticker})."""
 # OUTPUT PARSING
 # =============================================================================
 
+# Regex for stripping markdown header decoration. Matches optional leading
+# whitespace, then optional ``#`` characters (1-6), then optional whitespace.
+_MD_HASH_PREFIX = re.compile(r"^\s*#{1,6}\s*")
+
+# Heading length ceiling — anything longer is body text, not a header.
+_MAX_HEADER_LEN = 80
+
+
+def _normalize_header(raw: str) -> Optional[str]:
+    """Normalize an LLM-emitted heading to its canonical lowercase label.
+
+    Accepts every common LLM output style:
+
+      ``Overview``                 -> ``"overview"``
+      ``Overview:``                -> ``"overview"``
+      ``# Overview``               -> ``"overview"``
+      ``## Overview``              -> ``"overview"``
+      ``**Overview**``             -> ``"overview"``
+      ``**Overview:**``            -> ``"overview"``
+      ``__Overview__``             -> ``"overview"``
+      ``## **Overview**``          -> ``"overview"``
+      ``  Overview  ``             -> ``"overview"`` (whitespace tolerated)
+
+    Returns ``None`` for anything that's clearly body text:
+
+      - empty / whitespace-only strings
+      - lines longer than 80 chars (real headers are short)
+      - lines ending in sentence punctuation (``.``, ``;``)
+      - lines containing comma followed by a space (prose connector)
+      - lines containing ``=`` or ``$`` or ``%`` (numeric content)
+      - lines containing the word ``is`` between alphanumeric runs
+        (e.g. "Trailing P/E is 40.7x")
+
+    This rejection list is empirical: it matches the body-text examples
+    in ``TestNormalizeHeaderRejects``.
+    """
+    if not raw or not raw.strip():
+        return None
+
+    s = raw.strip()
+    if len(s) > _MAX_HEADER_LEN:
+        return None
+
+    # Reject body-text patterns BEFORE we start stripping decoration —
+    # so that "Trailing P/E is 40.7x" doesn't get mistaken for the
+    # heading "Trailing P/E" after we strip everything after a space.
+    if "$" in s or "%" in s or "=" in s:
+        return None
+    if s.endswith((".", ";")):
+        return None
+    # Semicolons inside the line are sentence connectors, not part of any
+    # heading label.
+    if ";" in s:
+        return None
+    if ", " in s:
+        return None
+    # "X is Y" pattern (embedded value): the word "is" between word chars.
+    if re.search(r"\b\w+\s+is\s+\w", s, re.IGNORECASE):
+        return None
+
+    # Strip leading markdown hashes
+    s = _MD_HASH_PREFIX.sub("", s).strip()
+    # Strip bold/italic markdown delimiters anywhere
+    s = s.replace("**", "").replace("__", "")
+    # Strip trailing colon
+    if s.endswith(":"):
+        s = s[:-1]
+    # Re-strip whitespace after decoration removal
+    s = s.strip().lower()
+
+    if not s:
+        return None
+
+    return s
+
+
 def _split_text(text: str, selected_keys: List[str]) -> Tuple[str, Dict[str, str]]:
     """Split the LLM output into overview + per-point paragraphs.
 
-    The model is instructed to produce headers like "Display Name:" (or
-    "Overview:") on their own line. We split on those headers.
+    The model is instructed to produce headers like "Display Name:" or
+    "## Display Name". We split on any line that ``_normalize_header``
+    recognizes as a known section heading.
 
     Returns
     -------
@@ -958,21 +1036,18 @@ def _split_text(text: str, selected_keys: List[str]) -> Tuple[str, Dict[str, str
             current_lines.append(line)
             continue
 
-        # Detect a header line: short line ending in ":" (or "**Name:**").
-        # We strip markdown bold.
-        candidate = stripped.replace("**", "").strip()
-        if candidate.endswith(":") and len(candidate) <= 80:
-            potential = candidate[:-1].strip().lower()
-            if potential == "overview":
-                _flush()
-                current_header = "overview"
-                current_lines = []
-                continue
-            if potential in header_to_key:
-                _flush()
-                current_header = potential
-                current_lines = []
-                continue
+        # Try to normalize as a heading
+        normalized = _normalize_header(stripped)
+        if normalized == "overview":
+            _flush()
+            current_header = "overview"
+            current_lines = []
+            continue
+        if normalized in header_to_key:
+            _flush()
+            current_header = normalized
+            current_lines = []
+            continue
 
         current_lines.append(line)
 

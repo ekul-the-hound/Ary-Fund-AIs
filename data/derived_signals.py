@@ -434,9 +434,18 @@ class DerivedSignals:
                 "beta_qmj":    "ticker.factor.beta_qmj",
             }
             for k, field in mapping.items():
-                # Try both name conventions
-                v = (betas.get(k) or betas.get(f"beta_{k.split('_')[1].upper()}")
-                     or betas.get(f"beta_Mkt-RF") if k == "beta_market" else None)
+                # Try every known spelling for this beta. Previous code used
+                #   v = (a or b or c) if k == "beta_market" else None
+                # which due to Python operator precedence actually parses as
+                #   v = a or b or (c if k == "beta_market" else None)
+                # — so the Fama-French "beta_Mkt-RF" alias was probed for
+                # every key, and the f-string had no placeholders. Rewritten
+                # as an explicit candidate list so the lookup is obvious and
+                # the f-string lint warning goes away.
+                candidates = [k, f"beta_{k.split('_')[1].upper()}"]
+                if k == "beta_market":
+                    candidates.append("beta_Mkt-RF")
+                v = next((betas.get(c) for c in candidates if betas.get(c) is not None), None)
                 if v is None:
                     continue
                 self.registry.upsert_point(
