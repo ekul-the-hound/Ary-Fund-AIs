@@ -202,15 +202,23 @@ def sample_metrics() -> Dict[str, Any]:
         "margin_trend": "expanding",
 
         # Leverage -------------------------------------------------------------
-        "debt_ebitda": 1.5,
-        "debt_to_ebitda": 1.5,           # alias the risk scanner also reads
-        "net_debt_ebitda": 1.0,
+        # NOTE: we only set `debt_to_ebitda` (industry-standard spelling), not
+        # the `debt_ebitda` alias. The risk scanner's _read() tries
+        # `debt_ebitda` first and only falls back to `debt_to_ebitda` if the
+        # first is absent. Tests that mutate `debt_to_ebitda` would otherwise
+        # be silently ignored because the alias would still hold the benign
+        # value.
+        "debt_to_ebitda": 1.5,
         "net_debt_to_ebitda": 1.0,
         "interest_coverage": 12.0,
 
         # Cash flow ------------------------------------------------------------
+        # NOTE: we deliberately do NOT set `cash_flow_negative_3_years` here.
+        # The risk scanner uses that flag short-circuit-style: if it's
+        # explicitly False, the scanner won't fall through to inspect
+        # `free_cash_flow_3y` / `fcf_history`. Leaving the flag absent (None)
+        # lets the FCF-streak test trigger HIGH risk as it expects.
         "free_cash_flow": 5_000_000_000.0,
-        "cash_flow_negative_3_years": False,
         "cash_conversion": 1.05,
 
         # Valuation ------------------------------------------------------------
