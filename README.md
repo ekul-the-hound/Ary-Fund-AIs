@@ -1,52 +1,57 @@
-# Ary Fund — Hedge Fund AI Research Assistant
+# ARY QUANT — Hedge Fund AI Research Assistant
 
-Quantamental research assistant for a student-run hedge fund (long-term
+Quantamental research platform for a student-run hedge fund (long-term
 focus). Runs a local LLM against SEC filings, market data, macroeconomic
-indicators, and a normalized data registry to parse filings, scan portfolio
-risks, generate multi-page investment theses, and produce quant risk
-reports.
+indicators, and a normalized data registry to screen stocks, analyze
+filings, scan portfolio risks, generate multi-page investment theses, and
+run probabilistic quant models — all from a Streamlit dashboard.
 
-Everything runs locally. No paid APIs, no cloud LLM costs. The agent layer
-is model-agnostic — a `mock` backend (offline, deterministic), a `dev`
-backend (a small instruction-tuned model via Ollama), and a `prod` slot for
-a larger model once validated.
+Everything runs locally. No paid APIs, no cloud LLM costs.
 
 ---
 
 ## Overview
 
-Five independent layers, each importable on its own:
+Six independent layers, each importable on its own:
 
-- **Data layer** — `sec_fetcher`, `market_data`, `macro_data`,
-  `sentiment_news`, `geo_supply`, `portfolio_db`, `pipeline`,
-  `data_registry`, `derived_signals`, `refresh_scheduler`. Raw fetchers
-  write into a normalized `DataRegistry` (canonical schema, per-field
-  source priority, idempotent upserts, conflict resolution). Derived
-  signals compute factor exposures, regime labels, sector heatmaps,
-  composite risk scores, and macro stress on top of the registry. The
-  scheduler orchestrates hourly / daily / weekly / event-driven refreshes
-  with lazy module loading so a single missing dep doesn't block the rest.
-- **Agent layer** — `base_agent`, `filing_analyzer`,
-  `data_point_analyzer`, `risk_scanner`, `thesis_generator`,
-  `thesis_essay`, `thesis_review`. `ask_agent()` is the single entry point
-  every downstream module calls. `AgentRequest` goes in, `AgentResponse`
-  comes back. Mock mode, Ollama success, and Ollama failure all produce
-  the same shape, so the pipeline never crashes from a backend outage.
-  The thesis stack now produces multi-section, multi-page memos with an
-  explicit data-gap protocol — when inputs are missing, the model
-  acknowledges the gap rather than inventing analysis around it.
-- **Quant layer** — `var_es`, `volatility`, `regime`, `regime_hmm`,
-  `kelly`, `position_sizing`, `black_scholes`, `avellaneda_stoikov`,
-  `poisson`, `gbm`, `hurst`, `ou_process`. Historical / parametric / MC
-  VaR & ES, close-to-close and Yang-Zhang vol estimators with forecasting,
-  rule-based and HMM regime classifiers, Kelly + volatility-targeted
-  sizing, options pricing and Greeks, market-making models, jump-arrival
-  intensity, and stochastic process toolkits.
-- **UI layer** — `app.py`. Streamlit dashboard: ticker picker, portfolio
-  cards, price chart with MA / RSI / vol overlays, risk & thesis panels,
-  macro context, and a debug view of the raw agent context JSON.
-- **Test layer** — per-module unit tests plus an end-to-end smoke test,
-  all defaulting to mock mode so they run offline and deterministically.
+- **Data layer** — SEC EDGAR fetcher with XBRL parsing and Form 4/13F
+  support, yfinance market data with technicals, FRED macro dashboard,
+  news and WSB sentiment aggregates, sanctions and geopolitical supply-
+  chain feeds, SQLite portfolio DB, a normalized `DataRegistry` (~100
+  canonical fields, per-field source priority, conflict resolution), pure-
+  computation derived signals (factor exposures, regime labels, sector
+  heatmaps, composite risk scores), and a refresh scheduler with hourly /
+  daily / weekly / event-driven orchestration.
+- **Agent layer** — `ask_agent()` is the single entry point every module
+  calls. `AgentRequest` goes in, `AgentResponse` comes back. Mock, Ollama
+  success, and Ollama failure all return the same shape so the pipeline
+  never crashes from a backend outage. Includes: filing analyzer,
+  data-point analyzer, risk scanner, short-form thesis generator,
+  multi-page thesis essay, and a self-review pass. An explicit data-gap
+  protocol prevents the model from inventing analysis for missing inputs.
+- **Quant layer** — VaR & Expected Shortfall (historical / parametric /
+  Monte Carlo), volatility estimators and forecasting, rule-based and HMM
+  regime classifiers, Kelly criterion, volatility-targeted position sizing,
+  Black-Scholes pricing and Greeks, Avellaneda-Stoikov market-making
+  reservation prices, Poisson jump-arrival intensity, GBM Monte Carlo,
+  Hurst exponent, Ornstein-Uhlenbeck mean reversion, and additional
+  research modules (HRP, RMT, SABR, Longstaff-Schwartz, ergodicity,
+  wavelet regimes, Lyapunov exponents, Lempel-Ziv complexity, sandpile,
+  FFT analysis, GAN synthetic data generation).
+- **Screener** — TradingView-style stock screener over a curated ~600-
+  ticker US universe (S&P 500 + large/mid caps). Live prices and 1-day
+  change via batched `yf.download` (5-minute cache). Fundamentals lazy-
+  loaded from `MarketData.get_fundamentals` with 24-hour SQLite cache. 15
+  filter pills wired to real filtering logic. No synthetic data — missing
+  cells show "—" rather than fabricated values.
+- **UI layer** — Streamlit dashboard with: sidebar ticker picker (backed
+  by the full ~600-symbol universe), portfolio overview cards, interactive
+  price chart with MA / RSI / vol overlays, risk & thesis panels, macro
+  context, streaming chat agent (grounded per-ticker with full context),
+  and a quant playground tab (HMM regime, Hurst exponent, OU mean
+  reversion, GBM Monte Carlo simulation).
+- **Test layer** — per-module unit tests, registry integration test
+  (44 passing), and an end-to-end smoke test, all defaulting to mock mode.
 
 `config.py` centralizes model selection, API keys, paths, logging, and
 risk thresholds. `main.py` is the top-level CLI entry point.
@@ -59,15 +64,14 @@ Three model tags in `config.AGENT_MODELS`:
 
 - **`mock`** — deterministic stub, no model server required. Used in tests
   and when Ollama is unreachable.
-- **`dev`** — a small instruction-tuned model served via Ollama. Current
-  default; lets the full pipeline run end-to-end while the `prod` stack is
-  validated.
-- **`prod`** — reserved for a larger Qwen-family model once thresholds are
-  confirmed.
+- **`dev`** — `phi3:3.8b` via Ollama. Current default; validates the full
+  pipeline end-to-end on modest hardware.
+- **`prod`** — `qwen3:14b-instruct` (or 30B variant); swap in once
+  thresholds are confirmed.
 
 Switch models by editing `DEFAULT_AGENT_MODEL` in `config.py`. No other
-code changes — callers route through `AGENT_MODELS`, never a raw model
-string. Per-call overrides are also supported via
+code changes needed — callers route through `AGENT_MODELS`, never a raw
+model string. Per-call overrides are also supported via
 `AgentRequest(..., model_tag="mock")`.
 
 ---
@@ -79,56 +83,68 @@ string. Per-call overrides are also supported via
 ├── config.py                       # model tags, API keys, paths, thresholds
 ├── main.py                         # CLI entry point; runs the full pipeline
 │
-├── agent/
-│   ├── base_agent.py               # AgentRequest / AgentResponse / ask_agent
-│   ├── filing_analyzer.py          # 10-K / 10-Q metric extraction
-│   ├── data_point_analyzer.py      # Per-field signal interpretation
-│   ├── risk_scanner.py             # Portfolio-level risk flagging
-│   ├── thesis_generator.py         # Short-form thesis (BUY/HOLD/SELL)
-│   ├── thesis_essay.py             # Multi-page investment memo
-│   └── thesis_review.py            # Self-review pass on generated theses
+├── app.py                          # Streamlit dashboard (main entry point)
+├── screener.py                     # TradingView-style screener tab
+├── playground.py                   # Quant playground tab
+├── chat.py                         # Streaming chat agent tab
+├── universe.py                     # ~600-ticker US universe + validation
+├── providers.py                    # Unified market data provider interface
+├── earnings_calendar.py            # Earnings date tracking
 │
-├── data/
-│   ├── sec_fetcher.py              # SEC EDGAR REST + XBRL parser
-│   ├── market_data.py              # yfinance + technicals (RSI, MACD, BBands)
-│   ├── macro_data.py               # FRED: rates, inflation, VIX, recession prob
-│   ├── sentiment_news.py           # News + WSB aggregates with VADER fallback
-│   ├── geo_supply.py               # Sanctions, freight, energy, supply chain
-│   ├── portfolio_db.py             # SQLite: positions, trades, snapshots
-│   ├── pipeline.py                 # Daily refresh + agent context builder
-│   ├── data_registry.py            # Normalized schema, upserts, snapshots
-│   ├── derived_signals.py          # Factors, regime, heatmaps, risk scores
-│   └── refresh_scheduler.py        # Hourly / daily / weekly orchestration
+├── base_agent.py                   # AgentRequest / AgentResponse / ask_agent
+├── filing_analyzer.py              # 10-K / 10-Q metric extraction
+├── data_point_analyzer.py          # Per-field signal interpretation
+├── data_point_analyzer_section.py  # Section-level data point rendering
+├── risk_scanner.py                 # Portfolio-level risk flagging
+├── thesis_generator.py             # Short-form thesis (BUY / HOLD / SELL)
+├── thesis_essay.py                 # Multi-page investment memo
+├── thesis_review.py                # Self-review pass on generated theses
+├── essay.py                        # Essay rendering utilities
 │
-├── quant/
-│   ├── var_es.py                   # Historical / parametric / MC VaR & ES
-│   ├── volatility.py               # Vol estimators + forecasting
-│   ├── regime.py                   # Trend + drawdown + vol classifier
-│   ├── regime_hmm.py               # HMM-based regime classifier
-│   ├── kelly.py                    # Kelly criterion utilities
-│   ├── position_sizing.py          # Kelly + vol-target combined sizing
-│   ├── black_scholes.py            # European option pricing + Greeks
-│   ├── avellaneda_stoikov.py       # Market-making bid/ask reservation prices
-│   ├── poisson.py                  # Jump-arrival intensity
-│   ├── gbm.py                      # Geometric Brownian motion
-│   ├── hurst.py                    # Hurst exponent / long-memory tests
-│   └── ou_process.py               # Ornstein-Uhlenbeck mean reversion
+├── sec_fetcher.py                  # SEC EDGAR REST + XBRL parser
+├── market_data.py                  # yfinance + technicals (RSI, MACD, BBands)
+├── macro_data.py                   # FRED: rates, inflation, VIX, recession prob
+├── sentiment_news.py               # News + WSB aggregates with VADER fallback
+├── geo_supply.py                   # Sanctions, freight, energy, supply chain
+├── portfolio_db.py                 # SQLite: positions, trades, snapshots
+├── pipeline.py                     # Daily refresh + agent context builder
+├── data_registry.py                # Normalized schema, upserts, snapshots
+├── derived_signals.py              # Factors, regime, heatmaps, risk scores
+├── refresh_scheduler.py            # Hourly / daily / weekly orchestration
+├── portfolio_construction.py       # Portfolio optimization utilities
 │
-├── ui/
-│   └── app.py                      # Streamlit dashboard
+├── var_es.py                       # Historical / parametric / MC VaR & ES
+├── volatility.py                   # Vol estimators + forecasting
+├── regime.py                       # Rule-based regime classifier
+├── regime_hmm.py                   # HMM-based regime classifier
+├── kelly.py                        # Kelly criterion utilities
+├── position_sizing.py              # Kelly + vol-target combined sizing
+├── black_scholes.py                # European option pricing + Greeks
+├── avellaneda_stoikov.py           # Market-making reservation prices
+├── poisson.py                      # Jump-arrival intensity
+├── gbm.py                          # Geometric Brownian motion
+├── hurst.py                        # Hurst exponent / long-memory tests
+├── ou_process.py                   # Ornstein-Uhlenbeck mean reversion
+├── monte_carlo.py                  # General Monte Carlo utilities
+├── sequential_monte_carlo.py       # Particle filter / SMC
+├── longstaff_schwartz.py           # LSM American option pricing
+├── sabr.py                         # SABR stochastic vol model
+├── hrp.py                          # Hierarchical risk parity
+├── rmt.py                          # Random matrix theory
+├── mst.py                          # Minimum spanning tree (correlation)
+├── wavelet_regimes.py              # Wavelet-based regime detection
+├── regime_hmm.py                   # Hidden Markov Model regimes
+├── lyapunov.py                     # Lyapunov exponent (chaos measure)
+├── lempel_ziv.py                   # Lempel-Ziv complexity
+├── fft_analysis.py                 # FFT spectral analysis
+├── ergodicity.py                   # Ergodicity economics utilities
+├── sandpile.py                     # Bak-Tang-Wiesenfeld sandpile model
+├── omori.py                        # Omori law (aftershock clustering)
+├── girsanov.py                     # Girsanov measure change
+├── gan_synthetic.py                # GAN-based synthetic data generation
+├── wave_function_collapse.py       # WFC for scenario generation
 │
-├── tests/
-│   ├── conftest.py                 # Shared pytest fixtures
-│   ├── test_base_agent.py
-│   ├── test_filing_analyzer.py
-│   ├── test_risk_scanner.py
-│   ├── test_thesis_generator.py
-│   ├── test_main.py
-│   ├── test_market_data_ext.py
-│   ├── test_sec_fetcher_ext.py
-│   ├── test_data_registry.py
-│   ├── test_integration.py
-│   └── test_end_to_end_smoke.py
+├── test_all.py                     # Full consolidated test suite
 │
 ├── pyproject.toml
 ├── pytest.ini
@@ -139,9 +155,8 @@ string. Per-call overrides are also supported via
 └── README.md
 ```
 
-Caches and the portfolio database are created at runtime under `data/`
-(e.g. `data/cache/`, `data/sec_cache/`, `data/portfolio.db`) and are
-excluded from version control by `.gitignore`.
+Runtime artifacts (`data/cache/`, `data/portfolio.db`, `logs/`) are
+created automatically on first run and excluded from version control.
 
 ---
 
@@ -151,8 +166,7 @@ excluded from version control by `.gitignore`.
 
 - Python 3.11+
 - Git
-- [Ollama](https://ollama.com) — only needed if you run anything other
-  than `mock` mode
+- [Ollama](https://ollama.com) — only needed for `dev` or `prod` mode
 
 ### 2. Clone and install
 
@@ -162,7 +176,7 @@ cd Ary-Fund-AIs
 
 python -m venv .venv
 .venv\Scripts\activate               # Windows
-# source .venv/bin/activate          # Linux/macOS
+# source .venv/bin/activate          # Linux / macOS
 
 pip install -r requirements.txt
 ```
@@ -173,7 +187,8 @@ Or, for an editable install with dev tools:
 pip install -e ".[dev]"
 ```
 
-For the heavier quant extras (statistical models, GARCH, etc.):
+For the heavier quant extras (`statsmodels`, `arch` for GARCH,
+`hmmlearn` for HMM regimes):
 
 ```bash
 pip install -e ".[quant]"
@@ -183,7 +198,7 @@ pip install -e ".[quant]"
 
 ```bash
 ollama serve                         # leave running in its own terminal
-ollama pull <model_name>             # see config.AGENT_MODELS for current dev tag
+ollama pull phi3:3.8b                # current dev model
 ```
 
 ### 4. API keys
@@ -192,23 +207,22 @@ Copy `.env.example` → `.env` and fill in:
 
 ```dotenv
 FRED_API_KEY=your_fred_key_here
-SEC_AGENT_NAME=Your Name
-SEC_AGENT_EMAIL=you@example.com
+SEC_USER_AGENT=Your Name your@email.com
 ```
 
 - **FRED** is free: [fred.stlouisfed.org/docs/api/api_key.html](https://fred.stlouisfed.org/docs/api/api_key.html)
-- **SEC EDGAR** requires a descriptive User-Agent with contact info — no
-  key, just the name/email.
+- **SEC EDGAR** requires a descriptive User-Agent header with contact
+  info — no key needed.
 
 `config.py` loads `.env` automatically via `python-dotenv` on import.
 
 ### 5. Verify the stack
 
 ```bash
-# Mock mode — no Ollama required
-python -c "from agent.base_agent import ask_agent, AgentRequest; print(ask_agent(AgentRequest(prompt='ping', context={}, model_tag='mock')).generated_json)"
+# Offline mock check — no Ollama required
+python -c "from base_agent import ask_agent, AgentRequest; print(ask_agent(AgentRequest(prompt='ping', context={}, model_tag='mock')).generated_json)"
 
-# Market data sanity check
+# Market data check
 python -c "import yfinance as yf; print(yf.Ticker('AAPL').history(period='1d')['Close'].iloc[-1])"
 ```
 
@@ -216,31 +230,25 @@ python -c "import yfinance as yf; print(yf.Ticker('AAPL').history(period='1d')['
 
 ## Running the Project
 
-Full pipeline (data refresh → agent analysis → risk + thesis) over the
-default watchlist defined in `config.WATCHLIST`:
+Full pipeline (data refresh → agent analysis → risk + thesis) over
+`config.WATCHLIST`:
 
 ```bash
 python main.py
 ```
 
-Daily data refresh only, no LLM calls:
-
-```bash
-python -m data.pipeline
-```
-
-Scheduler-driven refreshes (granular by data half-life):
-
-```bash
-python -m data.refresh_scheduler hourly
-python -m data.refresh_scheduler daily
-python -m data.refresh_scheduler weekly
-```
-
 Streamlit dashboard:
 
 ```bash
-streamlit run ui/app.py
+streamlit run app.py
+```
+
+Scheduled data refresh:
+
+```bash
+python refresh_scheduler.py hourly
+python refresh_scheduler.py daily
+python refresh_scheduler.py weekly
 ```
 
 ### Switching agent backends
@@ -251,93 +259,63 @@ In `config.py`:
 DEFAULT_AGENT_MODEL: str = "dev"    # "mock" | "dev" | "prod"
 ```
 
-When Ollama is unreachable, `ask_agent` falls back to mock output
-automatically — the response contract is preserved either way.
+When Ollama is unreachable, `ask_agent` falls back to mock automatically.
 
 ---
 
 ## Running Tests
 
 ```bash
-pytest                              # full suite
-pytest -k filing_analyzer           # single module
-pytest tests/test_end_to_end_smoke.py
-pytest tests/test_integration.py    # full registry round-trip
+pytest                              # full suite via pytest.ini
+python test_all.py                  # consolidated test runner
 pytest -x                           # stop at first failure
 ```
 
-Pytest config lives in `pytest.ini` / `pyproject.toml`. Tests default to
-`mock` mode, so they run offline and deterministically. The integration
-test verifies that every fetcher writes into the registry correctly and
-that downstream snapshots return the expected normalized fields.
+Tests default to `mock` mode — they run offline and deterministically.
 
 ---
 
 ## Current Status
 
 **Built:**
-- **Data layer:** SEC fetcher with CIK lookup and XBRL parsing
-  (14+ canonical fields per company, plus derived FCF, R&D intensity,
-  SBC/revenue, dilution YoY); Form 4 parsing with 10b5-1 and P/S code
-  detection; 13F informationtable parsing; market data with technicals
-  and multi-stock comparison; FRED macro dashboard with VIX term-structure
-  ratio; news + WSB sentiment aggregates with VADER fallback; sanctions /
-  freight / energy / supply-chain feeds; SQLite portfolio DB with FIFO
-  P&L; the `DataPipeline` orchestrator; a normalized `DataRegistry` with
-  ~100 canonical fields, per-field source priority, and conflict
-  resolution; derived signals for factor exposures, regime labels, sector
-  heatmaps, and composite risk scores; a refresh scheduler with lazy
-  module loading.
-- **Agent layer:** model-agnostic `ask_agent` core with mock/dev/prod
-  routing, filing analyzer, data-point analyzer, risk scanner, short-form
-  thesis generator, multi-page thesis essay, and a self-review pass.
-  Explicit data-gap protocol prevents the model from inventing analysis
-  for missing inputs.
-- **Quant layer:** VaR & Expected Shortfall (historical + parametric +
-  MC); volatility estimators and forecasts; rule-based and HMM regime
-  classifiers; Kelly and volatility-targeted position sizing;
-  Black-Scholes pricing and Greeks; Avellaneda-Stoikov market-making
-  reservation prices; Poisson jump-arrival intensity; geometric Brownian
-  motion, Hurst exponent, and Ornstein-Uhlenbeck process utilities.
-- **UI:** Streamlit dashboard with portfolio overview, price charts with
-  overlays, risk & thesis panels, macro context, and raw-context debug
-  view.
-- **Tests:** per-module unit tests, registry integration test, end-to-end
-  smoke test — all defaulting to mock mode.
-- **Packaging:** `pyproject.toml`, `requirements.txt`, `setup.py`,
-  `pytest.ini`, `.env` support via `python-dotenv`, `.gitignore` covering
-  secrets, caches, DBs, logs, and venvs.
+- Data layer: SEC EDGAR (XBRL, Form 4, 13F), market data with
+  technicals, FRED macro, news + sentiment, sanctions and supply-chain
+  feeds, portfolio DB, normalized `DataRegistry` with ~100 canonical
+  fields and derived signals, refresh scheduler.
+- Agent layer: model-agnostic routing, filing analyzer, data-point
+  analyzer, risk scanner, short-form thesis, multi-page essay, self-
+  review pass, data-gap protocol.
+- Quant layer: VaR/ES, volatility, regime (rule-based + HMM), Kelly,
+  position sizing, Black-Scholes, Avellaneda-Stoikov, Poisson, GBM,
+  Hurst, OU process, plus a full suite of research models (HRP, RMT,
+  MST, SABR, Longstaff-Schwartz, wavelets, ergodicity, GAN synthesis,
+  and more).
+- Screener: ~600-ticker universe, live prices, lazy fundamentals,
+  15 filter pills, 24-hour SQLite cache, no synthetic data.
+- UI: Streamlit dashboard with screener, portfolio overview, price
+  charts, risk & thesis panels, macro context, streaming chat agent,
+  and quant playground.
+- Tests: 44+ passing across unit, integration, and smoke tests.
 
 **In progress:**
 - Wiring `pipeline.build_agent_context()` to read directly from the
-  registry via `reg.snapshot(ticker, [...])` rather than touching raw
-  tables.
-- Replacing the stubbed `recompute_global_risk_pulse()` with a proper
-  market-wide composite.
-- Populating `factor_returns` from Ken French's data library so factor
-  exposures compute against live data.
-- Building an ETF-issuer-CSV ingestion script that calls the existing
-  `set_etf_holdings()` API.
-- Promoting the `prod` model tag once validation is complete.
+  registry via `reg.snapshot()`.
+- Populating `factor_returns` from Ken French's data library.
+- Promoting `prod` model tag once validation is complete.
 
 ---
 
 ## Future Work
 
-- **RAG over project data** — a `rag/` module using ChromaDB for local
-  vector storage and `nomic-embed-text` via Ollama for embeddings,
-  hooking into `pipeline.build_agent_context()`. Practical alternative to
-  fine-tuning, especially for retrieval over filings and fund notes.
-- **Optional fine-tuning** — LoRA on smaller open models (e.g.
-  Qwen3-1.7B / 4B via Unsloth) trained on SEC filings + fund notes.
-  Skipped for the MVP; base instruction-tuned models plus strong prompts
-  carry most of the load.
+- **RAG module** — ChromaDB vector store + `nomic-embed-text` embeddings
+  via Ollama, hooked into `pipeline.build_agent_context()`. More
+  practical than fine-tuning for retrieval over filings and fund notes.
 - **Daily scheduler hooks** — auto-scan holdings at market open, push
-  high-risk flags to a Slack channel.
-- **PDF reports** — one-click investment memos combining thesis essay +
-  charts + risk summary.
-- **Candidate screener** — rank 500+ tickers by fundamental quality
-  using the registry's normalized fields.
+  risk flags to Slack.
+- **PDF reports** — one-click investment memos combining thesis essay,
+  charts, and risk summary.
+- **Fine-tuning** — LoRA on smaller open models (Qwen3-1.7B / 4B via
+  Unsloth) trained on SEC filings + fund notes. Deferred for MVP.
 
 ---
 
