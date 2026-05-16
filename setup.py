@@ -1,29 +1,33 @@
 """
-Hedge Fund AI — Environment Setup
+Hedge Fund AI - Environment Setup
 Run once: python setup.py
-After that, just double-click activate.bat to start working
+After that, double-click activate.bat to start working.
 """
 
 import subprocess
 import sys
 from pathlib import Path
 
-# Hardcoded so it doesn't matter where this file gets run from
-PROJECT_DIR = Path(r"D:\ary fund")
+# Derive the project dir from this file's location - no hardcoded path,
+# no case-sensitivity gotchas with "D:\ary fund" vs "D:\Ary Fund".
+PROJECT_DIR = Path(__file__).resolve().parent
 VENV_DIR = PROJECT_DIR / "hedgefund_ai"
+
 
 def run(cmd, **kwargs):
     print(f"  > {cmd}")
-    result = subprocess.run(cmd, shell=True, **kwargs, capture_output=False)
+    result = subprocess.run(cmd, shell=True, capture_output=False, **kwargs)
     if result.returncode != 0:
         print("\n  ERROR: Command failed. Check the output above.")
         sys.exit(1)
     return result
 
+
 def main():
     print("=" * 55)
-    print("  Hedge Fund AI — Environment Setup")
+    print("  Hedge Fund AI - Environment Setup")
     print("=" * 55)
+    print(f"  Project dir: {PROJECT_DIR}")
 
     if not PROJECT_DIR.exists():
         print(f"\n  ERROR: {PROJECT_DIR} does not exist.")
@@ -37,9 +41,9 @@ def main():
         run(f'python -m venv "{VENV_DIR}"')
         print("  Done.")
 
-    # Step 2: Paths to pip and python inside the venv (robust quoting)
+    # Step 2: Resolve pip path
     pip_exe = VENV_DIR / "Scripts" / "pip.exe"
-    pip = f'"{pip_exe.absolute()}"'  # Use absolute path for reliability
+    pip = f'"{pip_exe.absolute()}"'
 
     # Step 2.5: Upgrade pip FIRST (fixes ModuleNotFoundError in subprocesses)
     print("\n[2/5] Upgrading pip...")
@@ -65,6 +69,9 @@ def main():
         # UI & visualization
         ("plotly streamlit pandas numpy", ""),
 
+        # PDF report generation
+        ("reportlab pypdf svglib", ""),
+
         # Infrastructure
         ("ollama fastapi uvicorn sqlite-utils requests beautifulsoup4 sqlalchemy", ""),
 
@@ -77,7 +84,7 @@ def main():
         print(f"\n  Installing: {pkg_name}{'...' if len(pkg.split()) > 1 else ''}")
         run(f'{pip} install {pkg} {flags}')
 
-    # Step 4: Install the project itself in editable mode (now works post-pip upgrade)
+    # Step 4: Install the project itself in editable mode
     print("\n[4/5] Installing hedgefund-ai in editable mode...")
     run(f'{pip} install -e "{PROJECT_DIR.absolute()}"')
 
@@ -86,11 +93,13 @@ def main():
     # Step 5: Create activate.bat for future sessions
     print("\n[5/5] Creating activate.bat for quick startup...")
 
-    bat_content = f"""@echo off
+    # Use %~dp0 so the .bat works regardless of how it's invoked or
+    # what casing the project dir happens to have on disk.
+    bat_content = """@echo off
 echo.
-echo  Hedge Fund AI — Activating environment...
-cd /d "{PROJECT_DIR.absolute()}"
-call "{VENV_DIR.absolute()}\\Scripts\\activate.bat"
+echo  Hedge Fund AI - Activating environment...
+cd /d "%~dp0"
+call "%~dp0hedgefund_ai\\Scripts\\activate.bat"
 echo  Done. You are now in (hedgefund_ai) at %CD%
 echo  Run: python main.py
 echo.
@@ -114,6 +123,7 @@ cmd /k
 
  Verify CUDA: python -c "import torch; print('CUDA:', torch.cuda.is_available())"
 """)
+
 
 if __name__ == "__main__":
     main()

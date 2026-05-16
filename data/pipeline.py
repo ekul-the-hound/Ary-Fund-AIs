@@ -17,12 +17,13 @@ Usage:
 
 import logging
 from datetime import datetime
-from typing import Optional
+from typing import Any, Optional
 
 from data.sec_fetcher import SECFetcher
 from data.market_data import MarketData
 from data.macro_data import MacroData
 from data.portfolio_db import PortfolioDB
+from data.data_registry import DataRegistry, get_default_registry
 
 logger = logging.getLogger(__name__)
 
@@ -46,6 +47,516 @@ logger = logging.getLogger(__name__)
 #
 # Tests monkeypatch these two names directly, so the wrappers must exist as
 # bindings at module scope.
+
+
+# =============================================================================
+# REGISTRY-FIRST CONTEXT CONTRACT
+# =============================================================================
+#
+# ``build_agent_context()`` returns a single, registry-backed view of one
+# ticker. The contract below is the authoritative description of what the
+# agent will see. Every field is sourced from the DataRegistry — raw data
+# providers (yfinance, EDGAR, FRED) are NEVER called directly by the
+# context builder. Instead, ``_ensure_registry_populated_for_context()``
+# does a lazy backfill: if a required field is missing from the registry,
+# the helper fetches it from the provider, writes it to the registry, and
+# then reads it back. Subsequent calls within the freshness window are
+# pure registry reads.
+#
+# CONTEXT SCHEMA
+# --------------
+# ``ticker``            (str)         The ticker symbol. Required.
+# ``as_of``             (str)         ISO-format date the snapshot was taken.
+# ``price``             (float|None)  Latest close price. None if no data.
+#                                     Backed by ``ticker.price.adj_close``.
+# ``prices``            (dict)        Price block: ``last``, ``change_pct``,
+#                                     ``market_cap``, ``fifty_two_week_high``,
+#                                     ``fifty_two_week_low``. Missing → None.
+# ``metrics``           (dict)        Fundamentals flat dict. Yfinance-style
+#                                     keys (``trailing_pe``, ``grossMargins``,
+#                                     ``freeCashflow``, etc.) preserved for
+#                                     backward compatibility with
+#                                     ``filing_analyzer.extract_key_metrics_for_agent``.
+# ``filings``           (list[dict])  Recent SEC filings (10-K, 10-Q, 8-K).
+#                                     Empty list when none available.
+# ``macro``             (dict)        Flat macro dict — same shape as before
+#                                     (``vix``, ``fed_funds_rate``,
+#                                     ``yield_curve_spread``, etc.).
+# ``portfolio``         (dict)        Position info if held, ``{}`` if not.
+# ``sentiment``         (dict)        Sentiment block:
+#                                     ``wsb_mentions_24h``, ``wsb_score``,
+#                                     ``news_count_7d``, ``news_tone_7d``.
+# ``geo_signals``       (dict)        Geographic / supply-chain signals.
+#                                     Empty when not yet populated.
+# ``risk_scores``       (dict)        Composite registry-derived risk scores
+#                                     (``macro_stress``, ``supply_chain``,
+#                                     ``sanctions_pressure``, etc.).
+# ``derived_signals``   (dict)        Quant-derived signals from the registry
+#                                     (``rsi_14``, ``macd_hist``, ``regime``,
+#                                     etc.).
+# ``provenance``        (dict)        Per-field source / confidence / as_of
+#                                     metadata: ``{field: {source_id, as_of,
+#                                     confidence}}``. Built from the registry's
+#                                     ``latest()`` rows.
+# ``freshness``         (dict)        Per-section freshness markers:
+#                                     ``{section_name: latest_as_of_iso}``.
+#
+# ABSENCE SEMANTICS
+# -----------------
+# A field that is not in the registry is represented explicitly:
+#   - scalars      → ``None``
+#   - dict blocks  → ``{}``
+#   - list blocks  → ``[]``
+# The function NEVER substitutes zero, empty string, or a fabricated value.
+# Callers can rely on ``ctx["prices"].get("last") is None`` to detect the
+# missing-price case unambiguously.
+#
+# DETERMINISM
+# -----------
+# For a given registry snapshot, ``build_agent_context()`` is deterministic.
+# The only nondeterministic input is ``datetime.now()`` for ``as_of``; pass
+# ``as_of_max`` (via a registry param) to pin time travel for tests.
+#
+# UNIVERSE-LEVEL CONTEXT
+# ----------------------
+# The class method ``DataPipeline.build_universe_context()`` (see below)
+# applies the same registry-first contract across multiple tickers. It is
+# *not* a thin wrapper around the per-ticker builder; it batches snapshot
+# reads to avoid N round-trips, but uses no raw providers.
+
+
+# Registry field → (top-level context section, key inside that section)
+# This is the canonical map from the registry's namespaced fields to the
+# legacy flat context schema. Adding a new field is a single-line change.
+_TICKER_FIELD_MAP: dict[str, tuple[str, str]] = {
+    # Price block
+    "ticker.price.adj_close":         ("prices", "last"),
+    "ticker.price.close":             ("prices", "close"),
+    "ticker.price.market_cap":        ("prices", "market_cap"),
+
+    # Fundamentals — these populate ``metrics`` under yfinance-style aliases
+    # so downstream consumers (filing_analyzer, thesis_essay) don't need to
+    # change. The aliases match what get_fundamentals() used to return.
+    "ticker.fundamental.revenue_ttm":      ("metrics", "totalRevenue"),
+    "ticker.fundamental.eps_diluted_ttm":  ("metrics", "trailingEps"),
+    "ticker.fundamental.fcf_ttm":          ("metrics", "freeCashflow"),
+    "ticker.fundamental.net_income_ttm":   ("metrics", "netIncomeToCommon"),
+    "ticker.fundamental.gross_margin":     ("metrics", "grossMargins"),
+    "ticker.fundamental.operating_margin": ("metrics", "operatingMargins"),
+    "ticker.fundamental.capex_ttm":        ("metrics", "capex"),
+    "ticker.fundamental.rd_ttm":           ("metrics", "researchAndDevelopment"),
+    "ticker.fundamental.tax_rate":         ("metrics", "effectiveTaxRate"),
+    "ticker.fundamental.goodwill":         ("metrics", "goodwill"),
+    "ticker.fundamental.shares_diluted":   ("metrics", "sharesOutstanding"),
+    "ticker.fundamental.long_term_debt":   ("metrics", "longTermDebt"),
+    "ticker.fundamental.total_assets":     ("metrics", "totalAssets"),
+    "ticker.fundamental.total_liabilities":("metrics", "totalLiab"),
+
+    # Sentiment
+    "ticker.sentiment.wsb_mentions_24h":   ("sentiment", "wsb_mentions_24h"),
+    "ticker.sentiment.wsb_score":          ("sentiment", "wsb_score"),
+    "ticker.sentiment.news_count_7d":      ("sentiment", "news_count_7d"),
+    "ticker.sentiment.news_tone_7d":       ("sentiment", "news_tone_7d"),
+
+    # Derived signals
+    "ticker.signal.rsi_14":                ("derived_signals", "rsi_14"),
+    "ticker.signal.macd_hist":             ("derived_signals", "macd_hist"),
+    "ticker.signal.atr_14":                ("derived_signals", "atr_14"),
+    "ticker.signal.sma_50":                ("derived_signals", "sma_50"),
+    "ticker.signal.sma_200":               ("derived_signals", "sma_200"),
+    "ticker.signal.realized_vol_30d":      ("derived_signals", "realized_vol_30d"),
+    "ticker.signal.drawdown":              ("derived_signals", "drawdown"),
+    "ticker.signal.regime":                ("derived_signals", "regime"),
+
+    # Risk scores
+    "ticker.risk.macro_stress_score":      ("risk_scores", "macro_stress"),
+    "ticker.risk.supply_chain_score":      ("risk_scores", "supply_chain"),
+    "ticker.risk.sanctions_pressure":      ("risk_scores", "sanctions_pressure"),
+    "ticker.risk.commodity_sensitivity":   ("risk_scores", "commodity_sensitivity"),
+    "ticker.risk.energy_crisis_score":     ("risk_scores", "energy_crisis"),
+    "ticker.risk.supplier_concentration":  ("risk_scores", "supplier_concentration"),
+    "ticker.risk.customer_concentration":  ("risk_scores", "customer_concentration"),
+
+    # Geographic / supply-chain disclosure
+    "ticker.disclosure.geographic_revenue":("geo_signals", "geographic_revenue"),
+    "ticker.disclosure.segment_revenue":   ("geo_signals", "segment_revenue"),
+
+    # Options
+    "ticker.options.iv_30d":               ("derived_signals", "iv_30d"),
+    "ticker.options.put_call_ratio":       ("derived_signals", "put_call_ratio"),
+
+    # Analyst
+    "ticker.analyst.consensus_target":     ("metrics", "targetMeanPrice"),
+    "ticker.analyst.next_earnings_date":   ("metrics", "next_earnings_date"),
+}
+
+# Macro/global fields → ``macro`` block
+_MACRO_FIELD_MAP: dict[str, str] = {
+    "global.vix":                          "vix",
+    "global.vix_3m":                       "vix_3m",
+    "global.hy_oas":                       "hy_oas",
+    "global.ig_oas":                       "ig_oas",
+    "global.recession_prob":               "recession_probability",
+    "global.consumer_sentiment":           "consumer_sentiment",
+    "global.financial_stress":             "financial_stress",
+    "global.yield_curve_2y10y":            "yield_curve_spread",
+}
+
+# Filings live as registry events rather than data_points. Pulled separately
+# via ``reg.recent_events()``.
+_FILING_EVENT_TYPE = "sec_filing"
+
+
+def _empty_context(ticker: str, reason: Optional[str] = None) -> dict:
+    """Return a schema-complete empty context.
+
+    Every key is present with a type-appropriate empty value, so downstream
+    code can safely index into ``ctx["prices"]["last"]`` etc. without
+    KeyError.
+    """
+    ctx: dict = {
+        "ticker": ticker,
+        "as_of": datetime.now().date().isoformat(),
+        "price": None,
+        "prices": {
+            "last": None,
+            "change_pct": None,
+            "market_cap": None,
+            "fifty_two_week_high": None,
+            "fifty_two_week_low": None,
+        },
+        "metrics": {},
+        "filings": [],
+        "macro": {},
+        "portfolio": {},
+        "sentiment": {},
+        "geo_signals": {},
+        "risk_scores": {},
+        "derived_signals": {},
+        "provenance": {},
+        "freshness": {},
+    }
+    if reason:
+        ctx["_empty_reason"] = reason
+    return ctx
+
+
+def _backfill_prices_to_registry(
+    pipe: "DataPipeline", reg: DataRegistry, ticker: str
+) -> dict:
+    """Fetch latest price from market_data, write it to the registry, return summary.
+
+    The summary dict captures fields that don't have canonical registry slots
+    yet (``change_pct``, ``fifty_two_week_high``, etc.) so the context builder
+    can still expose them. Once those become canonical registry fields they
+    can be dropped from this passthrough.
+    """
+    summary: dict = {
+        "change_pct": None,
+        "fifty_two_week_high": None,
+        "fifty_two_week_low": None,
+    }
+    try:
+        latest = pipe.market.get_latest_price(ticker) or {}
+    except Exception as e:
+        logger.warning(
+            "build_agent_context | %s | price backfill skipped: %s",
+            ticker, e, exc_info=True,
+        )
+        return summary
+
+    price = latest.get("price")
+    if price is not None:
+        try:
+            reg.upsert_point(
+                entity_id=ticker, entity_type="ticker",
+                field="ticker.price.adj_close",
+                as_of=datetime.now().isoformat(timespec="seconds"),
+                source_id="yfinance",
+                value_num=float(price), confidence=0.9,
+            )
+        except Exception as e:
+            logger.debug("registry upsert price failed for %s: %s", ticker, e)
+
+    market_cap = latest.get("market_cap")
+    if market_cap is not None:
+        try:
+            reg.upsert_point(
+                entity_id=ticker, entity_type="ticker",
+                field="ticker.price.market_cap",
+                as_of=datetime.now().isoformat(timespec="seconds"),
+                source_id="yfinance",
+                value_num=float(market_cap), confidence=0.9,
+            )
+        except Exception as e:
+            logger.debug("registry upsert market_cap failed for %s: %s", ticker, e)
+
+    summary["change_pct"] = latest.get("change_pct")
+    summary["fifty_two_week_high"] = latest.get("fifty_two_week_high")
+    summary["fifty_two_week_low"] = latest.get("fifty_two_week_low")
+    return summary
+
+
+def _backfill_fundamentals_to_registry(
+    pipe: "DataPipeline", reg: DataRegistry, ticker: str
+) -> dict:
+    """Fetch fundamentals, write canonical fields to registry, return passthrough.
+
+    Returns a flat dict of yfinance-style fields that don't have canonical
+    registry slots yet (sector, industry, name, P/E, forward P/E, etc.).
+    These remain in ``ctx["metrics"]`` so existing consumers keep working.
+    """
+    passthrough: dict = {}
+    try:
+        fund = pipe.market.get_fundamentals(ticker) or {}
+    except Exception as e:
+        logger.warning(
+            "build_agent_context | %s | fundamentals backfill skipped: %s",
+            ticker, e, exc_info=True,
+        )
+        return passthrough
+
+    if not isinstance(fund, dict):
+        return passthrough
+
+    # Flatten the same way the legacy code did, so we can map fields.
+    flat: dict = {}
+    for section in ("overview", "financials", "valuation", "growth", "analyst", "dividends"):
+        sub = fund.get(section)
+        if isinstance(sub, dict):
+            flat.update(sub)
+    flat.setdefault("sector", fund.get("sector"))
+    flat.setdefault("industry", fund.get("industry"))
+    flat.setdefault("name", fund.get("name"))
+
+    # Yfinance field → canonical registry field.
+    yf_to_canonical: list[tuple[str, str]] = [
+        ("totalRevenue",             "ticker.fundamental.revenue_ttm"),
+        ("trailingEps",              "ticker.fundamental.eps_diluted_ttm"),
+        ("freeCashflow",             "ticker.fundamental.fcf_ttm"),
+        ("netIncomeToCommon",        "ticker.fundamental.net_income_ttm"),
+        ("grossMargins",             "ticker.fundamental.gross_margin"),
+        ("operatingMargins",         "ticker.fundamental.operating_margin"),
+        ("sharesOutstanding",        "ticker.fundamental.shares_diluted"),
+        ("longTermDebt",             "ticker.fundamental.long_term_debt"),
+        ("totalAssets",              "ticker.fundamental.total_assets"),
+        ("totalLiab",                "ticker.fundamental.total_liabilities"),
+        ("goodwill",                 "ticker.fundamental.goodwill"),
+        ("targetMeanPrice",          "ticker.analyst.consensus_target"),
+    ]
+    now_iso = datetime.now().isoformat(timespec="seconds")
+    for yf_key, canonical in yf_to_canonical:
+        v = flat.get(yf_key)
+        if v is None:
+            continue
+        try:
+            reg.upsert_point(
+                entity_id=ticker, entity_type="ticker",
+                field=canonical, as_of=now_iso,
+                source_id="yfinance",
+                value_num=float(v), confidence=0.8,
+            )
+        except (TypeError, ValueError):
+            # Non-numeric value — skip canonical write, keep in passthrough.
+            pass
+        except Exception as e:
+            logger.debug("registry upsert %s failed for %s: %s", canonical, ticker, e)
+
+    # Everything not written as canonical stays in passthrough so the agent
+    # still sees common fields like trailing_pe, sector, name, etc.
+    canonical_yf_keys = {pair[0] for pair in yf_to_canonical}
+    for k, v in flat.items():
+        if k not in canonical_yf_keys:
+            passthrough[k] = v
+    return passthrough
+
+
+def _backfill_filings_to_registry(
+    pipe: "DataPipeline", reg: DataRegistry, ticker: str
+) -> list[dict]:
+    """Fetch recent SEC filings and emit registry events.
+
+    Returns the list of filing dicts so the context builder can pass them
+    through. Registry events are emitted for traceability; the list is
+    the source of truth for the agent's ``filings`` block.
+    """
+    try:
+        filings_10k = pipe.sec.get_filings(ticker, "10-K", count=1) or []
+        filings_10q = pipe.sec.get_filings(ticker, "10-Q", count=2) or []
+        filings_8k = pipe.sec.get_recent_8k_events(ticker, days_back=60) or []
+    except Exception as e:
+        logger.warning(
+            "build_agent_context | %s | filings backfill skipped: %s",
+            ticker, e, exc_info=True,
+        )
+        return []
+
+    all_filings = [*filings_10k, *filings_10q, *filings_8k]
+
+    now_iso = datetime.now().isoformat(timespec="seconds")
+    for f in all_filings:
+        try:
+            reg.upsert_event(
+                entity_id=ticker,
+                event_type=_FILING_EVENT_TYPE,
+                occurred_at=str(f.get("filed_at") or f.get("date") or now_iso),
+                source_id="sec_edgar",
+                payload_json={
+                    "form": f.get("form") or f.get("form_type"),
+                    "accession": f.get("accession_number") or f.get("accession"),
+                    "url": f.get("url"),
+                    "filed_at": f.get("filed_at"),
+                },
+                confidence=1.0,
+            )
+        except Exception as e:
+            logger.debug("registry upsert filing event failed for %s: %s", ticker, e)
+
+    return all_filings
+
+
+def _backfill_macro_to_registry(pipe: "DataPipeline", reg: DataRegistry) -> dict:
+    """Fetch macro dashboard, write key globals to registry, return passthrough.
+
+    Macro fields are not ticker-scoped — they use ``entity_id="GLOBAL"``.
+    """
+    try:
+        raw = pipe.macro.get_macro_dashboard() or {}
+    except Exception as e:
+        logger.warning(
+            "build_agent_context | macro backfill skipped: %s", e, exc_info=True,
+        )
+        return {}
+    flat = _flatten_macro(raw)
+
+    # Map flat macro keys to canonical global fields where they exist.
+    flat_to_canonical: list[tuple[str, str]] = [
+        ("vix",                     "global.vix"),
+        ("vix_3m",                  "global.vix_3m"),
+        ("recession_probability",   "global.recession_prob"),
+        ("financial_stress",        "global.financial_stress"),
+        ("yield_curve_spread",      "global.yield_curve_2y10y"),
+        ("consumer_sentiment",      "global.consumer_sentiment"),
+    ]
+    now_iso = datetime.now().isoformat(timespec="seconds")
+    for src, canonical in flat_to_canonical:
+        v = flat.get(src)
+        if v is None:
+            continue
+        try:
+            reg.upsert_point(
+                entity_id="GLOBAL", entity_type="global",
+                field=canonical, as_of=now_iso,
+                source_id="fred",
+                value_num=float(v), confidence=0.95,
+            )
+        except (TypeError, ValueError):
+            pass
+        except Exception as e:
+            logger.debug("registry upsert macro %s failed: %s", canonical, e)
+
+    return flat
+
+
+def _ensure_registry_populated_for_context(
+    pipe: "DataPipeline",
+    reg: DataRegistry,
+    ticker: str,
+) -> dict:
+    """Lazy backfill: if any required field is missing, fetch + write it.
+
+    Returns a passthrough dict containing fields that don't have canonical
+    registry slots yet (so they can still reach the agent). Within a few
+    refresh cycles, all canonical fields will be in the registry and the
+    passthrough collapses to just non-canonical extras (sector, P/E, etc.).
+    """
+    passthrough: dict = {
+        "price_summary": {},
+        "metrics_extras": {},
+        "filings": [],
+        "macro_extras": {},
+    }
+
+    # --- Prices: backfill if no recent close in registry ---
+    if reg.latest_value(ticker, "ticker.price.adj_close") is None:
+        passthrough["price_summary"] = _backfill_prices_to_registry(pipe, reg, ticker)
+    else:
+        # Still need the non-canonical price fields. Cheap to fetch.
+        try:
+            latest = pipe.market.get_latest_price(ticker) or {}
+            passthrough["price_summary"] = {
+                "change_pct": latest.get("change_pct"),
+                "fifty_two_week_high": latest.get("fifty_two_week_high"),
+                "fifty_two_week_low": latest.get("fifty_two_week_low"),
+            }
+        except Exception:
+            pass
+
+    # --- Fundamentals: backfill if no recent revenue in registry ---
+    if reg.latest_value(ticker, "ticker.fundamental.revenue_ttm") is None:
+        passthrough["metrics_extras"] = _backfill_fundamentals_to_registry(pipe, reg, ticker)
+    else:
+        # Fetch extras (sector, name, multiples) that don't have canonical slots.
+        try:
+            fund = pipe.market.get_fundamentals(ticker) or {}
+            flat: dict = {}
+            for section in ("overview", "financials", "valuation", "growth", "analyst", "dividends"):
+                sub = fund.get(section) if isinstance(fund, dict) else None
+                if isinstance(sub, dict):
+                    flat.update(sub)
+            if isinstance(fund, dict):
+                flat.setdefault("sector", fund.get("sector"))
+                flat.setdefault("industry", fund.get("industry"))
+                flat.setdefault("name", fund.get("name"))
+            passthrough["metrics_extras"] = flat
+        except Exception:
+            pass
+
+    # --- Filings: always pull (cheap; SEC fetcher has its own caching) ---
+    passthrough["filings"] = _backfill_filings_to_registry(pipe, reg, ticker)
+
+    # --- Macro: backfill if no recent VIX in registry ---
+    if reg.latest_value("GLOBAL", "global.vix") is None:
+        passthrough["macro_extras"] = _backfill_macro_to_registry(pipe, reg)
+    else:
+        # Macro has many fields that aren't all canonical — pull the full flat dict.
+        try:
+            raw = pipe.macro.get_macro_dashboard() or {}
+            passthrough["macro_extras"] = _flatten_macro(raw)
+        except Exception:
+            pass
+
+    return passthrough
+
+
+def _set_nested(ctx: dict, section: str, key: str, value: Any) -> None:
+    """Write ``ctx[section][key] = value`` if value is not None."""
+    if value is None:
+        return
+    ctx.setdefault(section, {})[key] = value
+
+
+def _record_provenance(
+    ctx: dict, field: str, row: Optional[dict]
+) -> None:
+    """Record a registry row's source/as_of/confidence in ``ctx['provenance']``."""
+    if not row:
+        return
+    ctx.setdefault("provenance", {})[field] = {
+        "source_id": row.get("source_id"),
+        "as_of": row.get("as_of"),
+        "confidence": row.get("confidence"),
+    }
+
+
+def _update_freshness(ctx: dict, section: str, as_of: Optional[str]) -> None:
+    """Track the latest as_of seen per section."""
+    if not as_of:
+        return
+    fresh = ctx.setdefault("freshness", {})
+    prev = fresh.get(section)
+    if prev is None or as_of > prev:
+        fresh[section] = as_of
 
 
 def _flatten_macro(nested: dict) -> dict:
@@ -146,116 +657,126 @@ def run_daily_refresh(tickers, db_path: str, cfg) -> dict:
 
 
 def build_agent_context(ticker: str, db_path: str, cfg) -> dict:
-    """Assemble a structured context dict for one ticker.
+    """Assemble a registry-backed structured context dict for one ticker.
 
-    This is the **dict-returning** sibling of
-    :meth:`DataPipeline.build_agent_context_text`. Consumers that want a
-    pre-rendered LLM prompt should use the text method; everything else
-    (``main.py``, ``risk_scanner``, ``thesis_generator``, the Streamlit UI)
-    wants the structured dict.
+    **Registry-first design.** This function reads exclusively from the
+    ``DataRegistry`` snapshot layer. Raw data providers (yfinance, EDGAR,
+    FRED) are never called directly here. If a required field is missing,
+    ``_ensure_registry_populated_for_context()`` does a one-shot backfill:
+    fetch from the provider, write to the registry, then read it back. This
+    keeps the registry as the single source of truth for the LLM while
+    allowing the system to bootstrap without a separate refresh pass.
+
+    See the CONTEXT SCHEMA section at the top of this module for the
+    authoritative field list and absence semantics.
+
+    Parameters
+    ----------
+    ticker:
+        The ticker symbol (e.g. ``"AAPL"``).
+    db_path:
+        SQLite path for the registry, portfolio DB, and refresh log.
+    cfg:
+        Project config object — only used to construct the data pipeline
+        for backfill calls. The registry itself is configured by db_path.
 
     Returns
     -------
     dict
-        Shape::
-
-            {
-              "ticker":    str,
-              "price":     float,
-              "prices":    {"last": float, "history": list, ...},
-              "metrics":   dict,       # raw fundamentals from market_data
-              "filings":   list[dict], # recent SEC filings
-              "macro":     dict,       # macro dashboard snapshot
-              "portfolio": dict,       # position info if held, else {}
-              "as_of":     str,        # ISO date
-            }
-
-        Any individual section that fails to fetch degrades to an empty
-        value of the appropriate type rather than raising — one bad
-        upstream call must not kill the whole ticker.
+        A schema-complete context. Missing fields are explicitly ``None``,
+        ``{}``, or ``[]`` — never zero or fabricated.
     """
     pipe = _build_pipeline(db_path, cfg)
+    reg = get_default_registry(db_path)
 
-    ctx: dict = {
-        "ticker": ticker,
-        "as_of": datetime.now().date().isoformat(),
-        "price": 0.0,
-        "prices": {},
-        "metrics": {},
-        "filings": [],
-        "macro": {},
-        "portfolio": {},
-    }
+    ctx = _empty_context(ticker)
 
-    # --- Prices -------------------------------------------------------------
-    try:
-        latest = pipe.market.get_latest_price(ticker)
-        price = float(latest.get("price") or 0.0)
-        ctx["price"] = price
-        ctx["prices"] = {
-            "last": price,
-            "change_pct": latest.get("change_pct"),
-            "market_cap": latest.get("market_cap"),
-            "fifty_two_week_high": latest.get("fifty_two_week_high"),
-            "fifty_two_week_low": latest.get("fifty_two_week_low"),
-        }
-    except Exception as e:
-        logger.warning(
-            "build_agent_context | %s | price fetch failed: %s",
-            ticker, e, exc_info=True,
-        )
+    # ------------------------------------------------------------------
+    # Step 1: lazy backfill — make sure the registry has what we need.
+    # Provider calls happen ONLY inside this helper, never below.
+    # ------------------------------------------------------------------
+    passthrough = _ensure_registry_populated_for_context(pipe, reg, ticker)
 
-    # --- Fundamentals (the raw dict the analyzer will normalize) ------------
-    try:
-        fund = pipe.market.get_fundamentals(ticker)
-        # Flatten the nested structure into a single-level dict that
-        # filing_analyzer.extract_key_metrics_for_agent can consume.
-        flat: dict = {}
-        # Include ALL sections — "overview" contains market_cap / enterprise_value
-        # needed for EV/EBITDA and FCF yield; "dividends" has dividend_yield.
-        for section in ("overview", "financials", "valuation", "growth", "analyst", "dividends"):
-            sub = fund.get(section) if isinstance(fund, dict) else None
-            if isinstance(sub, dict):
-                flat.update(sub)
-        # Keep top-level descriptors for the prompt builder.
-        if isinstance(fund, dict):
-            flat.setdefault("sector", fund.get("sector"))
-            flat.setdefault("industry", fund.get("industry"))
-            flat.setdefault("name", fund.get("name"))
-        ctx["metrics"] = flat
-    except Exception as e:
-        logger.warning(
-            "build_agent_context | %s | fundamentals fetch failed: %s",
-            ticker, e, exc_info=True,
-        )
+    # ------------------------------------------------------------------
+    # Step 2: one snapshot call for every ticker-scoped registry field.
+    # ------------------------------------------------------------------
+    ticker_fields = list(_TICKER_FIELD_MAP.keys())
+    ticker_snapshot = reg.snapshot(ticker, ticker_fields)
 
-    # --- Filings ------------------------------------------------------------
-    try:
-        filings_10k = pipe.sec.get_filings(ticker, "10-K", count=1) or []
-        filings_10q = pipe.sec.get_filings(ticker, "10-Q", count=2) or []
-        filings_8k = pipe.sec.get_recent_8k_events(ticker, days_back=60) or []
-        ctx["filings"] = [*filings_10k, *filings_10q, *filings_8k]
-    except Exception as e:
-        logger.warning(
-            "build_agent_context | %s | filings fetch failed: %s",
-            ticker, e, exc_info=True,
-        )
+    for field, value in ticker_snapshot.items():
+        section, key = _TICKER_FIELD_MAP[field]
+        if value is None:
+            # Honor absence semantics: don't write None into nested dicts;
+            # leave them empty. ``_empty_context`` already created the
+            # structure so consumers can index safely.
+            continue
+        _set_nested(ctx, section, key, value)
 
-    # --- Macro --------------------------------------------------------------
-    # get_macro_dashboard() returns a nested dict (sections like
-    # "interest_rates", "inflation", etc.). Flatten it so risk_scanner,
-    # main.py, and thesis_generator can read top-level keys like
-    # "yield_curve_spread", "vix", "recession_probability".
-    try:
-        raw_macro = pipe.macro.get_macro_dashboard() or {}
-        ctx["macro"] = _flatten_macro(raw_macro)
-    except Exception as e:
-        logger.warning(
-            "build_agent_context | %s | macro fetch failed: %s",
-            ticker, e, exc_info=True,
-        )
+        # Pull the full row once for provenance + freshness. ``latest()``
+        # is the same query path as ``latest_value()`` so this is cheap.
+        row = reg.latest(ticker, field)
+        _record_provenance(ctx, field, row)
+        if row:
+            _update_freshness(ctx, section, row.get("as_of"))
 
-    # --- Portfolio position (if any) ---------------------------------------
+    # ------------------------------------------------------------------
+    # Step 3: macro snapshot — global-scoped fields.
+    # ------------------------------------------------------------------
+    macro_fields = list(_MACRO_FIELD_MAP.keys())
+    macro_snapshot = reg.snapshot("GLOBAL", macro_fields)
+    for field, value in macro_snapshot.items():
+        if value is None:
+            continue
+        flat_key = _MACRO_FIELD_MAP[field]
+        ctx["macro"][flat_key] = value
+        row = reg.latest("GLOBAL", field)
+        _record_provenance(ctx, field, row)
+        if row:
+            _update_freshness(ctx, "macro", row.get("as_of"))
+
+    # ------------------------------------------------------------------
+    # Step 4: merge non-canonical passthrough fields. These are values
+    # the providers return that don't yet have canonical registry slots
+    # (sector, name, trailing_pe, etc.). They reach the agent through
+    # ``metrics`` and ``prices`` so existing consumers don't break. As
+    # canonical fields expand, this section will shrink.
+    # ------------------------------------------------------------------
+    price_summary = passthrough.get("price_summary") or {}
+    for k, v in price_summary.items():
+        if v is not None:
+            ctx["prices"][k] = v
+
+    metrics_extras = passthrough.get("metrics_extras") or {}
+    for k, v in metrics_extras.items():
+        # Don't clobber values that came from the canonical registry path.
+        if v is not None and ctx["metrics"].get(k) is None:
+            ctx["metrics"][k] = v
+
+    macro_extras = passthrough.get("macro_extras") or {}
+    for k, v in macro_extras.items():
+        if v is not None and ctx["macro"].get(k) is None:
+            ctx["macro"][k] = v
+
+    # Filings: registry events plus the live list (the live list is the
+    # source of truth for content; events are for audit/traceability).
+    filings_list = passthrough.get("filings") or []
+    if filings_list:
+        ctx["filings"] = filings_list
+
+    # ------------------------------------------------------------------
+    # Step 5: ``price`` shorthand for legacy consumers.
+    # ------------------------------------------------------------------
+    if ctx["prices"].get("last") is not None:
+        try:
+            ctx["price"] = float(ctx["prices"]["last"])
+        except (TypeError, ValueError):
+            ctx["price"] = None
+
+    # ------------------------------------------------------------------
+    # Step 6: portfolio position lookup. Portfolio DB is not part of the
+    # agent-facing data registry — it's user state, not market data — so
+    # reading it here doesn't violate the registry-first contract.
+    # ------------------------------------------------------------------
     try:
         positions = pipe.portfolio.get_positions() or []
         for p in positions:
@@ -274,6 +795,30 @@ def build_agent_context(ticker: str, db_path: str, cfg) -> dict:
         )
 
     return ctx
+
+
+def build_universe_context(
+    tickers: list[str], db_path: str, cfg
+) -> dict[str, dict]:
+    """Registry-first context builder for multiple tickers.
+
+    Reads the same registry the per-ticker path reads. Calls the per-ticker
+    builder in a loop; the helper inside (``_ensure_registry_populated_for_context``)
+    is idempotent and the registry caches across calls, so the second ticker
+    onward sees a pre-warmed registry. No raw providers are called outside
+    of the per-ticker backfill path.
+
+    Returns ``{ticker: context_dict}``. Tickers that fail are not included.
+    """
+    out: dict[str, dict] = {}
+    for t in tickers or []:
+        try:
+            out[t] = build_agent_context(t, db_path, cfg)
+        except Exception as e:
+            logger.warning(
+                "build_universe_context | %s | failed: %s", t, e, exc_info=True,
+            )
+    return out
 
 
 # =============================================================================

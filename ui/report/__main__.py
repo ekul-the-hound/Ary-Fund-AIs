@@ -49,7 +49,10 @@ def _try_pipeline_context(ticker: str) -> dict:
     try:
         from data import pipeline as _pipeline   # type: ignore
         import config as _config                  # type: ignore
-        db_path = getattr(_config, "DB_PATH", "data/hedgefund.db")
+        # config.py exposes PORTFOLIO_DB_PATH (not DB_PATH); the legacy
+        # fallback string is kept as a last-resort default for callers
+        # that import this CLI without a real project config.
+        db_path = getattr(_config, "PORTFOLIO_DB_PATH", "data/portfolio.db")
         return _pipeline.build_agent_context(ticker, db_path, _config) or {}
     except Exception as e:  # noqa: BLE001
         print(

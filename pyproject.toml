@@ -26,12 +26,16 @@ dependencies = [
     # UI
     "streamlit>=1.36",
     "plotly>=5.20",
+
+    # PDF report generation
+    "reportlab>=4.0",
 ]
 
 [project.optional-dependencies]
 dev = [
     "pytest>=8.0",
     "pytest-mock>=3.12",
+    "pypdf>=4.0",
 ]
 quant = [
     "statsmodels>=0.14",
@@ -39,12 +43,8 @@ quant = [
 ]
 
 [tool.setuptools]
-packages = ["agent", "data", "quant", "ui"]
+packages = ["agent", "data", "quant", "ui", "report"]
 
-[tool.pytest.ini_options]
-testpaths = ["tests"]
-python_files = ["test_*.py"]
-addopts = "-ra"
-filterwarnings = [
-    "ignore::DeprecationWarning",
-]
+# NOTE: pytest configuration lives in pytest.ini, not here.
+# When both files have a pytest section, pytest.ini wins and any block
+# here is silently ignored - keeping it in one place avoids drift.

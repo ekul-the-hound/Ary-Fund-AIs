@@ -13,7 +13,7 @@ This module is imported by every layer:
 
 All downstream modules should read values from here rather than hard-coding
 paths, keys, or model tags. To swap the LLM backend (e.g. from mock to a real
-Ollama model), change ``DEFAULT_AGENT_MODEL`` below — no other code needs to
+Ollama model), change ``DEFAULT_AGENT_MODEL`` below - no other code needs to
 be touched.
 """
 
@@ -113,19 +113,19 @@ HTTP_MAX_RETRIES: int = 3
 # =============================================================================
 # Everything below is consumed by ``agent/base_agent.py`` and the master
 # ``main.py`` loop. The agent layer is intentionally model-agnostic: callers
-# never reference a specific model tag — they go through ``AGENT_MODELS``
+# never reference a specific model tag - they go through ``AGENT_MODELS``
 # and ``DEFAULT_AGENT_MODEL``.
 #
 # Swap models by editing ``DEFAULT_AGENT_MODEL`` only. For example:
-#   - "mock" → no Ollama required, returns deterministic JSON. Use for tests.
-#   - "dev"  → Phi-3-mini-3.8B via Ollama. Current filler while we validate
-#              the wiring end-to-end on an RTX 2080.
-#   - "prod" → Qwen 14B/30B instruct — swap in once the 3.8B model proves
-#              the pipeline works.
+#   - "mock" -> no Ollama required, returns deterministic JSON. Use for tests.
+#   - "dev"  -> Phi-3-mini-3.8B via Ollama. Current filler while we validate
+#               the wiring end-to-end on an RTX 2080.
+#   - "prod" -> Qwen 14B/30B instruct - swap in once the 3.8B model proves
+#               the pipeline works.
 # -----------------------------------------------------------------------------
 
 AGENT_MODELS: Dict[str, str] = {
-    # Deterministic stub — no model server required. Safe default.
+    # Deterministic stub - no model server required. Safe default.
     "mock": "mock",
 
     # Current filler model. Phi-3-mini (~3.8B) runs comfortably on the
@@ -152,7 +152,7 @@ AGENT_TIMEOUT: int = 30
 MAX_TOKENS: int = 4096
 
 # Where prompt templates will live once we start loading them from disk.
-# The directory does not need to exist yet — ``base_agent`` currently builds
+# The directory does not need to exist yet - ``base_agent`` currently builds
 # prompts in code. This is reserved for the next iteration.
 AGENT_PROMPT_TEMPLATES_DIR: str = str(DATA_DIR / "prompts" / "agent")
 
@@ -189,19 +189,19 @@ RISK_THRESHOLDS: Dict[str, float] = {
 
 
 # =============================================================================
-# SANITY CHECKS (deferred — only emit if logging is already configured)
+# SANITY CHECKS (explicit-only - callers invoke after logging is configured)
 # =============================================================================
 
 def _warn_if_missing() -> None:
     """Emit warnings for missing-but-not-fatal config values.
 
-    Called by ``main.py`` and ``app.py`` after ``logging.basicConfig`` has
-    run, so the messages appear in the application log rather than on stderr
-    every time *any* script imports config.
-
-    Callers that set up logging before importing config will see these;
-    bare imports (pytest, interactive sessions, Streamlit startup) will not
-    get the spurious "FRED_API_KEY is empty" stderr message.
+    Called by ``main.py`` (and any other entry point) AFTER
+    ``logging.basicConfig`` has run, so the messages appear in the
+    application log rather than on stderr every time *any* script imports
+    config. This function is intentionally NOT auto-invoked at import
+    time - callers must explicitly call it once they own the log
+    configuration. That avoids double-warnings (the previous version
+    auto-fired here AND in ``main._cli_entry``).
     """
     logger = logging.getLogger(__name__)
     if not FRED_API_KEY:
@@ -215,10 +215,3 @@ def _warn_if_missing() -> None:
             "fall back to mock mode.",
             DEFAULT_AGENT_MODEL,
         )
-
-
-# Only auto-emit if the root logger already has handlers (i.e. logging has
-# been configured by the caller). This avoids the "FRED_API_KEY is empty"
-# message being printed to stderr on every bare import.
-if logging.root.handlers:
-    _warn_if_missing()
