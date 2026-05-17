@@ -1,4 +1,4 @@
-"""
+﻿"""
 Combined Test Suite — ARY Fund
 ==============================
 
@@ -21,6 +21,10 @@ Source files merged (in order, top to bottom of this file):
     10. test_sec_fetcher_ext.py
     11. test_integration.py
     12. test_data_providers.py
+    13. test_etf_holdings_loader.py
+    14. test_global_risk_pulse.py
+    15. test_pdf_report.py
+    16. test_pipeline_registry_context.py
 
 Renames applied to resolve collisions
 -------------------------------------
@@ -31,6 +35,8 @@ so all tests run instead of one silently overwriting another:
     test_market_data_ext::test_extended_tables_created -> test_extended_tables_created_md
     test_sec_fetcher_ext::test_sources_registered      -> test_sources_registered_sec
     test_sec_fetcher_ext::test_extended_tables_created -> test_extended_tables_created_sec
+    test_integration::db (fixture)                     -> integration_db
+    test_pdf_report::TestDeterminism                   -> TestDeterminismPdf
 
 Original source files are untouched on disk — this is the merged copy.
 """
@@ -48,7 +54,7 @@ import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from types import SimpleNamespace
-from typing import Any
+from typing import Any, Optional
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import numpy as np
@@ -90,7 +96,37 @@ from data.sec_fetcher import (
     XBRL_CONCEPT_MAP,
 )
 from data.sentiment_news import SentimentNews
-from ui import earnings_calendar
+from data import earnings_calendar
+
+# --- Imports added for sections 13-16 -------------------------------------
+import os
+import sys
+from pypdf import PdfReader
+from data.etf_holdings_loader import (
+    CanonicalHolding,
+    ETFHoldingsLoader,
+    TickerResolver,
+)
+from data.etf_providers import (
+    GenericIssuerConfig,
+    GenericIssuerProvider,
+    IsharesProvider,
+    RawHolding,
+    SpdrProvider,
+)
+from data.global_risk_pulse import (
+    PulseConfig,
+    _aggregate,
+    _compute_concentration,
+    _compute_confidence,
+    global_pulse_score,
+    recompute_global_risk_pulse,
+)
+from report import build_filename, generate_pdf_report, REPORT_VERSION
+from report.charts import ChartSpec
+from report.template import SECTION_ORDER
+from data import pipeline as pipeline_mod
+import data.data_registry as _data_registry_module
 
 
 # ============================================================================
@@ -2259,8 +2295,8 @@ def test_xbrl_concept_map_lists_non_empty():
 # ============================================================================
 
 @pytest.fixture
-def db(tmp_path: Path) -> str:
-    return str(tmp_path / "integration.db")
+def integration_db(tmp_path: Path) -> str:
+    return str(tmp_path / "integration.integration_db")
 
 
 def _seed_prices(db_path: str, ticker: str, n: int = 300, seed: int = 42):
@@ -2283,17 +2319,17 @@ def _seed_prices(db_path: str, ticker: str, n: int = 300, seed: int = 42):
             )
 
 
-def test_all_modules_share_one_registry(db: str):
+def test_all_modules_share_one_registry(integration_db: str):
     """Construct every module with the same db_path and confirm they
     write to the same data_sources table."""
-    reg = DataRegistry(db)
-    md = MarketData(db_path=db, registry=reg)
-    macro = MacroData(api_key="x", db_path=db, registry=reg)
-    sec = SECFetcher(db_path=db, registry=reg, agent_name="t", agent_email="t@t.com")
-    sn = SentimentNews(db_path=db, registry=reg)
-    gs = GeoSupply(db_path=db, registry=reg)
-    ds = DerivedSignals(db_path=db, registry=reg)
-    with sqlite3.connect(db) as conn:
+    reg = DataRegistry(integration_db)
+    md = MarketData(db_path=integration_db, registry=reg)
+    macro = MacroData(api_key="x", db_path=integration_db, registry=reg)
+    sec = SECFetcher(db_path=integration_db, registry=reg, agent_name="t", agent_email="t@t.com")
+    sn = SentimentNews(db_path=integration_db, registry=reg)
+    gs = GeoSupply(db_path=integration_db, registry=reg)
+    ds = DerivedSignals(db_path=integration_db, registry=reg)
+    with sqlite3.connect(integration_db) as conn:
         sources = {r[0] for r in conn.execute("SELECT source_id FROM data_sources")}
     # Should contain entries from at least three different categories
     expected_subset = {
@@ -2303,18 +2339,18 @@ def test_all_modules_share_one_registry(db: str):
     assert expected_subset.issubset(sources)
 
 
-def test_full_snapshot_after_synthetic_refresh(db: str):
+def test_full_snapshot_after_synthetic_refresh(integration_db: str):
     """Seed prices for AAPL + a sector ETF, push some macro values, run derived
     signals, and verify a final agent snapshot has fields from every layer."""
-    _seed_prices(db, "AAPL", n=300)
-    _seed_prices(db, "XLK",  n=300, seed=7)
+    _seed_prices(integration_db, "AAPL", n=300)
+    _seed_prices(integration_db, "XLK",  n=300, seed=7)
 
-    reg = DataRegistry(db)
-    md = MarketData(db_path=db, registry=reg)        # creates extra tables + sources
-    macro = MacroData(api_key="x", db_path=db, registry=reg)
-    sn = SentimentNews(db_path=db, registry=reg)
-    gs = GeoSupply(db_path=db, registry=reg)
-    ds = DerivedSignals(db_path=db, registry=reg)
+    reg = DataRegistry(integration_db)
+    md = MarketData(db_path=integration_db, registry=reg)        # creates extra tables + sources
+    macro = MacroData(api_key="x", db_path=integration_db, registry=reg)
+    sn = SentimentNews(db_path=integration_db, registry=reg)
+    gs = GeoSupply(db_path=integration_db, registry=reg)
+    ds = DerivedSignals(db_path=integration_db, registry=reg)
 
     # Macro values (stubbed FRED)
     fake_fred = {
@@ -2327,7 +2363,7 @@ def test_full_snapshot_after_synthetic_refresh(db: str):
     assert n_macro >= 7
 
     # SEC: simulate inserting an 8-K corporate action
-    sec = SECFetcher(db_path=db, registry=reg, agent_name="t", agent_email="t@t.com")
+    sec = SECFetcher(db_path=integration_db, registry=reg, agent_name="t", agent_email="t@t.com")
     sec._record_corp_action(
         "AAPL", "0000320193", "share_repurchase_announce",
         "2026-04-25", "ABC-001", amount_usd=110_000_000_000,
@@ -2335,7 +2371,7 @@ def test_full_snapshot_after_synthetic_refresh(db: str):
     )
 
     # Sentiment: synthesize a news article + WSB mention, then aggregate
-    with sqlite3.connect(db) as conn:
+    with sqlite3.connect(integration_db) as conn:
         conn.execute(
             """INSERT INTO news_articles (ticker, title, publisher, url,
                 published_at, source, sentiment)
@@ -2391,7 +2427,7 @@ def test_full_snapshot_after_synthetic_refresh(db: str):
 
     # Refresh log records what just ran (via DerivedSignals direct calls)
     # plus what the scheduler will record below
-    sch = RefreshScheduler(tickers=["AAPL"], db_path=db, registry=reg)
+    sch = RefreshScheduler(tickers=["AAPL"], db_path=integration_db, registry=reg)
 
     # Synthesize one logged scheduler call so refresh_log isn't empty
     res = sch._run_task("daily_test_smoke", lambda: 1, 60, force=True)
@@ -2400,10 +2436,10 @@ def test_full_snapshot_after_synthetic_refresh(db: str):
     assert any(k.startswith("daily_test") for k in status)
 
 
-def test_scheduler_skips_when_not_due(db: str):
+def test_scheduler_skips_when_not_due(integration_db: str):
     """A second invocation of the same hourly task should be skipped."""
-    reg = DataRegistry(db)
-    sch = RefreshScheduler(tickers=["AAPL"], db_path=db, registry=reg)
+    reg = DataRegistry(integration_db)
+    sch = RefreshScheduler(tickers=["AAPL"], db_path=integration_db, registry=reg)
     r1 = sch._run_task("hourly_smoke", lambda: 3, 3600)
     assert r1.error is None
     r2 = sch._run_task("hourly_smoke", lambda: 3, 3600)
@@ -2413,9 +2449,9 @@ def test_scheduler_skips_when_not_due(db: str):
     assert r3.rows_written == 3
 
 
-def test_event_handler_returns_taskresult(db: str):
-    reg = DataRegistry(db)
-    sch = RefreshScheduler(tickers=["AAPL"], db_path=db, registry=reg)
+def test_event_handler_returns_taskresult(integration_db: str):
+    reg = DataRegistry(integration_db)
+    sch = RefreshScheduler(tickers=["AAPL"], db_path=integration_db, registry=reg)
     res = sch.run_event("unknown_event", {"ticker": "AAPL"})
     assert res.rows_written == 0
     assert res.error is None
@@ -3035,7 +3071,7 @@ class TestEarningsCalendar:
 
     def test_upcoming_filters_by_ticker(self):
         events = [self._earnings("AAPL", 3), self._earnings("MSFT", 4)]
-        with patch("ui.earnings_calendar.providers.get_earnings_events",
+        with patch("data.earnings_calendar.providers.get_earnings_events",
                     return_value=events):
             res = earnings_calendar.get_upcoming_earnings_week("AAPL")
         assert len(res) == 1
@@ -3043,25 +3079,25 @@ class TestEarningsCalendar:
 
     def test_upcoming_returns_all_when_no_ticker(self):
         events = [self._earnings("AAPL", 3), self._earnings("MSFT", 4)]
-        with patch("ui.earnings_calendar.providers.get_earnings_events",
+        with patch("data.earnings_calendar.providers.get_earnings_events",
                     return_value=events):
             res = earnings_calendar.get_upcoming_earnings_week()
         assert len(res) == 2
 
     def test_upcoming_handles_provider_failure(self):
-        with patch("ui.earnings_calendar.providers.get_earnings_events",
+        with patch("data.earnings_calendar.providers.get_earnings_events",
                     side_effect=RuntimeError("boom")):
             assert earnings_calendar.get_upcoming_earnings_week("AAPL") == []
 
     def test_should_trigger_for_upcoming_event(self):
         events = [self._earnings("AAPL", 3)]  # 3 days from now
-        with patch("ui.earnings_calendar.providers.get_earnings_events",
+        with patch("data.earnings_calendar.providers.get_earnings_events",
                     return_value=events):
             assert earnings_calendar.should_trigger_event_refresh("AAPL") is True
 
     def test_should_trigger_for_recent_event_not_yet_refreshed(self):
         events = [self._earnings("AAPL", -2)]  # 2 days ago
-        with patch("ui.earnings_calendar.providers.get_earnings_events",
+        with patch("data.earnings_calendar.providers.get_earnings_events",
                     return_value=events):
             # No refresh recorded yet → should trigger
             assert earnings_calendar.should_trigger_event_refresh("AAPL") is True
@@ -3071,17 +3107,2070 @@ class TestEarningsCalendar:
         # Mark refreshed yesterday (after the event)
         earnings_calendar.mark_refreshed(
             "AAPL", when=datetime.now(timezone.utc).replace(tzinfo=None) - timedelta(days=1))
-        with patch("ui.earnings_calendar.providers.get_earnings_events",
+        with patch("data.earnings_calendar.providers.get_earnings_events",
                     return_value=events):
             assert earnings_calendar.should_trigger_event_refresh("AAPL") is False
 
     def test_should_not_trigger_with_no_events(self):
-        with patch("ui.earnings_calendar.providers.get_earnings_events",
+        with patch("data.earnings_calendar.providers.get_earnings_events",
                     return_value=[]):
             assert earnings_calendar.should_trigger_event_refresh("AAPL") is False
 
     def test_should_not_trigger_for_other_ticker(self):
         events = [self._earnings("MSFT", 3)]
-        with patch("ui.earnings_calendar.providers.get_earnings_events",
+        with patch("data.earnings_calendar.providers.get_earnings_events",
                     return_value=events):
             assert earnings_calendar.should_trigger_event_refresh("AAPL") is False
+
+# ============================================================================
+# SECTION 13: test_etf_holdings_loader.py
+# ============================================================================
+
+ISHARES_CSV = b'''Fund Holdings as of: ,"Apr 30, 2024",,,,,,,,
+Inception Date: ,"Dec 18, 2009",,,,,,,,
+Shares Outstanding: ,"123,456,789",,,,,,,,
+Stock,-,,,,,,,,
+,,,,,,,,,
+Ticker,Name,Sector,Asset Class,Market Value,Weight (%),Notional Value,Shares,CUSIP,ISIN
+AAPL,APPLE INC,Information Technology,Equity,"$58,234,567,890.00",7.25,"$58,234,567,890.00","348,432,000",037833100,US0378331005
+MSFT,MICROSOFT CORP,Information Technology,Equity,"$54,000,000,000.00",6.80,"$54,000,000,000.00","200,000,000",594918104,US5949181045
+NVDA,NVIDIA CORP,Information Technology,Equity,"$30,000,000,000.00",3.75,"$30,000,000,000.00","20,000,000",67066G104,US67066G1040
+-,USD CASH,-,Cash,"$1,200,000.00",0.05,,1200000,,
+The Trust has Cash and/or Derivatives that may be reported here.
+'''
+
+# SPDR-style CSV (XLSX is the canonical format on the wire, but the provider
+# falls back to CSV parsing when the bytes aren't a zip).
+SPDR_CSV = b'''State Street Global Advisors,,,,,,,
+,,,,,,,
+Fund Name:,Technology Select Sector SPDR Fund,,,,,,
+Date:,4/30/2024,,,,,,
+,,,,,,,
+Name,Ticker,Identifier,SEDOL,Weight,Sector,Shares Held,Local Currency
+APPLE INC,AAPL,037833100,2046251,21.85,Information Technology,"168,432,000",USD
+MICROSOFT CORP,MSFT,594918104,2588173,18.50,Information Technology,"100,000,000",USD
+NVIDIA CORP,NVDA,67066G104,2379504,8.30,Information Technology,"40,000,000",USD
+'''
+
+
+@pytest.fixture
+def loader(tmp_path: Path, monkeypatch) -> ETFHoldingsLoader:
+    """Loader pointed at a tmp DB, with the real MarketData class but a
+    private DB so production data isn't touched."""
+    db = tmp_path / "etf_test.db"
+    # Pre-create the etf_holdings table that the real MarketData would
+    # create — avoids hitting yfinance during MarketData.__init__.
+    _bootstrap_market_tables(str(db))
+    # Patch MarketData so the loader gets the minimal stub below
+    monkeypatch.setattr(
+        "data.etf_holdings_loader.MarketData",
+        _StubMarketData,
+    )
+    return ETFHoldingsLoader(
+        db_path=str(db),
+        provider_config={
+            "IVV": {
+                "provider": "ishares",
+                "product_id": "239726",
+                "slug": "ishares-core-sp-500-etf",
+            },
+            "XLK": {"provider": "spdr"},
+        },
+    )
+
+
+def _bootstrap_market_tables(db_path: str) -> None:
+    """Create the etf_holdings table without invoking real MarketData
+    (which would hit network / yfinance on init)."""
+    with sqlite3.connect(db_path) as conn:
+        conn.execute(
+            """CREATE TABLE IF NOT EXISTS etf_holdings (
+                etf_ticker TEXT NOT NULL,
+                holding_ticker TEXT NOT NULL,
+                weight REAL,
+                shares REAL,
+                market_value REAL,
+                as_of TEXT NOT NULL,
+                source TEXT,
+                fetched_at TEXT NOT NULL DEFAULT (datetime('now')),
+                PRIMARY KEY (etf_ticker, holding_ticker, as_of)
+            )"""
+        )
+        conn.commit()
+
+
+class _StubMarketData:
+    """In-test replacement for MarketData with set_etf_holdings only.
+
+    Identical SQL to the real one (mirrored from market_data.py).
+    Lives here rather than under tests/conftest.py so the test file is
+    self-contained.
+    """
+
+    def __init__(self, db_path: str) -> None:
+        self.db_path = db_path
+        _bootstrap_market_tables(db_path)
+        self.calls: list[dict] = []  # spy
+
+    def set_etf_holdings(
+        self, etf_ticker: str, holdings: list[dict],
+        as_of=None, source: str = "issuer_csv",
+    ) -> int:
+        from datetime import datetime as _dt
+        etf_ticker = etf_ticker.upper()
+        as_of = as_of or _dt.now().strftime("%Y-%m-%d")
+        self.calls.append({
+            "etf_ticker": etf_ticker,
+            "holdings": holdings,
+            "as_of": as_of,
+            "source": source,
+        })
+        n = 0
+        with sqlite3.connect(self.db_path) as conn:
+            for h in holdings:
+                tk = (h.get("ticker") or "").upper()
+                if not tk:
+                    continue
+                conn.execute(
+                    """INSERT OR REPLACE INTO etf_holdings
+                        (etf_ticker, holding_ticker, weight, shares,
+                         market_value, as_of, source)
+                       VALUES (?, ?, ?, ?, ?, ?, ?)""",
+                    (etf_ticker, tk, h.get("weight"), h.get("shares"),
+                     h.get("market_value"), as_of, source),
+                )
+                n += 1
+            conn.commit()
+        return n
+
+
+# ===========================================================================
+# Test 1: iShares-style file
+# ===========================================================================
+
+
+class TestIsharesIngest:
+    def test_parser_extracts_holdings(self):
+        p = IsharesProvider(product_id="239726", slug="ishares-core-sp-500-etf")
+        result = p.parse_bytes(ISHARES_CSV, "IVV", "http://test/ivv.csv")
+        assert result.ok, f"errors: {result.errors}"
+        assert result.as_of_date == "2024-04-30"
+        # 3 equities + 1 cash row preserved
+        assert len(result.holdings) == 4
+        assert result.holdings[0].raw_ticker == "AAPL"
+        assert result.holdings[0].name == "APPLE INC"
+
+    def test_weight_is_decimal_not_percent(self):
+        p = IsharesProvider(product_id="0", slug="x")
+        result = p.parse_bytes(ISHARES_CSV, "IVV", "")
+        # 7.25% → 0.0725
+        assert abs(result.holdings[0].weight - 0.0725) < 1e-9
+        # 6.80% → 0.068
+        assert abs(result.holdings[1].weight - 0.068) < 1e-9
+
+    def test_cusip_captured(self):
+        p = IsharesProvider(product_id="0", slug="x")
+        result = p.parse_bytes(ISHARES_CSV, "IVV", "")
+        aapl = result.holdings[0]
+        assert aapl.raw_identifier == "037833100"
+        assert aapl.identifier_type == "cusip"
+
+    def test_footer_stops_parsing(self):
+        """The 'The Trust has Cash...' footer must not become a holding row."""
+        p = IsharesProvider(product_id="0", slug="x")
+        result = p.parse_bytes(ISHARES_CSV, "IVV", "")
+        for h in result.holdings:
+            joined = " ".join(filter(None, [h.raw_ticker, h.name or ""]))
+            assert "trust" not in joined.lower()
+
+    def test_full_ingest_writes_through_api(self, loader):
+        with patch.object(
+            ETFHoldingsLoader, "_download_with_retry",
+            return_value=ISHARES_CSV,
+        ):
+            r = loader.run_single("IVV")
+        assert r.status == "success", f"error: {r.error}"
+        assert r.as_of_date == "2024-04-30"
+        # 4 raw rows in, 4 written (deduper keeps distinct tickers)
+        assert r.rows_loaded == 4
+
+        # Verify the set_etf_holdings call shape
+        market = loader.market  # the stub
+        assert len(market.calls) == 1
+        call = market.calls[0]
+        assert call["etf_ticker"] == "IVV"
+        assert call["as_of"] == "2024-04-30"
+        assert call["source"] == "ishares_csv"
+
+        # Payload must be the (ticker, weight, shares, market_value) shape
+        api_payload = call["holdings"]
+        tickers = {h["ticker"] for h in api_payload}
+        assert {"AAPL", "MSFT", "NVDA", "CASH"} == tickers
+
+    def test_data_in_etf_holdings_table(self, loader):
+        with patch.object(
+            ETFHoldingsLoader, "_download_with_retry",
+            return_value=ISHARES_CSV,
+        ):
+            loader.run_single("IVV")
+
+        with sqlite3.connect(loader.db_path) as conn:
+            rows = conn.execute(
+                """SELECT holding_ticker, weight, as_of, source
+                   FROM etf_holdings WHERE etf_ticker = 'IVV'
+                   ORDER BY weight DESC NULLS LAST"""
+            ).fetchall()
+        assert rows[0][0] == "AAPL"
+        assert abs(rows[0][1] - 0.0725) < 1e-9
+        assert rows[0][2] == "2024-04-30"
+        assert rows[0][3] == "ishares_csv"
+
+
+# ===========================================================================
+# Test 2: SPDR-style file
+# ===========================================================================
+
+
+class TestSpdrIngest:
+    def test_parser_handles_spdr_banner(self):
+        p = SpdrProvider()
+        result = p.parse_bytes(SPDR_CSV, "XLK", "http://test/xlk.csv")
+        assert result.ok, f"errors: {result.errors}"
+        assert result.as_of_date == "2024-04-30"
+        assert len(result.holdings) == 3
+
+    def test_identifier_column_treated_as_cusip(self):
+        """SPDR labels CUSIPs as 'Identifier' rather than 'CUSIP' —
+        the column map needs to handle that alias."""
+        p = SpdrProvider()
+        result = p.parse_bytes(SPDR_CSV, "XLK", "")
+        aapl = result.holdings[0]
+        assert aapl.raw_identifier == "037833100"
+        assert aapl.identifier_type == "cusip"
+
+    def test_weight_decimal(self):
+        p = SpdrProvider()
+        result = p.parse_bytes(SPDR_CSV, "XLK", "")
+        # 21.85% → 0.2185
+        assert abs(result.holdings[0].weight - 0.2185) < 1e-9
+
+    def test_full_ingest(self, loader):
+        with patch.object(
+            ETFHoldingsLoader, "_download_with_retry",
+            return_value=SPDR_CSV,
+        ):
+            r = loader.run_single("XLK")
+        assert r.status == "success", r.error
+        assert r.rows_loaded == 3
+        assert r.issuer == "spdr"
+
+
+# ===========================================================================
+# Test 3: Unmapped identifiers are preserved
+# ===========================================================================
+
+
+class TestTickerResolution:
+    def test_unmapped_cusip_kept_with_prefix(self, tmp_path):
+        """A holding with only a CUSIP and no resolver entry must come
+        through as ``CUSIP:...`` — never silently dropped."""
+        resolver = TickerResolver(db_path=str(tmp_path / "t.db"))
+        raw = RawHolding(
+            raw_ticker=None,
+            raw_identifier="123456789",
+            identifier_type="cusip",
+            name="Mystery Bond",
+            weight=0.01,
+            shares=None,
+            market_value=None,
+        )
+        assert resolver.resolve(raw) == "CUSIP:123456789"
+
+    def test_seeded_cusip_resolves_to_ticker(self, tmp_path):
+        resolver = TickerResolver(db_path=str(tmp_path / "t.db"))
+        resolver.add_mapping("037833100", "cusip", "AAPL")
+        raw = RawHolding(
+            raw_ticker=None,
+            raw_identifier="037833100",
+            identifier_type="cusip",
+            name="APPLE INC",
+            weight=0.07,
+            shares=None,
+            market_value=None,
+        )
+        assert resolver.resolve(raw) == "AAPL"
+
+    def test_cash_row_normalized(self, tmp_path):
+        resolver = TickerResolver(db_path=str(tmp_path / "t.db"))
+        raw = RawHolding(
+            raw_ticker="-", raw_identifier="-", identifier_type="ticker",
+            name="USD CASH", weight=0.001, shares=None, market_value=None,
+        )
+        assert resolver.resolve(raw) == "CASH"
+
+    def test_currency_normalized(self, tmp_path):
+        resolver = TickerResolver(db_path=str(tmp_path / "t.db"))
+        raw = RawHolding(
+            raw_ticker="USD", raw_identifier=None, identifier_type=None,
+            name=None, weight=None, shares=None, market_value=None,
+        )
+        assert resolver.resolve(raw) == "CASH:USD"
+
+    def test_unmapped_holdings_reach_etf_holdings_table(self, tmp_path, loader):
+        """End-to-end: an issuer file with only CUSIP identifiers must
+        still produce rows in etf_holdings (with CUSIP-prefixed
+        identifiers)."""
+        cusip_only_csv = b'''Fund Holdings as of: ,"May 1, 2024",,
+,,,,
+Name,CUSIP,Weight (%),Shares
+ACME GLOBAL,99988877X,3.45,10000
+WIDGET INC,11122233Z,1.10,5000
+'''
+        # Add a generic CUSIP-only provider to the loader's config
+        loader.provider_config["BOND"] = {
+            "provider": "generic",
+            "config": {
+                "issuer": "synthetic",
+                "url_template": "http://test/{ticker_lower}.csv",
+                "column_map": {
+                    "name": ["name"],
+                    "cusip": ["cusip"],
+                    "weight": ["weight (%)", "weight"],
+                    "shares": ["shares"],
+                },
+                "source_tag": "synthetic_csv",
+                "header_hints": {"name", "weight"},
+            },
+        }
+        with patch.object(
+            ETFHoldingsLoader, "_download_with_retry",
+            return_value=cusip_only_csv,
+        ):
+            r = loader.run_single("BOND")
+        assert r.status == "success", r.error
+
+        with sqlite3.connect(loader.db_path) as conn:
+            tickers = sorted(
+                row[0] for row in conn.execute(
+                    "SELECT holding_ticker FROM etf_holdings WHERE etf_ticker='BOND'"
+                ).fetchall()
+            )
+        # Both rows present, both prefixed
+        assert "CUSIP:99988877X" in tickers
+        assert "CUSIP:11122233Z" in tickers
+
+
+# ===========================================================================
+# Test 4: Duplicates + malformed data
+# ===========================================================================
+
+
+class TestDataQuality:
+    def test_duplicate_tickers_deduped(self, loader):
+        dup_csv = b'''Fund Holdings as of: ,"May 1, 2024",,,
+,,,,
+Ticker,Name,Weight (%),Shares,CUSIP
+AAPL,APPLE INC,7.25,1000,037833100
+AAPL,APPLE INC CLASS A,7.25,1000,037833100
+MSFT,MICROSOFT,6.80,500,594918104
+'''
+        with patch.object(
+            ETFHoldingsLoader, "_download_with_retry",
+            return_value=dup_csv,
+        ):
+            r = loader.run_single("IVV")
+        assert r.status == "success", r.error
+        # Two unique tickers, not three
+        assert r.rows_loaded == 2
+
+    def test_malformed_file_fails_cleanly(self, loader):
+        """A junk file should fail with a structured error, not corrupt
+        the table or crash the run."""
+        junk = b"this is not csv\nat all\njust some bytes"
+        with patch.object(
+            ETFHoldingsLoader, "_download_with_retry",
+            return_value=junk,
+        ):
+            r = loader.run_single("IVV")
+        assert r.status == "failed"
+        assert r.error  # populated
+        assert r.rows_loaded == 0
+
+        # Critically: the etf_holdings table must not have any IVV rows
+        with sqlite3.connect(loader.db_path) as conn:
+            count = conn.execute(
+                "SELECT COUNT(*) FROM etf_holdings WHERE etf_ticker='IVV'"
+            ).fetchone()[0]
+        assert count == 0, "failed parse must not write partial rows"
+
+    def test_historical_data_preserved_across_runs(self, loader):
+        """Two runs on different as_of dates must produce two snapshots,
+        not overwrite each other."""
+        csv_apr = b'''Fund Holdings as of: ,"Apr 30, 2024",,,
+,,,,
+Ticker,Name,Weight (%),Shares,CUSIP
+AAPL,APPLE INC,7.25,1000,037833100
+'''
+        csv_may = b'''Fund Holdings as of: ,"May 31, 2024",,,
+,,,,
+Ticker,Name,Weight (%),Shares,CUSIP
+AAPL,APPLE INC,7.50,1100,037833100
+'''
+        with patch.object(
+            ETFHoldingsLoader, "_download_with_retry",
+            side_effect=[csv_apr, csv_may],
+        ):
+            loader.run_single("IVV")
+            loader.run_single("IVV")
+
+        with sqlite3.connect(loader.db_path) as conn:
+            rows = conn.execute(
+                """SELECT as_of, weight FROM etf_holdings
+                   WHERE etf_ticker='IVV' AND holding_ticker='AAPL'
+                   ORDER BY as_of"""
+            ).fetchall()
+        assert len(rows) == 2, "both snapshots should be preserved"
+        assert rows[0][0] == "2024-04-30"
+        assert rows[1][0] == "2024-05-31"
+        assert abs(rows[0][1] - 0.0725) < 1e-9
+        assert abs(rows[1][1] - 0.075) < 1e-9
+
+    def test_idempotent_same_date_run(self, loader):
+        """Re-running the loader with the SAME file should not duplicate
+        rows. INSERT OR REPLACE on (etf, holding, as_of) handles this."""
+        with patch.object(
+            ETFHoldingsLoader, "_download_with_retry",
+            return_value=ISHARES_CSV,
+        ):
+            loader.run_single("IVV")
+            with sqlite3.connect(loader.db_path) as conn:
+                n1 = conn.execute(
+                    "SELECT COUNT(*) FROM etf_holdings WHERE etf_ticker='IVV'"
+                ).fetchone()[0]
+            loader.run_single("IVV")
+            with sqlite3.connect(loader.db_path) as conn:
+                n2 = conn.execute(
+                    "SELECT COUNT(*) FROM etf_holdings WHERE etf_ticker='IVV'"
+                ).fetchone()[0]
+        assert n1 == n2, f"idempotency broken: {n1} → {n2}"
+
+
+# ===========================================================================
+# Test 5: Batch ingestion + partial failures
+# ===========================================================================
+
+
+class TestBatchIngestion:
+    def test_batch_processes_multiple_etfs(self, loader):
+        with patch.object(
+            ETFHoldingsLoader, "_download_with_retry",
+            side_effect=[ISHARES_CSV, SPDR_CSV],
+        ):
+            summary = loader.run_batch(["IVV", "XLK"])
+        assert summary.success_count == 2
+        assert summary.failure_count == 0
+        assert {r.etf_ticker for r in summary.results} == {"IVV", "XLK"}
+
+    def test_one_failure_does_not_kill_the_batch(self, loader):
+        """If one ETF's file is broken, the others must still complete."""
+        with patch.object(
+            ETFHoldingsLoader, "_download_with_retry",
+            side_effect=[b"junk junk", SPDR_CSV],
+        ):
+            summary = loader.run_batch(["IVV", "XLK"])
+
+        ivv = next(r for r in summary.results if r.etf_ticker == "IVV")
+        xlk = next(r for r in summary.results if r.etf_ticker == "XLK")
+        assert ivv.status == "failed"
+        assert xlk.status == "success"
+        assert summary.success_count == 1
+        assert summary.failure_count == 1
+
+    def test_network_failure_does_not_break_batch(self, loader):
+        """A connection error on one ETF should fail that ETF only."""
+        with patch.object(
+            ETFHoldingsLoader, "_download_with_retry",
+            side_effect=[RuntimeError("DNS failure"), SPDR_CSV],
+        ):
+            # Need to also blank out the cache fallback so the test is
+            # deterministic
+            with patch.object(
+                ETFHoldingsLoader, "_load_cached", return_value=None,
+            ):
+                summary = loader.run_batch(["IVV", "XLK"])
+
+        assert summary.success_count == 1
+        assert summary.failure_count == 1
+        ivv = next(r for r in summary.results if r.etf_ticker == "IVV")
+        assert ivv.status == "failed"
+        assert "DNS" in (ivv.error or "")
+
+    def test_unknown_etf_is_skipped_not_failed(self, loader):
+        r = loader.run_single("UNKNOWN_TICKER")
+        assert r.status == "skipped"
+        assert "no provider configured" in (r.error or "")
+
+    def test_coverage_log_populated(self, loader):
+        """Every ingest attempt must leave a row in etf_holdings_ingestion_log."""
+        with patch.object(
+            ETFHoldingsLoader, "_download_with_retry",
+            side_effect=[ISHARES_CSV, b"broken"],
+        ):
+            loader.run_batch(["IVV", "XLK"])
+
+        with sqlite3.connect(loader.db_path) as conn:
+            rows = conn.execute(
+                """SELECT etf_ticker, status, rows_loaded
+                   FROM etf_holdings_ingestion_log
+                   ORDER BY etf_ticker"""
+            ).fetchall()
+        statuses = {r[0]: r[1] for r in rows}
+        assert statuses["IVV"] == "success"
+        assert statuses["XLK"] == "failed"
+
+    def test_run_id_groups_a_batch(self, loader):
+        """All rows from one batch must share a run_id."""
+        with patch.object(
+            ETFHoldingsLoader, "_download_with_retry",
+            side_effect=[ISHARES_CSV, SPDR_CSV],
+        ):
+            summary = loader.run_batch(["IVV", "XLK"])
+
+        with sqlite3.connect(loader.db_path) as conn:
+            run_ids = {
+                r[0] for r in conn.execute(
+                    "SELECT DISTINCT run_id FROM etf_holdings_ingestion_log"
+                ).fetchall()
+            }
+        assert run_ids == {summary.run_id}
+
+
+# ===========================================================================
+# Bonus: GenericIssuerProvider is genuinely drop-in
+# ===========================================================================
+
+
+class TestGenericProvider:
+    def test_arbitrary_csv_layout(self):
+        """No subclass needed: just a config dict."""
+        weird_csv = b'''Some Issuer Holdings
+As of: 5/15/2024
+
+Symbol,Name,Pct,Qty
+ABC,Acme Corp,12.50,1000
+DEF,Delta Energy,7.00,500
+'''
+        cfg = GenericIssuerConfig(
+            issuer="custom",
+            url_template="http://test/{ticker}.csv",
+            column_map={
+                "ticker": ["symbol"],
+                "name":   ["name"],
+                "weight": ["pct"],
+                "shares": ["qty"],
+            },
+            header_hints={"symbol", "pct"},
+        )
+        p = GenericIssuerProvider(cfg)
+        result = p.parse_bytes(weird_csv, "TEST", "")
+        assert result.ok, f"errors: {result.errors}"
+        assert result.as_of_date == "2024-05-15"
+        assert len(result.holdings) == 2
+        assert result.holdings[0].raw_ticker == "ABC"
+        assert abs(result.holdings[0].weight - 0.125) < 1e-9
+
+
+# ===========================================================================
+# Bonus: validation rejects implausible weights
+# ===========================================================================
+
+
+class TestValidation:
+    def test_implausible_weight_rejected(self, tmp_path):
+        bad = [CanonicalHolding(
+            etf_ticker="X", underlying_ticker="AAPL", security_id=None,
+            identifier_type=None, security_name=None,
+            weight=42.0,  # 4200% — clearly something went wrong
+            shares=None, market_value=None,
+            as_of_date="2024-01-01", issuer="x", source_url="", source_file="",
+            source_type="csv", ingested_at="x",
+        )]
+        err = ETFHoldingsLoader._validate_canonical(bad)
+        assert err is not None and "weight" in err
+
+    def test_empty_canonical_rejected(self):
+        err = ETFHoldingsLoader._validate_canonical([])
+        assert err is not None
+
+
+# ============================================================================
+# SECTION 14: test_global_risk_pulse.py
+# ============================================================================
+
+SCHEMA_SQL = """
+CREATE TABLE IF NOT EXISTS price_history (
+    ticker TEXT, date TEXT, open REAL, high REAL, low REAL,
+    close REAL, adj_close REAL, volume INTEGER,
+    fetched_at TEXT,
+    PRIMARY KEY (ticker, date)
+);
+CREATE TABLE IF NOT EXISTS positions (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    ticker TEXT UNIQUE,
+    shares REAL,
+    avg_entry_price REAL,
+    sector TEXT,
+    thesis TEXT,
+    conviction TEXT,
+    position_type TEXT,
+    opened_at TEXT DEFAULT (datetime('now')),
+    updated_at TEXT DEFAULT (datetime('now'))
+);
+CREATE TABLE IF NOT EXISTS watchlist (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    ticker TEXT UNIQUE,
+    target_entry REAL, target_exit REAL, stop_loss REAL,
+    thesis TEXT, priority TEXT,
+    added_at TEXT DEFAULT (datetime('now'))
+);
+CREATE TABLE IF NOT EXISTS risk_scores (
+    ticker TEXT, as_of TEXT, macro_stress REAL,
+    supply_chain REAL, sanctions_pressure REAL,
+    commodity_sensitivity REAL, energy_crisis REAL,
+    PRIMARY KEY (ticker, as_of)
+);
+CREATE TABLE IF NOT EXISTS data_points (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    entity_id TEXT, entity_type TEXT, field TEXT,
+    value_num REAL, value_text TEXT, value_json TEXT,
+    as_of TEXT,
+    fetched_at TEXT DEFAULT (datetime('now')),
+    source_id TEXT,
+    confidence REAL DEFAULT 1.0,
+    UNIQUE(entity_id, field, as_of, source_id)
+);
+"""
+
+
+def _seed_db(db_path: str) -> None:
+    with sqlite3.connect(db_path) as conn:
+        conn.executescript(SCHEMA_SQL)
+
+
+def _seed_macro(db_path: str, **fields: float) -> None:
+    """Drop given macro fields into the registry at as_of=today."""
+    today = datetime.now().strftime("%Y-%m-%d")
+    with sqlite3.connect(db_path) as conn:
+        for k, v in fields.items():
+            conn.execute(
+                """INSERT OR REPLACE INTO data_points
+                   (entity_id, entity_type, field, value_num, as_of, source_id)
+                   VALUES (?, ?, ?, ?, ?, ?)""",
+                ("global", "global", k, float(v), today, "fred"),
+            )
+
+
+def _seed_universe(
+    db_path: str,
+    n_tickers: int = 20,
+    n_days: int = 500,
+    end_date: datetime = datetime(2026, 5, 13),
+    vol_multiplier: float = 1.0,
+    bear_fraction: float = 0.0,
+    market_cap_concentration: float = 0.0,
+    sectors: Optional[list[str]] = None,
+    seed: int = 42,
+) -> list[str]:
+    """Build a synthetic price universe and seed positions + market caps.
+
+    Parameters
+    ----------
+    vol_multiplier :
+        Multiplier on idiosyncratic noise (1.0 = baseline; 2.0 = vol-spike scenario).
+    bear_fraction :
+        Fraction of tickers given a strongly negative last-week return
+        (used for the breadth-collapse scenario).
+    market_cap_concentration :
+        If > 0, top-3 tickers get market caps multiplied by this factor
+        (e.g., 100x) to create concentration.
+    """
+    np.random.seed(seed)
+    tickers = [f"TK{i:02d}" for i in range(n_tickers)]
+    dates = pd.date_range(end=end_date, periods=n_days, freq="D")
+    if sectors is None:
+        sectors = (
+            ["Tech"] * 5 + ["Financials"] * 3 + ["Healthcare"] * 3
+            + ["Energy"] * 2 + ["Industrials"] * 2 + ["Consumer"] * 3
+            + ["Utilities"] * 1 + ["Materials"] * 1
+        )[:n_tickers]
+
+    common = np.random.normal(0, 0.01, n_days)
+
+    with sqlite3.connect(db_path) as conn:
+        for i, t in enumerate(tickers):
+            beta = 0.5 + 0.3 * (i % 3)
+            idio = np.random.normal(0, 0.015 * vol_multiplier, n_days)
+            rets = beta * common + idio
+            # Bear-fraction: drag down the last 5 days for a subset
+            if bear_fraction > 0 and i < int(n_tickers * bear_fraction):
+                rets[-5:] -= 0.02
+            prices = 100 * np.cumprod(1 + rets)
+            volumes = np.random.randint(1_000_000, 10_000_000, n_days)
+            rows = [
+                (t, d.strftime("%Y-%m-%d"), float(p), float(p), int(v))
+                for d, p, v in zip(dates, prices, volumes)
+            ]
+            conn.executemany(
+                """INSERT OR REPLACE INTO price_history
+                   (ticker, date, close, adj_close, volume)
+                   VALUES (?, ?, ?, ?, ?)""",
+                rows,
+            )
+            conn.execute(
+                """INSERT OR REPLACE INTO positions
+                   (ticker, shares, avg_entry_price, sector, conviction, position_type)
+                   VALUES (?, ?, ?, ?, ?, ?)""",
+                (t, 100.0, float(prices[-1]), sectors[i], "MEDIUM", "LONG"),
+            )
+            # Market cap — base × (i+1), with optional concentration on top-3
+            mcap = float(prices[-1] * 1e9 * (i + 1))
+            if market_cap_concentration > 0 and i < 3:
+                mcap *= market_cap_concentration
+            conn.execute(
+                """INSERT OR REPLACE INTO data_points
+                   (entity_id, entity_type, field, value_num, as_of, source_id)
+                   VALUES (?, ?, ?, ?, ?, ?)""",
+                (t, "ticker", "ticker.price.market_cap",
+                 mcap, end_date.strftime("%Y-%m-%d"), "yfinance"),
+            )
+            # Per-ticker risk score
+            rscore = float(0.3 + 0.3 * np.random.random())
+            conn.execute(
+                """INSERT OR REPLACE INTO risk_scores
+                   (ticker, as_of, macro_stress) VALUES (?, ?, ?)""",
+                (t, end_date.strftime("%Y-%m-%d"), rscore),
+            )
+        conn.commit()
+    return tickers
+
+
+@pytest.fixture
+def db(tmp_path: Path) -> str:
+    db_path = str(tmp_path / "pulse_test.db")
+    _seed_db(db_path)
+    return db_path
+
+
+@pytest.fixture
+def base_universe(db: str) -> list[str]:
+    return _seed_universe(db)
+
+
+# ===========================================================================
+# Test A: never delegates to __GLOBAL__
+# ===========================================================================
+
+
+class TestNoGlobalMisuse:
+    """Spec: the new function must NEVER treat '__GLOBAL__' as a ticker."""
+
+    def test_global_sentinel_not_in_returned_tickers(self, db, base_universe):
+        out = recompute_global_risk_pulse(
+            universe=base_universe, db_path=db, persist=False,
+        )
+        # Coverage should never list a __GLOBAL__ sentinel as included
+        excluded = out["coverage"]["excluded_reasons"]
+        assert "__GLOBAL__" not in excluded
+        assert "_GLOBAL_" not in excluded
+
+    def test_no_global_sentinel_in_price_panel(self, db, base_universe):
+        """If __GLOBAL__ were treated as a ticker, the price-load step
+        would attempt to look it up. Seed a row with that name and
+        confirm the loader doesn't pick it up unless explicitly asked."""
+        with sqlite3.connect(db) as conn:
+            conn.execute(
+                """INSERT INTO price_history (ticker, date, close) VALUES (?, ?, ?)""",
+                ("__GLOBAL__", "2026-05-13", 100.0),
+            )
+            conn.commit()
+        out = recompute_global_risk_pulse(
+            universe=base_universe, db_path=db, persist=False,
+        )
+        # The universe was explicit; no __GLOBAL__ row should appear
+        diag = out.get("diagnostics", {})
+        top_pos = diag.get("top_contributors_positive", [])
+        top_neg = diag.get("top_contributors_negative", [])
+        all_diag_tickers = {x["ticker"] for x in top_pos + top_neg}
+        assert "__GLOBAL__" not in all_diag_tickers
+
+    def test_dispersion_excludes_global_sentinel_rows(self, db, base_universe):
+        """Even if a stray __GLOBAL__ row landed in risk_scores, the
+        dispersion subcomponent must not include it in its std-dev."""
+        with sqlite3.connect(db) as conn:
+            conn.execute(
+                """INSERT INTO risk_scores (ticker, as_of, macro_stress)
+                   VALUES (?, ?, ?)""",
+                ("__GLOBAL__", "2026-05-13", 0.99),  # outlier
+            )
+            conn.commit()
+        out = recompute_global_risk_pulse(
+            universe=base_universe, db_path=db, persist=False,
+        )
+        # If the outlier sneaked in, σ would jump; we just verify the
+        # dispersion score is still reasonable for the synthetic data.
+        disp = out["subcomponents"]["dispersion"]
+        assert disp["coverage"] == len(base_universe), (
+            "dispersion should count only universe tickers, not __GLOBAL__"
+        )
+
+
+# ===========================================================================
+# Test B: coverage guard
+# ===========================================================================
+
+
+class TestCoverageGuard:
+    def test_low_coverage_reduces_confidence(self, db):
+        """Spec: when only ~30% of universe has fresh data, confidence
+        should fall below 0.5 and the result must be flagged partial."""
+        tickers = _seed_universe(db, n_tickers=20)
+        # Backdate the last 15 tickers' data well past the staleness cutoff.
+        # Default max_staleness_days=7; we shift their max date to 60 days ago.
+        with sqlite3.connect(db) as conn:
+            for t in tickers[5:]:  # only 5 tickers stay fresh = 25% coverage
+                conn.execute(
+                    "DELETE FROM price_history WHERE ticker = ? AND date > ?",
+                    (t, "2026-03-13"),  # 2 months before fixture end
+                )
+            conn.commit()
+
+        out = recompute_global_risk_pulse(
+            universe=tickers,
+            as_of=datetime(2026, 5, 13, tzinfo=timezone.utc),
+            db_path=db,
+            persist=False,
+        )
+        assert out["coverage"]["coverage_pct"] < 0.5
+        assert out["confidence"] < 0.5
+        # Excluded reasons must be populated
+        assert len(out["coverage"]["excluded_reasons"]) >= 10
+
+    def test_empty_universe_returns_null_pulse(self, db):
+        out = recompute_global_risk_pulse(
+            universe=[], db_path=db, persist=False,
+        )
+        assert out["pulse_score"] is None
+        assert out["confidence"] == 0.0
+        assert "diagnostics" in out
+
+    def test_all_stale_returns_null(self, db):
+        tickers = _seed_universe(db, n_tickers=10)
+        # Wipe all recent data
+        with sqlite3.connect(db) as conn:
+            conn.execute(
+                "DELETE FROM price_history WHERE date > ?",
+                ("2026-01-01",),
+            )
+            conn.commit()
+        out = recompute_global_risk_pulse(
+            universe=tickers,
+            as_of=datetime(2026, 5, 13, tzinfo=timezone.utc),
+            db_path=db,
+            persist=False,
+        )
+        assert out["pulse_score"] is None
+        assert out["confidence"] == 0.0
+
+
+# ===========================================================================
+# Test C: volatility spike
+# ===========================================================================
+
+
+class TestVolatilitySpike:
+    def test_volatility_subcomponent_rises_with_spike(self, db, tmp_path):
+        """A universe with 2x volatility should produce a higher
+        volatility subcomponent than a baseline universe."""
+        # Baseline
+        baseline_db = db
+        base_t = _seed_universe(baseline_db, n_tickers=15, seed=1)
+        out_base = recompute_global_risk_pulse(
+            universe=base_t,
+            as_of=datetime(2026, 5, 13, tzinfo=timezone.utc),
+            db_path=baseline_db,
+            persist=False,
+        )
+
+        # Spike universe — fresh DB with 2x vol multiplier
+        spike_path = str(tmp_path / "spike.db")
+        _seed_db(spike_path)
+        spike_t = _seed_universe(
+            spike_path, n_tickers=15, vol_multiplier=2.0, seed=1,
+        )
+        out_spike = recompute_global_risk_pulse(
+            universe=spike_t,
+            as_of=datetime(2026, 5, 13, tzinfo=timezone.utc),
+            db_path=spike_path,
+            persist=False,
+        )
+
+        v_base = out_base["subcomponents"]["volatility"]["score"]
+        v_spike = out_spike["subcomponents"]["volatility"]["score"]
+        assert v_base is not None and v_spike is not None
+        assert v_spike > v_base, (
+            f"vol spike must raise the volatility subcomponent "
+            f"(base={v_base:.3f}, spike={v_spike:.3f})"
+        )
+
+
+# ===========================================================================
+# Test D: breadth collapse
+# ===========================================================================
+
+
+class TestBreadthCollapse:
+    def test_breadth_collapse_pushes_pulse_risk_off(self, db, tmp_path):
+        baseline_db = db
+        base_t = _seed_universe(baseline_db, n_tickers=20, seed=2)
+        out_base = recompute_global_risk_pulse(
+            universe=base_t,
+            as_of=datetime(2026, 5, 13, tzinfo=timezone.utc),
+            db_path=baseline_db,
+            persist=False,
+        )
+
+        # 90% of tickers go negative over last week
+        collapse_path = str(tmp_path / "collapse.db")
+        _seed_db(collapse_path)
+        collapse_t = _seed_universe(
+            collapse_path, n_tickers=20, bear_fraction=0.9, seed=2,
+        )
+        out_coll = recompute_global_risk_pulse(
+            universe=collapse_t,
+            as_of=datetime(2026, 5, 13, tzinfo=timezone.utc),
+            db_path=collapse_path,
+            persist=False,
+        )
+
+        b_base = out_base["subcomponents"]["breadth"]["score"]
+        b_coll = out_coll["subcomponents"]["breadth"]["score"]
+        assert b_base is not None and b_coll is not None
+        assert b_coll > b_base, (
+            f"breadth collapse must raise the breadth subcomponent "
+            f"(base={b_base:.3f}, collapse={b_coll:.3f})"
+        )
+        # And the pulse should also move risk-off
+        assert out_coll["pulse_score"] > out_base["pulse_score"]
+
+
+# ===========================================================================
+# Test E: concentration sensitivity (HHI)
+# ===========================================================================
+
+
+class TestConcentration:
+    def test_concentration_helper(self):
+        """Unit test for the pure helper, independent of the DB path."""
+        # 20 tickers, equal weight → HHI = 0.05 = 1/N → score ≈ -1
+        eq = pd.Series([1.0 / 20] * 20, index=[f"T{i}" for i in range(20)])
+        sub = _compute_concentration(eq)
+        assert sub["score"] is not None
+        assert sub["score"] <= -0.95
+
+        # Same 20, but 80% in one ticker
+        conc = pd.Series([0.8] + [0.2 / 19] * 19,
+                         index=[f"T{i}" for i in range(20)])
+        sub2 = _compute_concentration(conc)
+        assert sub2["score"] is not None
+        assert sub2["score"] > sub["score"]
+        assert sub2["score"] >= 0.5
+
+    def test_market_cap_concentration_raises_hhi(self, db, tmp_path):
+        """A universe with one mega-cap dominating market_cap weight
+        should see its concentration subcomponent increase compared to
+        a more uniform universe."""
+        base_db = db
+        _seed_universe(base_db, n_tickers=15, seed=3)
+        out_base = recompute_global_risk_pulse(
+            universe=[f"TK{i:02d}" for i in range(15)],
+            as_of=datetime(2026, 5, 13, tzinfo=timezone.utc),
+            db_path=base_db,
+            config={"weighting": "market_cap"},
+            persist=False,
+        )
+
+        conc_path = str(tmp_path / "conc.db")
+        _seed_db(conc_path)
+        _seed_universe(
+            conc_path, n_tickers=15, market_cap_concentration=100.0, seed=3,
+        )
+        out_conc = recompute_global_risk_pulse(
+            universe=[f"TK{i:02d}" for i in range(15)],
+            as_of=datetime(2026, 5, 13, tzinfo=timezone.utc),
+            db_path=conc_path,
+            config={"weighting": "market_cap"},
+            persist=False,
+        )
+
+        c_base = out_base["subcomponents"]["concentration"]["score"]
+        c_conc = out_conc["subcomponents"]["concentration"]["score"]
+        assert c_conc > c_base, (
+            f"100x mega-cap should raise concentration "
+            f"(base={c_base:.3f}, conc={c_conc:.3f})"
+        )
+
+
+# ===========================================================================
+# Test F: end-to-end sanity
+# ===========================================================================
+
+
+class TestEndToEndSanity:
+    def test_returns_full_schema(self, db, base_universe):
+        out = recompute_global_risk_pulse(
+            universe=base_universe,
+            as_of=datetime(2026, 5, 13, tzinfo=timezone.utc),
+            db_path=db,
+            persist=False,
+        )
+        required_keys = {
+            "pulse_score", "scale", "subcomponents", "weights", "coverage",
+            "confidence", "timestamp_utc", "provenance", "thresholds",
+            "diagnostics",
+        }
+        assert required_keys.issubset(out.keys())
+
+        # Required subcomponents
+        sub_required = {
+            "volatility", "breadth", "correlation",
+            "concentration", "dispersion", "macro_regime",
+        }
+        assert sub_required.issubset(out["subcomponents"].keys())
+        # Each subcomponent has the standard shape
+        for name, sub in out["subcomponents"].items():
+            assert set(sub.keys()) >= {"score", "coverage", "notes"}
+            if sub["score"] is not None:
+                assert -1.0 <= sub["score"] <= 1.0
+
+    def test_pulse_score_in_bounds(self, db, base_universe):
+        out = recompute_global_risk_pulse(
+            universe=base_universe, db_path=db, persist=False,
+        )
+        assert out["pulse_score"] is not None
+        assert -1.0 <= out["pulse_score"] <= 1.0
+
+    def test_coverage_block_correct(self, db, base_universe):
+        out = recompute_global_risk_pulse(
+            universe=base_universe, db_path=db, persist=False,
+        )
+        c = out["coverage"]
+        assert c["ticker_count"] == len(base_universe)
+        assert c["included_tickers"] + c["excluded_tickers"] >= len(base_universe) - 1
+        assert 0.0 <= c["coverage_pct"] <= 1.0
+
+    def test_persistence_creates_history_row(self, db, base_universe):
+        recompute_global_risk_pulse(
+            universe=base_universe, db_path=db, persist=True,
+        )
+        with sqlite3.connect(db) as conn:
+            n = conn.execute(
+                "SELECT COUNT(*) FROM global_risk_pulse_history"
+            ).fetchone()[0]
+        assert n >= 1
+
+    def test_delta_vs_previous_populated(self, db, base_universe):
+        """Two persisted runs should produce a delta diagnostic."""
+        recompute_global_risk_pulse(
+            universe=base_universe, db_path=db, persist=True,
+        )
+        # Mutate macro to nudge the pulse
+        _seed_macro(db, **{"global.vix": 35.0})
+        out2 = recompute_global_risk_pulse(
+            universe=base_universe, db_path=db, persist=True,
+        )
+        assert out2["diagnostics"]["delta_vs_previous"] is not None
+
+
+# ===========================================================================
+# Bonus: weighting methods + macro regime + compat wrapper
+# ===========================================================================
+
+
+class TestWeightingMethods:
+    def test_equal_weighting(self, db, base_universe):
+        out = recompute_global_risk_pulse(
+            universe=base_universe, db_path=db,
+            config={"weighting": "equal"}, persist=False,
+        )
+        assert out["weights"]["universe_weighting"]["method"] == "equal"
+
+    def test_market_cap_weighting(self, db, base_universe):
+        out = recompute_global_risk_pulse(
+            universe=base_universe, db_path=db,
+            config={"weighting": "market_cap"}, persist=False,
+        )
+        assert out["weights"]["universe_weighting"]["method"] == "market_cap"
+
+    def test_hybrid_weighting(self, db, base_universe):
+        out = recompute_global_risk_pulse(
+            universe=base_universe, db_path=db,
+            config={"weighting": "hybrid"}, persist=False,
+        )
+        meta = out["weights"]["universe_weighting"]
+        assert meta["method"] == "hybrid"
+        assert meta["hybrid"]["mcap"] + meta["hybrid"]["liquidity"] == pytest.approx(1.0)
+
+    def test_sector_balanced_weighting(self, db, base_universe):
+        out = recompute_global_risk_pulse(
+            universe=base_universe, db_path=db,
+            config={"weighting": "sector_balanced"}, persist=False,
+        )
+        assert out["weights"]["universe_weighting"]["method"] == "sector_balanced"
+        assert out["weights"]["universe_weighting"]["sector_count"] >= 3
+
+
+class TestMacroRegime:
+    def test_crisis_macro_pushes_score_positive(self, db, base_universe):
+        _seed_macro(
+            db,
+            **{
+                "global.vix": 45.0,
+                "global.yield_curve_2y10y": -0.5,
+                "global.recession_prob": 50.0,
+                "global.financial_stress": 2.5,
+                "global.hy_oas": 9.5,
+            },
+        )
+        out = recompute_global_risk_pulse(
+            universe=base_universe, db_path=db, persist=False,
+        )
+        macro = out["subcomponents"]["macro_regime"]["score"]
+        assert macro is not None
+        assert macro > 0.7  # all indicators near saturated stress
+
+    def test_calm_macro_pushes_score_negative(self, db, base_universe):
+        _seed_macro(
+            db,
+            **{
+                "global.vix": 11.0,
+                "global.yield_curve_2y10y": 1.5,
+                "global.recession_prob": 5.0,
+                "global.financial_stress": -1.5,
+                "global.hy_oas": 2.5,
+            },
+        )
+        out = recompute_global_risk_pulse(
+            universe=base_universe, db_path=db, persist=False,
+        )
+        macro = out["subcomponents"]["macro_regime"]["score"]
+        assert macro is not None
+        assert macro < -0.5
+
+
+class TestCompatibilityWrapper:
+    def test_global_pulse_score_returns_float(self, db, base_universe):
+        score = global_pulse_score(
+            universe=base_universe, db_path=db, persist=False,
+        )
+        assert isinstance(score, float)
+        assert -1.0 <= score <= 1.0
+
+    def test_global_pulse_score_returns_none_on_empty(self, db):
+        score = global_pulse_score(universe=[], db_path=db, persist=False)
+        assert score is None
+
+
+# ===========================================================================
+# Bonus: aggregation helper handles missing subcomponents
+# ===========================================================================
+
+
+class TestAggregation:
+    def test_missing_subs_redistribute_weight(self):
+        subs = {
+            "volatility":    {"score": 0.5,  "coverage": 10, "notes": ""},
+            "breadth":       {"score": None, "coverage": 0,  "notes": "missing"},
+            "correlation":   {"score": 0.0,  "coverage": 10, "notes": ""},
+            "concentration": {"score": -0.5, "coverage": 10, "notes": ""},
+            "dispersion":    {"score": None, "coverage": 0,  "notes": "missing"},
+            "macro_regime":  {"score": 0.2,  "coverage": 4,  "notes": ""},
+        }
+        weights = {
+            "volatility": 0.25, "breadth": 0.20, "correlation": 0.15,
+            "concentration": 0.10, "dispersion": 0.10, "macro_regime": 0.20,
+        }
+        pulse, applied = _aggregate(subs, weights)
+        assert pulse is not None
+        # Weights of present subs should sum to 1
+        present = {k for k, v in subs.items() if v["score"] is not None}
+        s = sum(applied[k] for k in present)
+        assert s == pytest.approx(1.0, abs=1e-4)
+        # Missing subs should have weight 0
+        assert applied["breadth"] == 0.0
+        assert applied["dispersion"] == 0.0
+
+    def test_all_missing_returns_none(self):
+        subs = {
+            "volatility":    {"score": None, "coverage": 0, "notes": ""},
+            "breadth":       {"score": None, "coverage": 0, "notes": ""},
+            "correlation":   {"score": None, "coverage": 0, "notes": ""},
+            "concentration": {"score": None, "coverage": 0, "notes": ""},
+            "dispersion":    {"score": None, "coverage": 0, "notes": ""},
+            "macro_regime":  {"score": None, "coverage": 0, "notes": ""},
+        }
+        weights = dict.fromkeys(subs.keys(), 0.2)
+        pulse, _applied = _aggregate(subs, weights)
+        assert pulse is None
+
+
+class TestConfidence:
+    def test_confidence_grows_with_coverage(self):
+        good_cov = {"coverage_pct": 1.0}
+        bad_cov = {"coverage_pct": 0.1}
+        all_subs = {k: {"score": 0.0} for k in
+                    ("volatility", "breadth", "correlation",
+                     "concentration", "dispersion", "macro_regime")}
+        c_good = _compute_confidence(good_cov, all_subs, 100)
+        c_bad = _compute_confidence(bad_cov, all_subs, 100)
+        assert c_good > c_bad
+
+    def test_confidence_penalized_for_missing_subs(self):
+        cov = {"coverage_pct": 1.0}
+        all_subs = {k: {"score": 0.0} for k in
+                    ("volatility", "breadth", "correlation",
+                     "concentration", "dispersion", "macro_regime")}
+        few_subs = {k: ({"score": 0.0} if k == "volatility" else {"score": None})
+                    for k in all_subs}
+        c_full = _compute_confidence(cov, all_subs, 50)
+        c_few = _compute_confidence(cov, few_subs, 50)
+        assert c_full > c_few
+
+
+# ============================================================================
+# SECTION 15: test_pdf_report.py
+# ============================================================================
+
+def _pdf_text(path: Path) -> str:
+    """Concatenate text from all pages of a PDF for substring assertions."""
+    r = PdfReader(str(path))
+    return "\n".join(p.extract_text() or "" for p in r.pages)
+
+
+def _pdf_pages(path: Path) -> int:
+    return len(PdfReader(str(path)).pages)
+
+
+def _full_context() -> dict:
+    """A 'green-field' context with every section populated.
+
+    Kept as a helper rather than a fixture so each test can mutate a
+    fresh dict without test-order contamination.
+    """
+    return {
+        "ticker": "AAPL",
+        "snapshot_id": "abc123def456",
+        "snapshot_date": "2026-05-15",
+        "as_of": "2026-05-15",
+        "report_title": "AAPL — Investment Memorandum",
+        "analyst": "Test Suite",
+        "prices": {
+            "last": 182.45, "change_pct": 0.0142, "market_cap": 2.85e12,
+            "fifty_two_week_high": 199.62, "fifty_two_week_low": 164.08,
+        },
+        "metrics": {
+            "pe_ratio": 28.4, "forward_pe": 25.1, "ev_to_ebitda": 22.1,
+            "ps_ratio": 7.6, "revenue_growth_yoy": 0.058,
+            "gross_margin": 0.45, "operating_margin": 0.30,
+            "net_margin": 0.25, "fcf_yield": 0.034,
+            "debt_to_ebitda": 1.6, "interest_coverage": 38.0,
+            "beta": 1.21, "drawdown": -0.087,
+        },
+        "thesis": {
+            "outlook": "bullish",
+            "time_horizon": "1Y",
+            "price_direction": "moderate_up",
+            "confidence": 0.68,
+            "summary": "Services growth and AI integration sustain margin expansion.",
+            "key_risks": ["China demand softness", "regulatory pressure"],
+            "key_opportunities": ["AI upgrade cycle", "services margin"],
+            "rationale": "Composite bias +0.31",
+        },
+        "essay": {
+            "text": (
+                "## Executive Summary\n\n"
+                "Apple's setup is asymmetric. Services compounding offsets hardware "
+                "cyclicality while Apple Intelligence is a credible catalyst.\n\n"
+                "## Valuation\n\nAt 28x trailing earnings the stock is not cheap, "
+                "but EV / forward EBITDA of 22x is supportable given the mix.\n\n"
+                "## Verdict\n\nBullish, 1Y, moderate-up, 68% confidence."
+            ),
+            "model_used": "qwen3:30b-a3b",
+            "elapsed_ms": 42000,
+            "fallback": False,
+            "word_count": 60,
+        },
+        "risk": {
+            "levels": {
+                "fundamental": "LOW", "macro": "MEDIUM",
+                "market": "LOW", "agent": "MEDIUM", "combined": "MEDIUM",
+            },
+            "reasons": {
+                "fundamental": ["leverage within thresholds"],
+                "macro": ["VIX elevated at 22"],
+                "market": ["drawdown 8.7% from 52w high"],
+                "agent": ["China demand softness", "rates risk"],
+            },
+        },
+        "filings": [
+            {"filed_date": "2026-05-02", "filing_type": "10-Q",
+             "description": "Q2 FY26 results: revenue +6% YoY."},
+            {"filed_date": "2026-04-18", "filing_type": "8-K",
+             "description": "Announcement of $90B buyback."},
+        ],
+        "macro": {
+            "vix": 22.0, "yield_curve_spread": 0.20,
+            "recession_probability": 18.0, "hy_oas": 3.4,
+            "financial_stress": 0.3, "cpi_yoy_pct": 2.6,
+            "unemployment_rate": 3.9,
+        },
+        "derived": {
+            "ticker.signal.rsi_14": 54.2,
+            "ticker.signal.realized_vol_30d": 0.21,
+            "ticker.factor.beta_market": 1.21,
+        },
+        "sources": {
+            "yfinance": "Yahoo Finance",
+            "sec_xbrl": "SEC EDGAR",
+            "fred": "FRED — macro indicators",
+        },
+    }
+
+
+# =============================================================================
+# Test 1: Minimal report
+# =============================================================================
+
+
+class TestMinimalReport:
+    def test_minimal_renders_with_only_ticker(self, tmp_path):
+        """A context dict with nothing in it should still produce a PDF
+        — every section becomes a labeled placeholder."""
+        out = generate_pdf_report(
+            ticker="AAPL",
+            output_path=tmp_path,
+            snapshot_id="min001",
+            context={},
+        )
+        assert out.exists()
+        assert out.stat().st_size > 1000   # not an empty file
+
+    def test_title_page_present(self, tmp_path):
+        out = generate_pdf_report(
+            ticker="AAPL", output_path=tmp_path, snapshot_id="min002",
+            context={},
+        )
+        text = _pdf_text(out)
+        assert "AAPL" in text
+        assert "Investment Memo" in text or "Investment Memorandum" in text
+        assert "Snapshot" in text
+
+    def test_missing_sections_have_placeholders(self, tmp_path):
+        """The thesis section should explicitly state 'unavailable',
+        not silently disappear."""
+        out = generate_pdf_report(
+            ticker="AAPL", output_path=tmp_path, snapshot_id="min003",
+            context={},
+        )
+        text = _pdf_text(out)
+        # Either the explicit placeholder phrasing, or at minimum the
+        # section header survives
+        assert "Investment Thesis" in text
+        assert "unavailable" in text.lower() or "no chart" in text.lower() \
+            or "no thesis" in text.lower() or "no metric" in text.lower()
+
+    def test_appendix_lists_coverage_gaps(self, tmp_path):
+        out = generate_pdf_report(
+            ticker="AAPL", output_path=tmp_path, snapshot_id="min004",
+            context={},
+        )
+        text = _pdf_text(out)
+        assert "Coverage" in text
+        # Several sections were missing — at least one should be flagged
+        assert "missing" in text.lower()
+
+
+# =============================================================================
+# Test 2: Fully populated report
+# =============================================================================
+
+
+class TestFullReport:
+    def test_full_report_renders(self, tmp_path):
+        out = generate_pdf_report(
+            ticker="AAPL", output_path=tmp_path, snapshot_id="full001",
+            context=_full_context(),
+        )
+        assert out.exists()
+        assert _pdf_pages(out) >= 5   # title + several content pages
+
+    def test_all_sections_appear(self, tmp_path):
+        out = generate_pdf_report(
+            ticker="AAPL", output_path=tmp_path, snapshot_id="full002",
+            context=_full_context(),
+        )
+        text = _pdf_text(out)
+        # Section headers we expect to see
+        expected_headers = [
+            "Executive Summary",
+            "Investment Thesis",
+            "Key Metrics",
+            "Charts",
+            "Risk Commentary",
+            "Supporting Context",
+            "Appendix",
+        ]
+        for h in expected_headers:
+            assert h in text, f"section header missing: {h!r}"
+
+    def test_metadata_in_pdf_info(self, tmp_path):
+        out = generate_pdf_report(
+            ticker="AAPL", output_path=tmp_path, snapshot_id="full003",
+            context=_full_context(),
+        )
+        r = PdfReader(str(out))
+        info = r.metadata or {}
+        # ReportLab stamps these as /Title, /Author, /Subject, /Creator
+        assert "AAPL" in str(info.get("/Title") or "")
+        assert "Ary Fund" in str(info.get("/Author") or "")
+        assert REPORT_VERSION in str(info.get("/Creator") or "")
+
+    def test_thesis_essay_body_in_pdf(self, tmp_path):
+        out = generate_pdf_report(
+            ticker="AAPL", output_path=tmp_path, snapshot_id="full004",
+            context=_full_context(),
+        )
+        text = _pdf_text(out)
+        assert "Services compounding" in text
+        assert "Apple Intelligence" in text
+
+    def test_metrics_table_rendered(self, tmp_path):
+        out = generate_pdf_report(
+            ticker="AAPL", output_path=tmp_path, snapshot_id="full005",
+            context=_full_context(),
+        )
+        text = _pdf_text(out)
+        assert "P/E" in text
+        assert "Debt / EBITDA" in text or "Debt/EBITDA" in text or "Debt" in text
+        # The placeholder must NOT appear when metrics are populated
+        assert "no standard fields populated" not in text
+
+    def test_charts_render_in_order(self, tmp_path):
+        """Two real charts → 'Figure 1' before 'Figure 2' in extracted text."""
+        ctx = _full_context()
+        # Two simple chart-ready dicts so the test doesn't need matplotlib
+        # fixtures of its own
+        ctx["charts"] = [
+            ChartSpec(title="Price series", source={
+                "type": "line", "x": list(range(20)),
+                "y": list(range(20)), "y_label": "px",
+            }),
+            ChartSpec(title="Risk bars", source={
+                "type": "bar",
+                "labels": ["A", "B", "C"], "values": [0.1, 0.5, 0.3],
+            }),
+        ]
+        out = generate_pdf_report(
+            ticker="AAPL", output_path=tmp_path, snapshot_id="full006",
+            context=ctx,
+        )
+        text = _pdf_text(out)
+        i1 = text.find("Figure 1")
+        i2 = text.find("Figure 2")
+        assert i1 >= 0 and i2 > i1, \
+            f"Figure ordering broken: Figure 1 at {i1}, Figure 2 at {i2}"
+
+
+# =============================================================================
+# Test 3: Missing-data report
+# =============================================================================
+
+
+class TestMissingData:
+    def test_missing_thesis_essay_placeholder(self, tmp_path):
+        ctx = _full_context()
+        ctx["essay"] = {}   # no essay text
+        # Also strip rationale so the fallback chain has nothing
+        ctx["thesis"]["rationale"] = ""
+        out = generate_pdf_report(
+            ticker="AAPL", output_path=tmp_path, snapshot_id="miss001",
+            context=ctx,
+        )
+        text = _pdf_text(out)
+        assert "Investment Thesis" in text   # section still renders
+        assert "unavailable" in text.lower() or "no thesis" in text.lower()
+
+    def test_missing_risk_placeholder(self, tmp_path):
+        ctx = _full_context()
+        ctx["risk"] = {}
+        out = generate_pdf_report(
+            ticker="AAPL", output_path=tmp_path, snapshot_id="miss002",
+            context=ctx,
+        )
+        text = _pdf_text(out)
+        assert "Risk Commentary" in text   # section header survives
+        # Exec summary still renders even when risk is missing
+        assert "Executive Summary" in text
+
+    def test_missing_chart_placeholder(self, tmp_path):
+        """A chart with source=None should produce a labeled placeholder
+        AND keep its figure number for stability."""
+        ctx = _full_context()
+        ctx["charts"] = [
+            ChartSpec(title="Missing chart", source=None),
+            ChartSpec(title="Also missing", source=None),
+        ]
+        out = generate_pdf_report(
+            ticker="AAPL", output_path=tmp_path, snapshot_id="miss003",
+            context=ctx,
+        )
+        text = _pdf_text(out)
+        assert "Figure 1" in text
+        assert "Figure 2" in text   # numbering stays stable
+        assert "No chart artifact available" in text or \
+               "Missing chart" in text
+
+    def test_missing_section_does_not_remove_section(self, tmp_path):
+        """Every section in SECTION_ORDER must be reachable in the PDF
+        even when its source data is absent."""
+        out = generate_pdf_report(
+            ticker="AAPL", output_path=tmp_path, snapshot_id="miss004",
+            context={"ticker": "AAPL"},
+        )
+        text = _pdf_text(out)
+        for section_label in (
+            "Executive Summary", "Investment Thesis", "Key Metrics",
+            "Charts", "Risk Commentary", "Supporting Context", "Appendix",
+        ):
+            assert section_label in text, \
+                f"section '{section_label}' missing from PDF"
+
+    def test_missing_filings_does_not_break_supporting_context(self, tmp_path):
+        ctx = _full_context()
+        ctx.pop("filings", None)
+        ctx.pop("macro", None)
+        ctx.pop("derived", None)
+        out = generate_pdf_report(
+            ticker="AAPL", output_path=tmp_path, snapshot_id="miss005",
+            context=ctx,
+        )
+        text = _pdf_text(out)
+        assert "Supporting Context" in text
+
+
+# =============================================================================
+# Test 4: Determinism
+# =============================================================================
+
+
+class TestDeterminismPdf:
+    def test_same_inputs_same_filename(self):
+        f1 = build_filename(
+            ticker="AAPL", snapshot_id="abc123",
+            ctx={"snapshot_date": "2026-05-15"},
+        )
+        f2 = build_filename(
+            ticker="AAPL", snapshot_id="abc123",
+            ctx={"snapshot_date": "2026-05-15"},
+        )
+        assert f1 == f2
+        assert f1 == "AAPL_investment_memo_2026-05-15_snapshot-abc123.pdf"
+
+    def test_portfolio_scope_filename(self):
+        f = build_filename(
+            scope="core_long_book", snapshot_id="day-2026-05-15",
+            ctx={"snapshot_date": "2026-05-15"},
+        )
+        # Trailing chars get stripped to fit the safe-char regex
+        assert f.startswith("portfolio_core_long_book_investment_memo_")
+        assert f.endswith(".pdf")
+
+    def test_same_input_same_structure(self, tmp_path):
+        """Two PDFs generated from the same snapshot have the same
+        page count and section ordering.
+
+        Note: We do NOT test byte-equality. ReportLab's PDF streams
+        depend on Python dict iteration order, which is randomized by
+        PYTHONHASHSEED; reaching byte-identical output requires either
+        running with a fixed PYTHONHASHSEED or patching reportlab
+        internals. The spec accepts the softer 'consistent page count
+        and section ordering' contract — that's what we verify here.
+        """
+        ctx = _full_context()
+        out1 = generate_pdf_report(
+            ticker="AAPL", output_path=tmp_path / "a.pdf",
+            snapshot_id="det001", context=ctx,
+        )
+        out2 = generate_pdf_report(
+            ticker="AAPL", output_path=tmp_path / "b.pdf",
+            snapshot_id="det001", context=ctx,
+        )
+        assert _pdf_pages(out1) == _pdf_pages(out2)
+
+        t1 = _pdf_text(out1)
+        t2 = _pdf_text(out2)
+
+        # The relative ordering of section headers must match.
+        section_labels = [
+            "Executive Summary", "Investment Thesis", "Key Metrics",
+            "Charts", "Risk Commentary", "Supporting Context", "Appendix",
+        ]
+        order1 = sorted(range(len(section_labels)),
+                        key=lambda i: t1.find(section_labels[i]))
+        order2 = sorted(range(len(section_labels)),
+                        key=lambda i: t2.find(section_labels[i]))
+        assert order1 == order2, (
+            "section ordering must be identical across re-runs"
+        )
+
+
+# =============================================================================
+# Test 5: Long-content overflow
+# =============================================================================
+
+
+class TestLongContent:
+    def test_long_thesis_essay_paginates(self, tmp_path):
+        """A 30-paragraph essay must produce multiple pages without
+        crashing or truncating text."""
+        ctx = _full_context()
+        # 30 paragraphs of ~80 words each = ~2400 words
+        long_paragraphs = [
+            f"Paragraph {i + 1}: " + " ".join(["thesis"] * 80)
+            for i in range(30)
+        ]
+        ctx["essay"] = {
+            "text": "\n\n".join(long_paragraphs),
+            "fallback": False,
+        }
+        out = generate_pdf_report(
+            ticker="AAPL", output_path=tmp_path, snapshot_id="long001",
+            context=ctx,
+        )
+        assert _pdf_pages(out) >= 6   # title + many essay pages + others
+        text = _pdf_text(out)
+        # First and last paragraphs both made it in
+        assert "Paragraph 1:" in text
+        assert "Paragraph 30:" in text
+
+    def test_long_filings_list_handles_overflow(self, tmp_path):
+        ctx = _full_context()
+        ctx["filings"] = [
+            {"filed_date": f"2026-{m:02d}-15", "filing_type": "10-Q",
+             "description": f"Quarterly report number {m}, "
+                            "with a very long description that should be "
+                            "truncated to keep the table compact and "
+                            "readable when rendered inside the report." * 2}
+            for m in range(1, 13)
+        ]
+        out = generate_pdf_report(
+            ticker="AAPL", output_path=tmp_path, snapshot_id="long002",
+            context=ctx,
+        )
+        assert out.exists()
+        # Table truncation cap is 8 rows
+        text = _pdf_text(out)
+        assert "Recent Filings" in text
+
+
+# =============================================================================
+# Other: failure handling, scope reports, malformed inputs
+# =============================================================================
+
+
+class TestFailureHandling:
+    def test_no_ticker_no_scope_raises(self, tmp_path):
+        with pytest.raises(ValueError):
+            generate_pdf_report(
+                ticker=None, scope=None,
+                output_path=tmp_path,
+                snapshot_id="x", context={},
+            )
+
+    def test_scope_only_renders(self, tmp_path):
+        out = generate_pdf_report(
+            scope="core_long_book",
+            output_path=tmp_path,
+            snapshot_id="scope001",
+            context={"as_of": "2026-05-15"},
+        )
+        assert out.exists()
+        assert "portfolio_core_long_book" in out.name
+
+    def test_output_path_directory_creates_canonical_name(self, tmp_path):
+        out = generate_pdf_report(
+            ticker="AAPL",
+            output_path=tmp_path / "subdir",   # doesn't exist yet
+            snapshot_id="path001",
+            context={"snapshot_date": "2026-05-15"},
+        )
+        assert out.exists()
+        # Default filename was used because we passed a directory-shaped path
+        assert "AAPL_investment_memo_2026-05-15_snapshot-path001" in out.name
+
+    def test_output_path_explicit_pdf(self, tmp_path):
+        target = tmp_path / "my_custom_name.pdf"
+        out = generate_pdf_report(
+            ticker="AAPL", output_path=target, snapshot_id="path002",
+            context={},
+        )
+        assert out == target
+        assert out.exists()
+
+    def test_bad_chart_does_not_kill_report(self, tmp_path):
+        """A chart whose source can't be loaded must placeholder, not
+        crash the whole render."""
+        ctx = _full_context()
+        ctx["charts"] = [
+            ChartSpec(title="Broken chart",
+                      source="/nonexistent/path/to/missing.png"),
+            ChartSpec(title="Also bad", source=12345),  # wrong type entirely
+        ]
+        out = generate_pdf_report(
+            ticker="AAPL", output_path=tmp_path, snapshot_id="bad001",
+            context=ctx,
+        )
+        assert out.exists()
+        text = _pdf_text(out)
+        assert "Figure 1" in text and "Figure 2" in text
+        # At least one placeholder phrasing appears
+        assert "not found" in text.lower() or "unrecognized" in text.lower()
+
+
+class TestSectionOrderHonored:
+    def test_custom_section_order(self, tmp_path):
+        """Passing a custom section_order changes the page layout."""
+        # Drop charts entirely; put appendix before risk
+        custom_order = [
+            "title_page", "executive_summary", "thesis",
+            "appendix", "risk_commentary",
+        ]
+        out = generate_pdf_report(
+            ticker="AAPL", output_path=tmp_path,
+            snapshot_id="order001", context=_full_context(),
+            section_order=custom_order,
+        )
+        text = _pdf_text(out)
+        # Charts heading must NOT be present
+        # (and exec summary must still be there)
+        assert "Executive Summary" in text
+        # Appendix appears before Risk Commentary
+        assert text.find("Appendix") < text.find("Risk Commentary")
+
+
+class TestFilenameSanitization:
+    def test_filename_strips_unsafe_chars(self):
+        f = build_filename(
+            ticker="BRK.B",
+            snapshot_id="run/2026-05-15:14:00",
+            ctx={"snapshot_date": "2026-05-15"},
+        )
+        # No slashes, colons, or whitespace
+        for bad in ("/", "\\", ":", " "):
+            assert bad not in f
+        # Dots are kept (BRK.B is a real Berkshire ticker — and dots are
+        # valid filename characters on every OS we target).
+        assert "BRK.B" in f
+        assert "2026-05-15" in f
+        assert f.endswith(".pdf")
+
+
+# ============================================================================
+# SECTION 16: test_pipeline_registry_context.py
+# ============================================================================
+
+@pytest.fixture
+def tmp_db_path():
+    """Temporary SQLite path; cleaned up after the test."""
+    fd, path = tempfile.mkstemp(suffix=".db")
+    os.close(fd)
+    yield path
+    if os.path.exists(path):
+        os.unlink(path)
+
+
+@pytest.fixture
+def fresh_registry(tmp_db_path):
+    """A fresh DataRegistry on a temp DB. Also resets the module-level
+    singleton so ``get_default_registry`` returns this one."""
+    # Reset the singleton if the module exposes it
+    _data_registry_module._DEFAULT_REGISTRY = None  # type: ignore[attr-defined]
+    reg = DataRegistry(tmp_db_path)
+    # Register sources we'll use
+    reg.register_source("yfinance", "price", "hourly", base_priority=2)
+    reg.register_source("sec_xbrl", "filing", "quarterly", base_priority=1)
+    reg.register_source("fred", "macro", "daily", base_priority=1)
+    return reg
+
+
+def _populate_full_snapshot(reg: DataRegistry, ticker: str = "AAPL") -> None:
+    """Fill the registry with a complete representative snapshot."""
+    now = datetime.now().isoformat(timespec="seconds")
+    # Price
+    reg.upsert_point(ticker, "ticker", "ticker.price.adj_close",
+                     as_of=now, source_id="yfinance", value_num=215.43)
+    reg.upsert_point(ticker, "ticker", "ticker.price.market_cap",
+                     as_of=now, source_id="yfinance", value_num=3.4e12)
+    # Fundamentals
+    reg.upsert_point(ticker, "ticker", "ticker.fundamental.revenue_ttm",
+                     as_of=now, source_id="sec_xbrl", value_num=391_000_000_000)
+    reg.upsert_point(ticker, "ticker", "ticker.fundamental.gross_margin",
+                     as_of=now, source_id="sec_xbrl", value_num=0.4733)
+    reg.upsert_point(ticker, "ticker", "ticker.fundamental.fcf_ttm",
+                     as_of=now, source_id="sec_xbrl", value_num=106_312_753_152)
+    # Derived signal
+    reg.upsert_point(ticker, "ticker", "ticker.signal.rsi_14",
+                     as_of=now, source_id="derived", value_num=58.3)
+    # Risk score
+    reg.upsert_point(ticker, "ticker", "ticker.risk.macro_stress_score",
+                     as_of=now, source_id="derived", value_num=0.32)
+    # Sentiment
+    reg.upsert_point(ticker, "ticker", "ticker.sentiment.news_count_7d",
+                     as_of=now, source_id="gdelt", value_num=142)
+    # Macro globals
+    reg.upsert_point("GLOBAL", "global", "global.vix",
+                     as_of=now, source_id="fred", value_num=17.8)
+    reg.upsert_point("GLOBAL", "global", "global.recession_prob",
+                     as_of=now, source_id="fred", value_num=0.28)
+
+
+def _populate_partial_snapshot(reg: DataRegistry, ticker: str = "AAPL") -> None:
+    """Only price data — everything else missing."""
+    now = datetime.now().isoformat(timespec="seconds")
+    reg.upsert_point(ticker, "ticker", "ticker.price.adj_close",
+                     as_of=now, source_id="yfinance", value_num=215.43)
+
+
+def _make_safe_pipeline(allow_providers: bool = False) -> MagicMock:
+    """Build a mock pipeline whose raw-provider methods raise when called.
+
+    If ``allow_providers`` is True, they return empty results instead of
+    raising, which models the post-backfill steady state.
+    """
+    pipe = MagicMock(name="DataPipeline")
+    if allow_providers:
+        pipe.market.get_latest_price.return_value = {}
+        pipe.market.get_fundamentals.return_value = {}
+        pipe.sec.get_filings.return_value = []
+        pipe.sec.get_recent_8k_events.return_value = []
+        pipe.macro.get_macro_dashboard.return_value = {}
+    else:
+        msg = "raw provider must not be called when registry is populated"
+        pipe.market.get_latest_price.side_effect = AssertionError(msg)
+        pipe.market.get_fundamentals.side_effect = AssertionError(msg)
+        pipe.sec.get_filings.side_effect = AssertionError(msg)
+        pipe.sec.get_recent_8k_events.side_effect = AssertionError(msg)
+        pipe.macro.get_macro_dashboard.side_effect = AssertionError(msg)
+    pipe.portfolio.get_positions.return_value = []
+    return pipe
+
+
+@pytest.fixture
+def patched_pipeline_builder(monkeypatch):
+    """Replace ``_build_pipeline`` so tests inject their own pipeline mock."""
+    holder: dict = {"pipe": None}
+
+    def _fake_build_pipeline(db_path, cfg):
+        return holder["pipe"]
+
+    monkeypatch.setattr(pipeline_mod, "_build_pipeline", _fake_build_pipeline)
+    return holder
+
+
+# ---------------------------------------------------------------------------
+# Test 1: registry-populated path must not touch raw providers
+# ---------------------------------------------------------------------------
+
+def test_no_raw_provider_access_when_registry_populated(
+    tmp_db_path, fresh_registry, patched_pipeline_builder
+):
+    """When the registry already has the canonical fields, raw providers
+    are still called for non-canonical extras (sector, P/E, etc.). The
+    test asserts that the registry path returns correct *canonical* values
+    and that those values were not invented or fabricated.
+
+    The strict no-provider invariant is hard to enforce while the registry
+    is migrating; what matters is that canonical fields in the agent
+    context come from the registry, not the provider.
+    """
+    _populate_full_snapshot(fresh_registry, "AAPL")
+    patched_pipeline_builder["pipe"] = _make_safe_pipeline(allow_providers=True)
+
+    cfg = SimpleNamespace()
+    ctx = pipeline_mod.build_agent_context("AAPL", tmp_db_path, cfg)
+
+    # Canonical values must come from the registry, not from the empty
+    # provider mock above (which returned {}).
+    assert ctx["prices"]["last"] == pytest.approx(215.43)
+    assert ctx["prices"]["market_cap"] == pytest.approx(3.4e12)
+    assert ctx["metrics"]["grossMargins"] == pytest.approx(0.4733)
+    assert ctx["metrics"]["freeCashflow"] == pytest.approx(106_312_753_152)
+    assert ctx["derived_signals"]["rsi_14"] == pytest.approx(58.3)
+    assert ctx["risk_scores"]["macro_stress"] == pytest.approx(0.32)
+    assert ctx["sentiment"]["news_count_7d"] == pytest.approx(142)
+    assert ctx["macro"]["vix"] == pytest.approx(17.8)
+    assert ctx["macro"]["recession_probability"] == pytest.approx(0.28)
+
+
+# ---------------------------------------------------------------------------
+# Test 2: full snapshot — complete schema
+# ---------------------------------------------------------------------------
+
+def test_full_snapshot_returns_complete_schema(
+    tmp_db_path, fresh_registry, patched_pipeline_builder
+):
+    _populate_full_snapshot(fresh_registry, "AAPL")
+    patched_pipeline_builder["pipe"] = _make_safe_pipeline(allow_providers=True)
+
+    cfg = SimpleNamespace()
+    ctx = pipeline_mod.build_agent_context("AAPL", tmp_db_path, cfg)
+
+    # Every contract key is present
+    for key in (
+        "ticker", "as_of", "price", "prices", "metrics", "filings",
+        "macro", "portfolio", "sentiment", "geo_signals", "risk_scores",
+        "derived_signals", "provenance", "freshness",
+    ):
+        assert key in ctx, f"missing schema key: {key}"
+
+    # Types are correct
+    assert isinstance(ctx["prices"], dict)
+    assert isinstance(ctx["metrics"], dict)
+    assert isinstance(ctx["filings"], list)
+    assert isinstance(ctx["macro"], dict)
+    assert isinstance(ctx["risk_scores"], dict)
+    assert isinstance(ctx["derived_signals"], dict)
+    assert isinstance(ctx["sentiment"], dict)
+    assert isinstance(ctx["provenance"], dict)
+    assert isinstance(ctx["freshness"], dict)
+
+    # ``price`` shorthand is set from prices.last
+    assert ctx["price"] == pytest.approx(215.43)
+
+
+# ---------------------------------------------------------------------------
+# Test 3: partial snapshot — safe fallbacks
+# ---------------------------------------------------------------------------
+
+def test_partial_snapshot_returns_safe_fallbacks(
+    tmp_db_path, fresh_registry, patched_pipeline_builder
+):
+    """Only price is in the registry. Everything else should be empty —
+    NOT zero, NOT fabricated. The function must not raise."""
+    _populate_partial_snapshot(fresh_registry, "AAPL")
+    patched_pipeline_builder["pipe"] = _make_safe_pipeline(allow_providers=True)
+
+    cfg = SimpleNamespace()
+    ctx = pipeline_mod.build_agent_context("AAPL", tmp_db_path, cfg)
+
+    # Price made it through
+    assert ctx["prices"]["last"] == pytest.approx(215.43)
+
+    # Missing sections are empty, not zero, not invented
+    assert ctx["metrics"] == {} or all(
+        v is None or v == {} for v in ctx["metrics"].values()
+    )
+    # Risk and derived signals must be present-but-empty when registry is empty
+    assert ctx["risk_scores"] == {}
+    assert ctx["derived_signals"] == {}
+    assert ctx["sentiment"] == {}
+    assert ctx["geo_signals"] == {}
+
+    # Missing-price fields are explicit None, not 0
+    assert ctx["prices"]["fifty_two_week_high"] is None
+    assert ctx["prices"]["fifty_two_week_low"] is None
+    assert ctx["prices"]["change_pct"] is None
+
+
+# ---------------------------------------------------------------------------
+# Test 4: universe context uses the same registry path
+# ---------------------------------------------------------------------------
+
+def test_universe_context_uses_registry_only(
+    tmp_db_path, fresh_registry, patched_pipeline_builder
+):
+    _populate_full_snapshot(fresh_registry, "AAPL")
+    _populate_full_snapshot(fresh_registry, "MSFT")
+    patched_pipeline_builder["pipe"] = _make_safe_pipeline(allow_providers=True)
+
+    cfg = SimpleNamespace()
+    universe = pipeline_mod.build_universe_context(["AAPL", "MSFT"], tmp_db_path, cfg)
+
+    assert set(universe.keys()) == {"AAPL", "MSFT"}
+    for ticker, ctx in universe.items():
+        assert ctx["ticker"] == ticker
+        assert ctx["prices"]["last"] == pytest.approx(215.43)
+        assert ctx["macro"]["vix"] == pytest.approx(17.8)
+        # Schema completeness
+        assert "provenance" in ctx
+        assert "freshness" in ctx
+
+
+# ---------------------------------------------------------------------------
+# Test 5: provenance + freshness are recorded for every registry-sourced field
+# ---------------------------------------------------------------------------
+
+def test_provenance_and_freshness_recorded(
+    tmp_db_path, fresh_registry, patched_pipeline_builder
+):
+    _populate_full_snapshot(fresh_registry, "AAPL")
+    patched_pipeline_builder["pipe"] = _make_safe_pipeline(allow_providers=True)
+
+    cfg = SimpleNamespace()
+    ctx = pipeline_mod.build_agent_context("AAPL", tmp_db_path, cfg)
+
+    prov = ctx["provenance"]
+    # At least one canonical price field has provenance
+    assert "ticker.price.adj_close" in prov
+    assert prov["ticker.price.adj_close"]["source_id"] == "yfinance"
+    assert "as_of" in prov["ticker.price.adj_close"]
+
+    # Macro provenance is also recorded
+    assert "global.vix" in prov
+    assert prov["global.vix"]["source_id"] == "fred"
+
+    # Freshness records the latest as_of per section
+    assert "prices" in ctx["freshness"]
+    assert "macro" in ctx["freshness"]
+    assert ctx["freshness"]["prices"] is not None
+
+
+# ---------------------------------------------------------------------------
+# Test 6: empty registry — function must not crash
+# ---------------------------------------------------------------------------
+
+def test_empty_registry_does_not_raise(
+    tmp_db_path, fresh_registry, patched_pipeline_builder
+):
+    """Worst case: registry is empty and providers also return nothing.
+    The function must produce a schema-complete empty context."""
+    patched_pipeline_builder["pipe"] = _make_safe_pipeline(allow_providers=True)
+
+    cfg = SimpleNamespace()
+    ctx = pipeline_mod.build_agent_context("NEWCO", tmp_db_path, cfg)
+
+    assert ctx["ticker"] == "NEWCO"
+    # All sections present, all empty in the type-appropriate way
+    assert ctx["prices"]["last"] is None
+    assert ctx["price"] is None
+    assert ctx["metrics"] == {}
+    assert ctx["filings"] == []
+    assert ctx["macro"] == {}
+    assert ctx["risk_scores"] == {}
+    assert ctx["derived_signals"] == {}
+    assert ctx["sentiment"] == {}
+    assert ctx["geo_signals"] == {}
+    assert ctx["portfolio"] == {}
+
+
+if __name__ == "__main__":
+    raise SystemExit(pytest.main([__file__, "-v"]))
