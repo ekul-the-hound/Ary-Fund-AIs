@@ -1,0 +1,42 @@
+[
+  {
+    "query": "What are Apple's supply chain risks?",
+    "filters": {"ticker": "AAPL"},
+    "expected_chunk_ids": [
+      "REPLACE_WITH_ACTUAL_CHUNK_ID_FROM_YOUR_INDEX"
+    ],
+    "notes": "After indexing the AAPL 10-K, find the Item 1A chunk that discusses manufacturing concentration in China and Taiwan. Use that chunk_id here. Run: python -m rag query 'supply chain China' --ticker AAPL to see candidate IDs."
+  },
+  {
+    "query": "How is Microsoft investing in AI infrastructure?",
+    "filters": {"ticker": "MSFT"},
+    "expected_chunk_ids": [
+      "REPLACE_WITH_ACTUAL_CHUNK_ID_FROM_YOUR_INDEX"
+    ],
+    "notes": "Look for MSFT 10-K MD&A chunks discussing capex and datacenter spend."
+  },
+  {
+    "query": "What did Tim Cook say about iPhone demand in China?",
+    "filters": {"ticker": "AAPL", "doc_types": ["transcript"]},
+    "expected_chunk_ids": [
+      "REPLACE_WITH_ACTUAL_CHUNK_ID_FROM_YOUR_INDEX"
+    ],
+    "notes": "Transcript-only query. Find a Tim Cook turn discussing China iPhone demand."
+  },
+  {
+    "query": "Recent guidance on margins for next quarter",
+    "filters": {"ticker": "AAPL", "doc_types": ["transcript"]},
+    "expected_chunk_ids": [
+      "REPLACE_WITH_ACTUAL_CHUNK_ID_FROM_YOUR_INDEX"
+    ],
+    "notes": "Find Luca Maestri's prepared remarks or guidance commentary."
+  },
+  {
+    "query": "What were the key risk factors disclosed in the most recent 10-K?",
+    "filters": {"ticker": "AAPL", "doc_types": ["filing"]},
+    "expected_chunk_ids": [
+      "REPLACE_WITH_ACTUAL_CHUNK_ID_FROM_YOUR_INDEX"
+    ],
+    "notes": "Should retrieve multiple Item 1A chunks from the latest 10-K. List 2-3 expected chunk IDs."
+  }
+]
