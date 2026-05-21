@@ -29,6 +29,11 @@ dependencies = [
 
     # PDF report generation
     "reportlab>=4.0",
+
+    # RAG — vector store, fallback embedder + cross-encoder, BM25
+    "chromadb>=0.5.0",
+    "sentence-transformers>=2.7",
+    "rank-bm25>=0.2.2",
 ]
 
 [project.optional-dependencies]
@@ -43,7 +48,20 @@ quant = [
 ]
 
 [tool.setuptools]
-packages = ["agent", "data", "quant", "ui", "report"]
+# Subpackages must be listed explicitly when using flat-layout. The
+# rag.* entries are required or `pip install -e .` silently omits them
+# and any `from rag.document_loaders import ...` fails at runtime.
+packages = [
+    "agent",
+    "data",
+    "quant",
+    "ui",
+    "report",
+    "rag",
+    "rag.document_loaders",
+    "rag.learning",
+    "rag.eval",
+]
 
 # NOTE: pytest configuration lives in pytest.ini, not here.
 # When both files have a pytest section, pytest.ini wins and any block

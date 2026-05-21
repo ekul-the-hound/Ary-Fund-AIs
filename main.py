@@ -30,6 +30,14 @@ For every ticker, ``main`` does the following in order:
 
 Errors on any single ticker are logged and skipped; the batch continues.
 A compact summary table is printed at the end.
+
+RAG integration
+---------------
+``pipeline.build_agent_context`` now also returns a ``retrieved_context``
+list — chunks pulled from the rag/ vector store for this ticker. We
+render those chunks into the agent prompt via
+:func:`_format_retrieved_chunks` so the model can actually use them.
+RAG failures degrade silently to an empty list; the agent still runs.
 """
 
 from __future__ import annotations
@@ -52,6 +60,60 @@ logger = logging.getLogger("hedgefund_ai.main")
 
 
 # =============================================================================
+# RAG CHUNK FORMATTING
+# =============================================================================
+
+def _format_retrieved_chunks(
+    chunks: List[Dict[str, Any]],
+    max_chars: int = 6000,
+) -> str:
+    """Render retrieved RAG chunks into a single prompt-ready string.
+
+    Trims to ``max_chars`` total — long contexts hurt both latency and
+    answer quality on phi3/qwen3 in the 3.8B–30B range. Chunks come in
+    pre-sorted by score (the retriever guarantees this); we stop
+    appending once the budget is exhausted.
+
+    Empty list → empty string (so callers can unconditionally
+    concatenate without a None check).
+    """
+    if not chunks:
+        return ""
+
+    lines: List[str] = ["=== RETRIEVED CONTEXT ==="]
+    used = len(lines[0])
+    for c in chunks:
+        header = (
+            f"\n[{c.get('source', '?')} | "
+            f"{c.get('ticker') or '-'} | "
+            f"{c.get('as_of') or '-'}"
+        )
+        section = c.get("section")
+        if section:
+            header += f" | {section}"
+        score = c.get("score", 0) or 0
+        header += f" | score={score:.2f}]"
+
+        body = (c.get("text") or "").strip()
+        block = f"{header}\n{body}\n"
+
+        if used + len(block) > max_chars:
+            # Truncate the body of this last block rather than dropping
+            # it entirely — partial context is better than nothing for
+            # the highest-scoring leftover.
+            remaining = max_chars - used - len(header) - 8  # safety margin
+            if remaining > 200:  # only worth including if non-trivial
+                lines.append(f"{header}\n{body[:remaining]}...\n")
+            break
+
+        lines.append(block)
+        used += len(block)
+
+    lines.append("=== END RETRIEVED CONTEXT ===\n")
+    return "\n".join(lines)
+
+
+# =============================================================================
 # PROMPT BUILDER
 # =============================================================================
 
@@ -60,6 +122,7 @@ def build_agent_prompt(
     context: Dict[str, Any],
     filings_summary: Dict[str, Any],
     key_metrics: Dict[str, Any],
+    rag_block: str = "",
 ) -> str:
     """Render the agent prompt from structured context.
 
@@ -78,6 +141,10 @@ def build_agent_prompt(
         Output of ``filing_analyzer.summarize_filings_by_year``.
     key_metrics:
         Output of ``filing_analyzer.extract_key_metrics_for_agent``.
+    rag_block:
+        Pre-rendered retrieved-context block from
+        :func:`_format_retrieved_chunks`. Empty string when RAG is
+        disabled or returned no hits.
     """
     macro = context.get("macro") or {}
 
@@ -98,7 +165,7 @@ def build_agent_prompt(
         },
     }
 
-    return (
+    prompt = (
         "You are a hedge-fund sell-side analyst. Analyse the ticker below and "
         "return ONLY a JSON object with the following keys:\n"
         '  "outlook": one of "bullish", "neutral", "bearish".\n'
@@ -113,6 +180,15 @@ def build_agent_prompt(
         "CONTEXT:\n"
         f"{json.dumps(payload, default=str, indent=2)}"
     )
+
+    # Append the retrieved-context block after the structured payload.
+    # The model sees structured facts first, then the prose chunks — this
+    # ordering keeps the JSON instruction at the top where small models
+    # are most likely to honor it.
+    if rag_block:
+        prompt = f"{prompt}\n\n{rag_block}"
+
+    return prompt
 
 
 # =============================================================================
@@ -206,6 +282,17 @@ def _process_ticker(
             or 0.0
         )
 
+        # 1b. Format any RAG-retrieved chunks. RAG failures land in the
+        # pipeline as an empty list, so this is safe even when the
+        # vector store is missing or Ollama is offline.
+        retrieved = context.get("retrieved_context") or []
+        rag_block = _format_retrieved_chunks(retrieved)
+        if retrieved:
+            logger.info(
+                "main | %s | rag retrieved %d chunks (%d chars rendered)",
+                ticker, len(retrieved), len(rag_block),
+            )
+
         # 2. Shape filings & metrics for the agent.
         max_filings = getattr(cfg, "MAX_FILINGS_PER_TICKER", 10)
         filings_summary = filing_analyzer.summarize_filings_by_year(
@@ -216,7 +303,9 @@ def _process_ticker(
         )
 
         # 3. Ask the agent (mock today, Phi-3 later).
-        prompt = build_agent_prompt(ticker, context, filings_summary, key_metrics)
+        prompt = build_agent_prompt(
+            ticker, context, filings_summary, key_metrics, rag_block=rag_block,
+        )
         request = AgentRequest(
             prompt=prompt,
             context=context,

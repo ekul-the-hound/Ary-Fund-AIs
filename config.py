@@ -8,6 +8,7 @@ This module is imported by every layer:
 
     - ``data/``  uses ``FRED_API_KEY``, DB paths, and log level.
     - ``agent/`` uses the AGENT LAYER CONFIG block (bottom of file).
+    - ``rag/``   uses the RAG CONFIG block (bottom of file).
     - ``main.py`` passes this module through as the ``config`` argument
       to ``pipeline.run_daily_refresh`` and ``base_agent.ask_agent``.
 
@@ -189,6 +190,80 @@ RISK_THRESHOLDS: Dict[str, float] = {
 
 
 # =============================================================================
+# RAG (Retrieval-Augmented Generation)
+# =============================================================================
+# All knobs for the rag/ package. Read-once at import; module-level retriever
+# instances cache the resulting config (see pipeline._get_rag_retriever).
+#
+# Disable the whole subsystem by setting RAG_ENABLED = False — the agent
+# context builder will short-circuit and return [] for retrieved_context
+# rather than failing.
+
+RAG_ENABLED: bool = True
+
+# ---- Storage paths ----------------------------------------------------------
+RAG_VECTOR_STORE_PATH: str = str(DATA_DIR / "chroma")
+RAG_TRACKING_DB: str = str(DATA_DIR / "rag_tracking.db")
+RAG_EMBEDDING_CACHE_DB: str = str(DATA_DIR / "rag_embeddings.db")
+RAG_BM25_INDEX_PATH: str = str(DATA_DIR / "chroma" / "bm25_index.pkl")
+RAG_FUND_NOTES_DIR: str = str(DATA_DIR / "fund_notes")
+
+# ---- Embedding & chunking ---------------------------------------------------
+# Embedder runs through Ollama when available; falls back to MiniLM
+# sentence-transformers. Backend selection is inside rag/embedder.py.
+RAG_EMBEDDING_MODEL: str = "nomic-embed-text"
+RAG_CHUNK_TOKENS: int = 500
+RAG_OVERLAP_TOKENS: int = 50
+
+# ---- Retrieval (Phase 3) ----------------------------------------------------
+# Default K returned to the agent. K_INITIAL is the over-retrieve size for
+# the reranker; it must be >= RAG_DEFAULT_K with comfortable headroom.
+RAG_DEFAULT_K: int = 8
+RAG_K_INITIAL: int = 30
+
+# Hybrid (vector + BM25 + RRF) tends to beat vector-only on filings/proxy
+# language where exact-term match matters (e.g. "DEF 14A", "Section 162(m)").
+RAG_HYBRID: bool = True
+
+# Cross-encoder rerank costs ~10ms per (query, chunk) pair on CPU. With
+# K_INITIAL=30 that's ~300ms — usually worth it on an 8GB VRAM box where
+# we can't run a bigger primary embedder anyway.
+RAG_RERANK: bool = True
+RAG_RERANK_MODEL: str = "cross-encoder/ms-marco-MiniLM-L-6-v2"
+
+# MMR diversifies the top-K. Off by default because for narrow ticker
+# queries you usually WANT redundancy (multiple 10-Ks repeating a risk
+# is signal, not noise). Flip on for broad sector/macro queries.
+RAG_MMR: bool = False
+RAG_MMR_LAMBDA: float = 0.7
+
+# LLM-driven query expansion. Uses phi3 for fast 1-2 expansion calls per
+# retrieve(). Disable for ultra-low-latency paths.
+RAG_QUERY_EXPAND: bool = True
+RAG_QUERY_EXPAND_MODEL: str = "phi3:3.8b"
+
+# ---- Indexing (Phase 2) -----------------------------------------------------
+# Contextualization prepends a short LLM-written summary to each chunk
+# before embedding (Anthropic's "contextual retrieval" idea). Costs one
+# LLM call per chunk per indexing run — meaningful on a 10-K with 300+
+# chunks. Leave OFF until you have a feel for retrieval quality without.
+RAG_CONTEXTUALIZE: bool = False
+RAG_CONTEXTUALIZE_MODEL: str = "phi3:3.8b"
+
+# ---- Learning loop (Phase 4) ------------------------------------------------
+# Self-indexing of closed-position theses. Thresholds are intentionally
+# strict — the indexed corpus poisons every future retrieval if quality
+# drifts, so under-indexing beats over-indexing.
+RAG_LEARNING_ENABLED: bool = True
+RAG_LEARNING_INDEX_THRESHOLD: float = 0.7
+RAG_LEARNING_DEMOTE_THRESHOLD: float = 0.5
+RAG_LEARNING_MAX_AUTHOR_PCT: float = 0.30   # no single author dominates
+RAG_LEARNING_MAX_TICKER_PCT: float = 0.25   # no single ticker dominates
+RAG_LEARNING_AUDIT_SAMPLES: int = 6
+RAG_LEARNING_AUDIT_LOG_DIR: str = str(DATA_DIR / "learning_audits")
+
+
+# =============================================================================
 # SANITY CHECKS (explicit-only - callers invoke after logging is configured)
 # =============================================================================
 
@@ -215,3 +290,14 @@ def _warn_if_missing() -> None:
             "fall back to mock mode.",
             DEFAULT_AGENT_MODEL,
         )
+    if RAG_ENABLED:
+        # Soft RAG environment check — RAG silently degrades on missing
+        # backends, so a startup warning helps the user notice before
+        # spending an hour debugging empty retrievals.
+        chroma_dir = Path(RAG_VECTOR_STORE_PATH)
+        if not chroma_dir.exists():
+            logger.info(
+                "RAG_VECTOR_STORE_PATH=%s does not exist yet; will be "
+                "created on first indexer run.",
+                RAG_VECTOR_STORE_PATH,
+            )

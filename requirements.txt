@@ -16,6 +16,18 @@ scikit-learn>=1.4
 streamlit>=1.36
 plotly>=5.20
 
+# PDF report generation
+reportlab>=4.0
+
+# RAG — vector store + retrieval
+# chromadb is the persistent vector DB. sentence-transformers is the
+# fallback embedder (when Ollama / nomic-embed-text is unreachable) and
+# also powers the cross-encoder reranker. rank-bm25 backs the BM25
+# half of the hybrid retriever.
+chromadb>=0.5.0
+sentence-transformers>=2.7
+rank-bm25>=0.2.2
+
 # Dev / test
 pytest>=8.0
 pytest-mock>=3.12

@@ -17,6 +17,7 @@ Usage:
 
 import logging
 from datetime import datetime
+from functools import lru_cache
 from typing import Any, Optional
 
 from data.sec_fetcher import SECFetcher
@@ -94,6 +95,14 @@ logger = logging.getLogger(__name__)
 # ``derived_signals``   (dict)        Quant-derived signals from the registry
 #                                     (``rsi_14``, ``macd_hist``, ``regime``,
 #                                     etc.).
+# ``retrieved_context`` (list[dict])  RAG-retrieved chunks (filings,
+#                                     transcripts, theses, notes) ranked by
+#                                     relevance to a ticker-scoped query.
+#                                     Empty list when RAG is disabled or
+#                                     returns nothing. Each entry has:
+#                                     ``source``, ``doc_id``, ``ticker``,
+#                                     ``as_of``, ``section``, ``score``,
+#                                     ``text``.
 # ``provenance``        (dict)        Per-field source / confidence / as_of
 #                                     metadata: ``{field: {source_id, as_of,
 #                                     confidence}}``. Built from the registry's
@@ -233,6 +242,7 @@ def _empty_context(ticker: str, reason: Optional[str] = None) -> dict:
         "geo_signals": {},
         "risk_scores": {},
         "derived_signals": {},
+        "retrieved_context": [],
         "provenance": {},
         "freshness": {},
     }
@@ -620,6 +630,142 @@ def _build_pipeline(db_path: str, cfg) -> "DataPipeline":
     )
 
 
+# =============================================================================
+# RAG RETRIEVER WIRING
+# =============================================================================
+# The retriever is expensive to construct (BM25 unpickle, cross-encoder
+# load, optional Ollama probe). We build it once per process and cache
+# with ``lru_cache``. ``cfg`` is unhashable for the module case, so the
+# cache key is the ``id(cfg)`` — fine because callers reuse one cfg
+# object for the life of the process.
+#
+# RAG is a soft dependency. Construction failures (missing chromadb,
+# missing nomic-embed-text, BM25 pickle corruption, etc.) downgrade to
+# "RAG disabled for this run" rather than failing the whole context
+# build. The agent still gets every other ctx field.
+
+@lru_cache(maxsize=1)
+def _get_rag_retriever(cfg):
+    """Construct the configured RAG retriever, cached for the process.
+
+    Returns None when RAG is disabled or construction fails. Callers
+    treat None as "no retrieved context" — RAG is never a hard
+    requirement for a context build to succeed.
+    """
+    if not getattr(cfg, "RAG_ENABLED", False):
+        return None
+
+    try:
+        from rag.bm25_index import BM25Index
+        from rag.hybrid_retriever import HybridRetriever
+        from rag.query_expander import (
+            make_disabled_expander,
+            make_ollama_expander,
+        )
+        from rag.reranker import Reranker
+        from rag.vector_store import get_default_store
+
+        # Pass the configured persist_path if get_default_store supports it.
+        # Some store implementations take ``persist_path``, others use a
+        # different kwarg — try the canonical name first and fall back to
+        # a no-arg construction so a mismatch downgrades to "use defaults"
+        # rather than crashing the whole RAG layer.
+        try:
+            store = get_default_store(persist_path=cfg.RAG_VECTOR_STORE_PATH)
+        except TypeError:
+            store = get_default_store()
+
+        # BM25 — built lazily from the existing store; only if hybrid on.
+        bm25 = None
+        if getattr(cfg, "RAG_HYBRID", False):
+            bm25 = BM25Index(persist_path=cfg.RAG_BM25_INDEX_PATH)
+            # ensure_built is a no-op when the persisted pickle is fresh.
+            try:
+                bm25.ensure_built(store, tracking_db_path=cfg.RAG_TRACKING_DB)
+            except Exception as e:  # noqa: BLE001
+                logger.warning("rag bm25 build failed; vector-only mode: %s", e)
+                bm25 = None
+
+        reranker = (
+            Reranker(cfg.RAG_RERANK_MODEL)
+            if getattr(cfg, "RAG_RERANK", False)
+            else None
+        )
+
+        expander = (
+            make_ollama_expander(model=cfg.RAG_QUERY_EXPAND_MODEL)
+            if getattr(cfg, "RAG_QUERY_EXPAND", False)
+            else make_disabled_expander()
+        )
+
+        retriever = HybridRetriever(
+            store=store,
+            bm25_index=bm25,
+            reranker=reranker,
+            query_expander=expander,
+            use_mmr=getattr(cfg, "RAG_MMR", False),
+            mmr_lambda=getattr(cfg, "RAG_MMR_LAMBDA", 0.7),
+            k_initial=getattr(cfg, "RAG_K_INITIAL", 30),
+        )
+        logger.info(
+            "rag retriever initialized | hybrid=%s rerank=%s mmr=%s",
+            bm25 is not None, reranker is not None,
+            getattr(cfg, "RAG_MMR", False),
+        )
+        return retriever
+    except Exception as e:  # noqa: BLE001
+        logger.warning("rag retriever init failed; disabling: %s", e)
+        return None
+
+
+def _rag_retrieve(ticker: str, cfg) -> list[dict]:
+    """Run one retrieve() and shape results for the agent context.
+
+    Never raises — RAG failures degrade silently to an empty list so
+    the agent still gets the rest of the context.
+    """
+    retriever = _get_rag_retriever(cfg)
+    if retriever is None:
+        return []
+
+    try:
+        query = (
+            f"investment analysis: thesis, risks, and recent moves for {ticker}"
+        )
+        # Phase 4 guard: only retrieve self-indexed theses with high
+        # composite quality; always retrieve external content.
+        extra_filters = {
+            "$or": [
+                {"self_indexed": {"$ne": True}},
+                {"composite_quality": {"$gte": 0.75}},
+            ]
+        }
+        results = retriever.retrieve(
+            query=query,
+            k=getattr(cfg, "RAG_DEFAULT_K", 8),
+            ticker=ticker,
+            doc_types=["filing", "transcript", "thesis", "note"],
+            extra_filters=extra_filters,
+        )
+        return [
+            {
+                "source": r.metadata.get("doc_type", "?"),
+                "doc_id": r.metadata.get("doc_id"),
+                "ticker": r.metadata.get("ticker"),
+                "as_of": r.metadata.get("as_of"),
+                "section": (
+                    r.metadata.get("section") or r.metadata.get("speaker")
+                ),
+                "score": round(r.score, 3),
+                "text": r.text,
+            }
+            for r in results
+        ]
+    except Exception as e:  # noqa: BLE001
+        logger.warning("rag retrieval failed for %s: %s", ticker, e)
+        return []
+
+
 def run_daily_refresh(tickers, db_path: str, cfg) -> dict:
     """Refresh all data sources for the given tickers.
 
@@ -667,6 +813,11 @@ def build_agent_context(ticker: str, db_path: str, cfg) -> dict:
     keeps the registry as the single source of truth for the LLM while
     allowing the system to bootstrap without a separate refresh pass.
 
+    **RAG integration.** After the registry/passthrough context is built,
+    we call :func:`_rag_retrieve` to attach retrieved prose chunks. RAG
+    failures (missing chromadb, embedder down, no corpus indexed) degrade
+    silently to ``retrieved_context = []``.
+
     See the CONTEXT SCHEMA section at the top of this module for the
     authoritative field list and absence semantics.
 
@@ -677,8 +828,9 @@ def build_agent_context(ticker: str, db_path: str, cfg) -> dict:
     db_path:
         SQLite path for the registry, portfolio DB, and refresh log.
     cfg:
-        Project config object — only used to construct the data pipeline
-        for backfill calls. The registry itself is configured by db_path.
+        Project config object — used to construct the data pipeline for
+        backfill calls AND read RAG_* knobs. The registry itself is
+        configured by db_path.
 
     Returns
     -------
@@ -793,6 +945,11 @@ def build_agent_context(ticker: str, db_path: str, cfg) -> dict:
             "build_agent_context | %s | portfolio lookup skipped: %s",
             ticker, e, exc_info=True,
         )
+
+    # ------------------------------------------------------------------
+    # Step 7: RAG retrieval. Soft dependency — empty list on any failure.
+    # ------------------------------------------------------------------
+    ctx["retrieved_context"] = _rag_retrieve(ticker, cfg)
 
     return ctx
 

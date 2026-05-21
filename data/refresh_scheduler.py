@@ -12,8 +12,9 @@ Cadences
 --------
 hourly      : fast-moving signals (prices, options, social, news, geopolitical)
 daily       : fundamentals, filings, sanctions full snapshots, macro daily,
-              Ken French factor returns
-weekly      : 13F holdings, factor exposures, ADV registrations
+              Ken French factor returns, RAG incremental index + BM25 rebuild,
+              Phase 4 self-indexing of closed-position theses
+weekly      : 13F holdings, factor exposures, ADV registrations, RAG audit
 event       : ad hoc handlers (8-K material event, rating change,
               ownership > 5%)
 market_open : holdings scan + Slack push for elevated risk flags
@@ -37,6 +38,20 @@ Slack integration
 ``data.notifiers``. Set ``SLACK_WEBHOOK_URL`` in the environment to
 enable; if unset, the scan still runs and persists results — only the
 push step is skipped (with an INFO log).
+
+RAG integration
+---------------
+The daily cadence now runs:
+  * ``daily_rag_index`` — incremental index over filings/theses/notes,
+    plus a BM25 rebuild if anything changed.
+  * ``daily_rag_learning`` — Phase 4 curator pass over recently-closed
+    positions (high-quality theses get self-indexed).
+
+The weekly cadence adds:
+  * ``weekly_rag_audit`` — re-score + demote stragglers, write audit log.
+
+Each RAG task is independently guarded; one failure doesn't bring down
+the rest of the cadence.
 
 Suggested cron entries
 ----------------------
@@ -87,7 +102,7 @@ class TaskResult:
 
 
 class RefreshScheduler:
-    """Orchestrates cadenced refreshes across the data + agent layers."""
+    """Orchestrates cadenced refreshes across the data + agent + RAG layers."""
 
     def __init__(
         self,
@@ -101,6 +116,7 @@ class RefreshScheduler:
         geo_supply=None,
         derived_signals=None,
         slack_webhook_url: Optional[str] = None,
+        cfg: Any = None,
     ):
         self.tickers = [t.upper() for t in (tickers or DEFAULT_WATCHLIST)]
         self.db_path = db_path
@@ -117,10 +133,28 @@ class RefreshScheduler:
         # call time inside data.notifiers. We hold the explicit value so
         # callers (tests, alternative entry points) can override env.
         self.slack_webhook_url = slack_webhook_url
+        # cfg is the project's `config` module (or any compatible namespace).
+        # Lazy-loaded on first access via the `cfg` property so tests can
+        # inject a stub and the CLI gets the real module automatically.
+        self._cfg = cfg
+        # portfolio_db is lazy too — RAG learning loop needs it, but the
+        # hourly/event paths don't.
+        self._portfolio_db = None
 
     # ------------------------------------------------------------------
     # Lazy loaders
     # ------------------------------------------------------------------
+    @property
+    def cfg(self):
+        """The project config module. Lazy-imported so unit tests can stub it."""
+        if self._cfg is None:
+            try:
+                import config as _cfg  # noqa: WPS433
+                self._cfg = _cfg
+            except Exception as e:  # noqa: BLE001
+                logger.warning("scheduler | config import failed: %s", e)
+        return self._cfg
+
     @property
     def registry(self):
         if self._registry is None:
@@ -191,6 +225,17 @@ class RefreshScheduler:
                 logger.warning("scheduler | derived_signals unavailable: %s", e)
         return self._derived
 
+    @property
+    def portfolio_db(self):
+        """PortfolioDB instance — needed by the Phase 4 learning loop."""
+        if self._portfolio_db is None:
+            try:
+                from data.portfolio_db import PortfolioDB
+                self._portfolio_db = PortfolioDB(db_path=self.db_path)
+            except Exception as e:  # noqa: BLE001
+                logger.warning("scheduler | portfolio_db unavailable: %s", e)
+        return self._portfolio_db
+
     # ------------------------------------------------------------------
     # Run a single task with logging + is_due gating
     # ------------------------------------------------------------------
@@ -239,6 +284,10 @@ class RefreshScheduler:
         if isinstance(rv, int):
             return rv
         if isinstance(rv, dict):
+            # If caller put an explicit ``rows`` key, trust it. Otherwise
+            # sum any int values (the legacy convention).
+            if isinstance(rv.get("rows"), int):
+                return rv["rows"]
             total = 0
             for v in rv.values():
                 if isinstance(v, int):
@@ -345,6 +394,26 @@ class RefreshScheduler:
                     lambda tk=tk: self.derived.recompute_risk_scores(tk),
                     INTERVAL_DAILY, force=force,
                 ))
+
+        # ------------------------------------------------------------------
+        # RAG block — runs after core data refresh so the indexer sees the
+        # latest filings/fundamentals/theses. Each task is independently
+        # guarded; a chromadb hiccup doesn't kill the rest.
+        # ------------------------------------------------------------------
+        if getattr(self.cfg, "RAG_ENABLED", False):
+            results.append(self._try_task(
+                "daily_rag_index",
+                lambda: self._run_rag_index(force=force),
+                INTERVAL_DAILY, force=force,
+            ))
+
+        if getattr(self.cfg, "RAG_LEARNING_ENABLED", False):
+            results.append(self._try_task(
+                "daily_rag_learning",
+                lambda: self._run_rag_learning(),
+                INTERVAL_DAILY, force=force,
+            ))
+
         return results
 
     def run_weekly(self, force: bool = False) -> list[TaskResult]:
@@ -356,6 +425,16 @@ class RefreshScheduler:
                     lambda tk=tk: self.derived.recompute_factor_exposures(tk),
                     INTERVAL_WEEKLY, force=force,
                 ))
+
+        # Phase 4 weekly audit — re-evaluate the self-indexed corpus and
+        # demote stragglers. Stratified-sample for human review.
+        if getattr(self.cfg, "RAG_LEARNING_ENABLED", False):
+            results.append(self._try_task(
+                "weekly_rag_audit",
+                lambda: self._run_rag_audit(),
+                INTERVAL_WEEKLY, force=force,
+            ))
+
         return results
 
     # ------------------------------------------------------------------
@@ -551,6 +630,181 @@ class RefreshScheduler:
         since = (datetime.now() - timedelta(days=45)).strftime("%Y-%m-%d")
         written = load_all(db_path=self.db_path, since=since)
         return sum(written.values())
+
+    # ------------------------------------------------------------------
+    # RAG tasks
+    # ------------------------------------------------------------------
+    def _run_rag_index(self, force: bool = False) -> dict:
+        """Incrementally index changed docs; rebuild BM25 if anything new.
+
+        Returns ``{"rows": int, ...}`` so ``_extract_rows`` reports a
+        useful count to the refresh log. The indexer is idempotent —
+        re-running on an unchanged corpus is a fast no-op.
+
+        Soft failure modes:
+          * cfg unavailable → log and return zero
+          * rag modules not importable → log and return zero
+          * any single loader failing inside ``run_tickers`` is
+            already isolated by the indexer itself
+        """
+        cfg = self.cfg
+        if cfg is None:
+            return {"rows": 0, "note": "cfg_unavailable"}
+
+        try:
+            from rag.bm25_index import BM25Index
+            from rag.contextualizer import (
+                make_disabled_contextualizer,
+                make_ollama_contextualizer,
+            )
+            from rag.indexer import Indexer
+            from rag.vector_store import get_default_store
+        except Exception as e:  # noqa: BLE001
+            logger.warning("scheduler | rag imports failed: %s", e)
+            return {"rows": 0, "note": "rag_imports_failed"}
+
+        cx = (
+            make_ollama_contextualizer(model=cfg.RAG_CONTEXTUALIZE_MODEL)
+            if getattr(cfg, "RAG_CONTEXTUALIZE", False)
+            else make_disabled_contextualizer()
+        )
+
+        indexer = Indexer(
+            contextualizer=cx,
+            tracking_db_path=cfg.RAG_TRACKING_DB,
+            chunk_tokens=cfg.RAG_CHUNK_TOKENS,
+            overlap_tokens=cfg.RAG_OVERLAP_TOKENS,
+        )
+
+        stats = indexer.run_tickers(
+            tickers=self.tickers,
+            sec_fetcher=self.sec,
+            portfolio_db=self.portfolio_db,
+            force=force,
+        )
+        total_new = sum(s.get("indexed", 0) for s in stats.values())
+
+        # Only rebuild BM25 when something actually changed — pickle
+        # write of a corpus-sized index isn't free.
+        if total_new > 0:
+            try:
+                bm25 = BM25Index(persist_path=cfg.RAG_BM25_INDEX_PATH)
+                try:
+                    store = get_default_store(persist_path=cfg.RAG_VECTOR_STORE_PATH)
+                except TypeError:
+                    store = get_default_store()
+                bm25.build_from_store(store)
+                logger.info(
+                    "scheduler | rag | bm25 rebuilt after %d new docs",
+                    total_new,
+                )
+            except Exception as e:  # noqa: BLE001
+                logger.warning("scheduler | rag bm25 rebuild failed: %s", e)
+
+        return {"rows": total_new, "by_loader": stats}
+
+    def _build_learning_loop(self):
+        """Construct the Phase 4 stack with portfolio_db hooks.
+
+        Returns None if any required piece can't be loaded so the caller
+        can degrade gracefully.
+        """
+        cfg = self.cfg
+        if cfg is None:
+            return None
+
+        try:
+            from rag.indexer import Indexer
+            from rag.learning import Auditor, Curator, LearningLoop
+            from rag.vector_store import get_default_store
+        except Exception as e:  # noqa: BLE001
+            logger.warning("scheduler | rag learning imports failed: %s", e)
+            return None
+
+        pdb = self.portfolio_db
+        if pdb is None:
+            logger.warning("scheduler | rag learning: portfolio_db unavailable")
+            return None
+
+        try:
+            try:
+                store = get_default_store(persist_path=cfg.RAG_VECTOR_STORE_PATH)
+            except TypeError:
+                store = get_default_store()
+
+            indexer = Indexer(tracking_db_path=cfg.RAG_TRACKING_DB)
+            curator = Curator(
+                tracking_db_path=cfg.RAG_TRACKING_DB,
+                index_threshold=cfg.RAG_LEARNING_INDEX_THRESHOLD,
+                demote_threshold=cfg.RAG_LEARNING_DEMOTE_THRESHOLD,
+                max_per_author_pct=cfg.RAG_LEARNING_MAX_AUTHOR_PCT,
+                max_per_ticker_pct=cfg.RAG_LEARNING_MAX_TICKER_PCT,
+            )
+            auditor = Auditor(
+                curator=curator,
+                chunk_delete_fn=store.delete_document,
+                thesis_loader_fn=pdb.get_thesis_by_id,
+                pnl_lookup_fn=pdb.get_pnl_for_thesis,
+            )
+            return LearningLoop(
+                curator=curator,
+                auditor=auditor,
+                indexer=indexer,
+                pnl_lookup_fn=pdb.get_pnl_for_thesis,
+                audit_log_dir=cfg.RAG_LEARNING_AUDIT_LOG_DIR,
+            )
+        except AttributeError as e:
+            # Most likely a missing portfolio_db hook
+            # (get_thesis_by_id, get_pnl_for_thesis, get_recently_closed_theses).
+            # Surface a clear message rather than the raw AttributeError.
+            logger.warning(
+                "scheduler | rag learning: portfolio_db missing hook (%s). "
+                "Add get_recently_closed_theses / get_thesis_by_id / "
+                "get_pnl_for_thesis to PortfolioDB.", e,
+            )
+            return None
+        except Exception as e:  # noqa: BLE001
+            logger.warning("scheduler | rag learning build failed: %s", e)
+            return None
+
+    def _run_rag_learning(self) -> dict:
+        """Process recently-closed positions; curator decides what indexes."""
+        loop = self._build_learning_loop()
+        if loop is None:
+            return {"rows": 0, "note": "learning_unavailable"}
+
+        try:
+            closed = self.portfolio_db.get_recently_closed_theses(since_days=7)
+        except AttributeError:
+            logger.warning(
+                "scheduler | rag learning: portfolio_db.get_recently_closed_theses "
+                "not implemented; skipping.",
+            )
+            return {"rows": 0, "note": "no_recently_closed_hook"}
+        except Exception as e:  # noqa: BLE001
+            logger.warning("scheduler | rag learning: closed-thesis fetch failed: %s", e)
+            return {"rows": 0, "note": "fetch_failed"}
+
+        result = loop.process_closed_theses(closed)
+        return {"rows": result.get("indexed", 0), "result": result}
+
+    def _run_rag_audit(self) -> dict:
+        """Weekly re-evaluation + stratified human-review sample."""
+        cfg = self.cfg
+        loop = self._build_learning_loop()
+        if loop is None or cfg is None:
+            return {"rows": 0, "note": "learning_unavailable"}
+
+        n_samples = int(getattr(cfg, "RAG_LEARNING_AUDIT_SAMPLES", 6))
+        audit = loop.scheduled_audit(n_samples=n_samples)
+        # Some implementations return "demoted", others "n_demoted" — be lax.
+        reevaluation = audit.get("reevaluation", {}) if isinstance(audit, dict) else {}
+        demoted = (
+            reevaluation.get("demoted")
+            or reevaluation.get("n_demoted")
+            or 0
+        )
+        return {"rows": int(demoted), "audit": audit}
 
     # ------------------------------------------------------------------
     # Event-driven hooks
