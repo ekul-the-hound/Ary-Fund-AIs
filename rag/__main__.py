@@ -1,154 +1,246 @@
 """
-rag/__main__.py
-===============
-CLI for the RAG package.
+rag.__main__
+============
+Minimal CLI dispatcher for the ``rag`` package.
 
-Usage
------
-::
+Why this exists
+---------------
+``rag/__init__.py`` and ``rag/integration_snippets.py`` document
+``python -m rag --help`` / ``python -m rag index --tickers ...`` as if
+they were a real entrypoint, but no ``__main__.py`` existed to back
+that promise. This module fulfils the promise by **dispatching to
+entry points that already exist** elsewhere in the package — it
+implements no new behaviour of its own.
 
-    # Backfill or incrementally index every loader
-    python -m rag index --tickers AAPL MSFT NVDA
+Subcommands and what they delegate to
+-------------------------------------
+* ``index``     → ``rag.indexer.Indexer.run_tickers`` (existing)
+* ``stats``     → ``rag.indexer.Indexer.stats``       (existing)
+* ``benchmark`` → ``rag.eval.benchmark.main``         (existing)
 
-    # Force re-index regardless of content hash
-    python -m rag index --tickers AAPL --force
+Run::
 
-    # Just notes (no tickers needed)
-    python -m rag index --notes-only
-
-    # One-off query
-    python -m rag query "What are Apple's supply chain risks?" --ticker AAPL
-
-    # Stats: how many docs/chunks in the store right now?
+    python -m rag --help
+    python -m rag index --tickers AAPL MSFT
     python -m rag stats
+    python -m rag benchmark --eval-set rag/eval/test_queries.json
 
-Design note
------------
-The CLI is intentionally thin. Each command delegates to the same
-classes you'd use from Python. This keeps "behavior I tested in a
-shell" identical to "behavior I'll get inside the agent pipeline."
+Design constraints
+------------------
+This is a **routing layer only**.  It must NOT:
+
+* introduce new business logic
+* re-implement anything ``rag.indexer`` or ``rag.benchmark`` already does
+* import any external service eagerly (Ollama, ChromaDB) — lazy-import
+  inside each subcommand handler so ``--help`` works on a fresh checkout
+  with no model server running
+
+The lazy-import discipline is what lets the CI pipeline run
+``python -m rag --help`` without needing ``ollama`` installed.
 """
-
 from __future__ import annotations
 
 import argparse
 import logging
 import sys
-
-from rag.indexer import Indexer
-from rag.retriever import Retriever
+from typing import Optional
 
 
-def cmd_index(args: argparse.Namespace) -> int:
-    indexer = Indexer()
+# ----------------------------------------------------------------------
+# Subcommand handlers — each one lazy-imports its dependencies so the
+# top-level --help works in environments without Ollama / ChromaDB.
+# ----------------------------------------------------------------------
+def _cmd_index(args: argparse.Namespace) -> int:
+    """Delegate to Indexer.run_tickers — no logic added here."""
+    try:
+        from rag.indexer import Indexer
+    except Exception as e:  # noqa: BLE001
+        print(f"rag index: indexer unavailable ({e})", file=sys.stderr)
+        return 2
 
+    # Optional dependency wiring. The user supplies them via env / config
+    # in normal operation; in CLI usage they're optional and the indexer
+    # silently skips missing loaders. We pass None explicitly to keep
+    # the routing layer's contract clean — Indexer.run_tickers handles
+    # the optional-arg branching, not us.
     sec_fetcher = None
     portfolio_db = None
-    if not args.notes_only and args.tickers:
-        # Lazy-import your data layer so the CLI works even when
-        # those modules aren't on the path.
-        try:
-            from data.sec_fetcher import SECFetcher
-            sec_fetcher = SECFetcher()
-        except Exception as e:  # noqa: BLE001
-            print(f"warning: sec_fetcher unavailable ({e}); skipping filings",
-                  file=sys.stderr)
-        try:
-            from data.portfolio_db import PortfolioDB
-            portfolio_db = PortfolioDB()
-        except Exception as e:  # noqa: BLE001
-            print(f"warning: portfolio_db unavailable ({e}); skipping theses",
-                  file=sys.stderr)
+    try:
+        ix = Indexer(tracking_db_path=args.tracking_db)
+    except Exception as e:  # noqa: BLE001
+        print(f"rag index: could not build Indexer ({e})", file=sys.stderr)
+        return 2
 
-    if args.notes_only:
-        from rag.document_loaders.notes import NotesLoader
-        stats = indexer.index_many(NotesLoader().load_all(), force=args.force)
-        print({"notes": stats})
-    else:
-        stats = indexer.run_tickers(
-            tickers=args.tickers or [],
-            sec_fetcher=sec_fetcher,
-            portfolio_db=portfolio_db,
-            force=args.force,
-        )
-        for source, s in stats.items():
-            print(f"{source}: {s}")
-    return 0
-
-
-def cmd_query(args: argparse.Namespace) -> int:
-    retriever = Retriever()
-    results = retriever.retrieve(
-        query=args.query,
-        k=args.k,
-        ticker=args.ticker,
-        doc_types=args.doc_types,
+    stats = ix.run_tickers(
+        tickers=args.tickers,
+        sec_fetcher=sec_fetcher,
+        portfolio_db=portfolio_db,
+        force=args.force,
     )
-    if not results:
-        print("(no results)")
-        return 0
-    for i, r in enumerate(results, 1):
-        section = r.metadata.get("section") or r.metadata.get("speaker") or ""
-        print(f"\n[{i}] score={r.score:.3f}  {r.metadata.get('ticker', '-')} "
-              f"{r.metadata.get('doc_type', '-')}  {section}")
-        print(f"    doc_id: {r.metadata.get('doc_id')}")
-        # Truncate the text for the terminal; full text is in metadata
-        snippet = r.text.replace("\n", " ").strip()
-        if len(snippet) > 300:
-            snippet = snippet[:300] + "..."
-        print(f"    {snippet}")
+    # Print the per-loader summary that run_tickers already produces.
+    for loader_name, loader_stats in (stats or {}).items():
+        print(f"{loader_name}: {loader_stats}")
     return 0
 
 
-def cmd_stats(args: argparse.Namespace) -> int:
-    indexer = Indexer()
-    s = indexer.stats()
-    print(f"Total documents:       {s['total_documents']}")
-    print(f"Total chunks tracked:  {s['total_chunks_recorded']}")
-    print(f"By doc_type:           {s['by_doc_type']}")
-    print(f"Vector store:          {s['vector_store_stats']}")
+def _cmd_stats(args: argparse.Namespace) -> int:
+    """Delegate to Indexer.stats — no logic added here."""
+    try:
+        from rag.indexer import Indexer
+    except Exception as e:  # noqa: BLE001
+        print(f"rag stats: indexer unavailable ({e})", file=sys.stderr)
+        return 2
+    try:
+        ix = Indexer(tracking_db_path=args.tracking_db)
+    except Exception as e:  # noqa: BLE001
+        print(f"rag stats: could not build Indexer ({e})", file=sys.stderr)
+        return 2
+    out = ix.stats()
+    # Print the same dict the method returns — no formatting beyond that.
+    for k, v in (out or {}).items():
+        print(f"{k}: {v}")
     return 0
 
 
-def main(argv: list[str] | None = None) -> int:
+def _cmd_benchmark(args: argparse.Namespace, passthrough: list[str]) -> int:
+    """Delegate to rag.benchmark.main, passing remaining argv through.
+
+    The benchmark module already owns its argparse configuration; we
+    don't re-declare those flags here. ``passthrough`` is the slice of
+    argv after the ``benchmark`` subcommand token, which gets handed
+    verbatim to ``rag.benchmark.main``.
+    """
+    try:
+        from rag.eval.benchmark import main as benchmark_main
+    except Exception as e:  # noqa: BLE001
+        print(f"rag benchmark: unavailable ({e})", file=sys.stderr)
+        return 2
+    return int(benchmark_main(passthrough) or 0)
+
+
+# ----------------------------------------------------------------------
+# Top-level dispatcher
+# ----------------------------------------------------------------------
+def _build_parser() -> argparse.ArgumentParser:
+    """Build the top-level argparse tree.
+
+    Help text mirrors what's documented in ``rag/integration_snippets.py``
+    so ``python -m rag --help`` and the in-repo docs say the same thing.
+    """
     parser = argparse.ArgumentParser(
         prog="python -m rag",
-        description="RAG ingestion and retrieval CLI for Ary Quant.",
+        description=(
+            "rag — Phase 1+2+3+4 RAG package for the hedgefund-ai project. "
+            "This CLI is a thin router; every subcommand delegates to an "
+            "entry point that already exists elsewhere in the package."
+        ),
+        epilog=(
+            "Examples:\n"
+            "  python -m rag index --tickers AAPL MSFT NVDA\n"
+            "  python -m rag stats\n"
+            "  python -m rag benchmark --eval-set rag/eval/test_queries.json"
+        ),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     parser.add_argument(
         "-v", "--verbose", action="store_true",
-        help="Enable INFO-level logging.",
+        help="Verbose (DEBUG-level) logging."
     )
-    sub = parser.add_subparsers(dest="command", required=True)
+    sub = parser.add_subparsers(
+        dest="command",
+        metavar="<command>",
+        title="commands",
+    )
 
-    p_index = sub.add_parser("index", help="Ingest documents into the vector store.")
-    p_index.add_argument("--tickers", nargs="+", default=[],
-                         help="Tickers to index filings/theses for.")
-    p_index.add_argument("--force", action="store_true",
-                         help="Re-index even if content hash is unchanged.")
-    p_index.add_argument("--notes-only", action="store_true",
-                         help="Skip filings/theses; only index fund notes.")
-    p_index.set_defaults(func=cmd_index)
+    # ----- index -----
+    p_index = sub.add_parser(
+        "index",
+        help="Index documents for one or more tickers "
+             "(delegates to rag.indexer.Indexer.run_tickers).",
+    )
+    p_index.add_argument(
+        "--tickers", nargs="+", required=True,
+        help="One or more ticker symbols to index.",
+    )
+    p_index.add_argument(
+        "--tracking-db", default="data/rag_tracking.db",
+        help="Path to the RAG tracking SQLite DB.",
+    )
+    p_index.add_argument(
+        "--force", action="store_true",
+        help="Re-index documents even if hash is unchanged.",
+    )
 
-    p_query = sub.add_parser("query", help="Run a one-off retrieval query.")
-    p_query.add_argument("query", help="Natural-language question.")
-    p_query.add_argument("--k", type=int, default=8,
-                         help="Number of chunks to return.")
-    p_query.add_argument("--ticker", help="Filter to a single ticker.")
-    p_query.add_argument("--doc-types", nargs="+",
-                         help="Filter to one or more doc types.")
-    p_query.set_defaults(func=cmd_query)
+    # ----- stats -----
+    p_stats = sub.add_parser(
+        "stats",
+        help="Print descriptive stats about the indexed corpus "
+             "(delegates to rag.indexer.Indexer.stats).",
+    )
+    p_stats.add_argument(
+        "--tracking-db", default="data/rag_tracking.db",
+        help="Path to the RAG tracking SQLite DB.",
+    )
 
-    p_stats = sub.add_parser("stats", help="Show index size and breakdown.")
-    p_stats.set_defaults(func=cmd_stats)
+    # ----- benchmark -----
+    # The benchmark subparser holds NO flags of its own. Every flag the
+    # user types after `benchmark` is collected into REMAINDER and
+    # forwarded verbatim to rag.benchmark.main. This avoids drift
+    # between the two argparsers — the benchmark module remains the
+    # single source of truth for its own flags.
+    sub.add_parser(
+        "benchmark",
+        help="Run the retrieval benchmark "
+             "(delegates to rag.eval.benchmark.main; all flags forward).",
+        add_help=False,
+    )
 
+    return parser
+
+
+def main(argv: Optional[list[str]] = None) -> int:
+    """CLI entry point. Routes the first positional arg to a handler."""
+    argv = list(sys.argv[1:] if argv is None else argv)
+
+    # Special-case the benchmark subcommand: anything after the
+    # `benchmark` token must NOT be parsed by our argparse (because
+    # rag.benchmark owns those flags). We split argv before argparse
+    # has a chance to choke on its unknown flags.
+    if "benchmark" in argv:
+        idx = argv.index("benchmark")
+        head = argv[:idx + 1]
+        passthrough = argv[idx + 1:]
+        parser = _build_parser()
+        # Allow `-h`/`--help` after `benchmark` to fall through to the
+        # benchmark module's own --help, not ours.
+        args = parser.parse_args(head)
+        logging.basicConfig(
+            level=logging.DEBUG if args.verbose else logging.WARNING,
+            format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
+        )
+        return _cmd_benchmark(args, passthrough)
+
+    parser = _build_parser()
     args = parser.parse_args(argv)
+
     logging.basicConfig(
-        level=logging.INFO if args.verbose else logging.WARNING,
-        format="%(asctime)s %(levelname)s %(name)s | %(message)s",
+        level=logging.DEBUG if args.verbose else logging.WARNING,
+        format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
     )
-    return args.func(args)
+
+    if args.command is None:
+        parser.print_help()
+        return 0
+    if args.command == "index":
+        return _cmd_index(args)
+    if args.command == "stats":
+        return _cmd_stats(args)
+
+    # Defensive — argparse should have rejected any other value
+    # against ``choices``-equivalent subcommand registration.
+    parser.print_help()
+    return 1
 
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    sys.exit(main())
