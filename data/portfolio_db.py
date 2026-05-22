@@ -104,8 +104,27 @@ def save_agent_opinion(
 class PortfolioDB:
     """Portfolio tracking and analytics backed by SQLite."""
 
-    def __init__(self, db_path: str = "data/hedgefund.db"):
+    def __init__(
+        self,
+        db_path: str = "data/hedgefund.db",
+        benchmark_lookup_fn=None,
+    ):
+        """
+        Parameters
+        ----------
+        db_path:
+            SQLite file path.
+        benchmark_lookup_fn:
+            Optional callable ``(ticker, start_date, end_date) -> float``
+            used by ``get_pnl_for_thesis`` to compute
+            ``benchmark_return_pct``. Returns the benchmark's total return
+            over the holding window as a fraction (e.g. ``0.08`` for +8%).
+            If not provided, ``benchmark_return_pct`` is set to ``None`` —
+            ``scorer.score_thesis`` handles that case (skips the benchmark
+            subtraction, no error).
+        """
         self.db_path = db_path
+        self._benchmark_lookup_fn = benchmark_lookup_fn
         self._init_db()
 
     # ------------------------------------------------------------------
@@ -202,6 +221,47 @@ class PortfolioDB:
                     updated_at TEXT NOT NULL DEFAULT (datetime('now'))
                 )
             """)
+
+            # ---- Phase 4: theses ------------------------------------------
+            # Per-thesis records. A thesis row is opened when the agent
+            # writes a new thesis (record_thesis) and closed when the
+            # position is exited (close_thesis). Closed rows feed the RAG
+            # learning loop via get_recently_closed_theses / get_pnl_for_thesis.
+            #
+            # Shape matches what rag/document_loaders/theses.py and
+            # rag/learning/scorer.py expect: id, ticker, created_at, score,
+            # stance, thesis_text, essay_text, author/model. Extra columns
+            # (entry_price, exit_price, shares, closed_at, outcome,
+            # thesis_note_path, metadata_json) carry the per-trade context
+            # needed to compute realized P&L without re-walking trades.
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS theses (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    ticker TEXT NOT NULL,
+                    author TEXT,
+                    model TEXT,
+                    stance TEXT CHECK(stance IN ('bull', 'bear', 'neutral')),
+                    score REAL,
+                    thesis_text TEXT,
+                    essay_text TEXT,
+                    entry_price REAL,
+                    exit_price REAL,
+                    shares REAL,
+                    created_at TEXT NOT NULL DEFAULT (datetime('now')),
+                    closed_at TEXT,
+                    outcome TEXT,
+                    thesis_note_path TEXT,
+                    metadata_json TEXT
+                )
+            """)
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_theses_closed_at "
+                "ON theses(closed_at)"
+            )
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_theses_ticker "
+                "ON theses(ticker)"
+            )
 
             # Set default cash balance if not exists
             conn.execute("""
@@ -879,6 +939,348 @@ class PortfolioDB:
                 lines.append(f"  ⚠ {flag}")
 
         return "\n".join(lines)
+
+    # ==================================================================
+    # Phase 4: thesis lifecycle + RAG learning-loop hooks
+    # ==================================================================
+    # The methods below back the Phase 4 self-improving RAG. The three
+    # public hooks (get_recently_closed_theses, get_thesis_by_id,
+    # get_pnl_for_thesis) are called by rag/learning/loop.py and
+    # rag/learning/auditor.py via the refresh scheduler. Shapes match
+    # the contract documented at the bottom of rag/integration_snippets.py
+    # AND the fields actually read by rag/learning/scorer.py.
+    #
+    # `record_thesis` and `close_thesis` are explicit write APIs — none
+    # of the existing PortfolioDB methods (add_position, reduce_position,
+    # record_trade, ...) is modified, so callers that don't use Phase 4
+    # see zero behaviour change.
+
+    def record_thesis(
+        self,
+        ticker: str,
+        *,
+        thesis_text: Optional[str] = None,
+        essay_text: Optional[str] = None,
+        score: Optional[float] = None,
+        stance: Optional[str] = None,
+        author: Optional[str] = None,
+        model: Optional[str] = None,
+        entry_price: Optional[float] = None,
+        shares: Optional[float] = None,
+        thesis_note_path: Optional[str] = None,
+        metadata: Optional[dict] = None,
+        created_at: Optional[str] = None,
+    ) -> int:
+        """Persist a new thesis row. Returns the new thesis id.
+
+        At least one of ``thesis_text`` or ``essay_text`` should be
+        non-empty for the row to be usable by the RAG indexer (the
+        loader skips rows whose text is empty). ``stance`` must be
+        one of ``'bull' | 'bear' | 'neutral'`` if provided.
+        """
+        ticker = ticker.upper()
+        if stance is not None and stance not in ("bull", "bear", "neutral"):
+            raise ValueError(
+                f"stance must be 'bull'|'bear'|'neutral', got {stance!r}"
+            )
+        if score is not None and not (0.0 <= float(score) <= 1.0):
+            raise ValueError(
+                f"score must be in [0, 1], got {score!r}"
+            )
+
+        meta_json = json.dumps(metadata) if metadata else None
+        ts = created_at or datetime.now().isoformat(timespec="seconds")
+
+        with sqlite3.connect(self.db_path) as conn:
+            cur = conn.execute(
+                """
+                INSERT INTO theses (
+                    ticker, author, model, stance, score,
+                    thesis_text, essay_text, entry_price, shares,
+                    thesis_note_path, metadata_json, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    ticker, author, model, stance, score,
+                    thesis_text, essay_text, entry_price, shares,
+                    thesis_note_path, meta_json, ts,
+                ),
+            )
+            conn.commit()
+            return int(cur.lastrowid or 0)
+
+    def close_thesis(
+        self,
+        thesis_id,
+        *,
+        exit_price: Optional[float] = None,
+        closed_at: Optional[str] = None,
+        outcome: Optional[str] = None,
+    ) -> dict:
+        """Stamp ``closed_at`` on a thesis. Idempotent re-close updates
+        the latest exit info but leaves the original ``closed_at``.
+
+        ``outcome``, if not provided, is auto-derived from
+        ``exit_price`` vs ``entry_price``: 'win' / 'loss' / 'flat'.
+        Returns the freshly-closed thesis row.
+        """
+        ts = closed_at or datetime.now().isoformat(timespec="seconds")
+
+        with sqlite3.connect(self.db_path) as conn:
+            conn.row_factory = sqlite3.Row
+            row = conn.execute(
+                "SELECT * FROM theses WHERE id = ?", (thesis_id,)
+            ).fetchone()
+            if row is None:
+                raise ValueError(f"No thesis with id={thesis_id!r}")
+            row = dict(row)
+
+            # Compute outcome if caller didn't supply one.
+            if outcome is None and exit_price is not None and row.get("entry_price"):
+                entry = float(row["entry_price"])
+                # Defensive: stance flips the sign for shorts ('bear').
+                # By default we treat the thesis as long unless stance='bear'.
+                is_short = (row.get("stance") == "bear")
+                raw_return = (exit_price - entry) / entry if entry else 0.0
+                effective = -raw_return if is_short else raw_return
+                if effective > 0.005:
+                    outcome = "win"
+                elif effective < -0.005:
+                    outcome = "loss"
+                else:
+                    outcome = "flat"
+
+            # Preserve the original closed_at on idempotent re-close;
+            # only update exit_price / outcome.
+            preserve_closed_at = row.get("closed_at") is not None
+            new_closed_at = row["closed_at"] if preserve_closed_at else ts
+
+            conn.execute(
+                """
+                UPDATE theses
+                SET closed_at = ?, exit_price = ?, outcome = ?
+                WHERE id = ?
+                """,
+                (new_closed_at,
+                 exit_price if exit_price is not None else row.get("exit_price"),
+                 outcome if outcome is not None else row.get("outcome"),
+                 thesis_id),
+            )
+            conn.commit()
+
+            return dict(conn.execute(
+                "SELECT * FROM theses WHERE id = ?", (thesis_id,)
+            ).fetchone())
+
+    def get_recently_closed_theses(
+        self,
+        since_days: int = 7,
+        limit: Optional[int] = None,
+    ) -> list[dict]:
+        """Thesis rows for positions closed in the last N days.
+
+        Parameters
+        ----------
+        since_days:
+            Look-back window. Theses with ``closed_at`` older than this
+            cutoff are excluded. Set to a very large number (e.g.
+            ``36500``) to fetch all closed theses.
+        limit:
+            Optional cap on number of rows returned. Most recent first.
+
+        Returns
+        -------
+        list[dict]
+            One dict per thesis, ordered by ``closed_at`` DESC. Each
+            dict has every column of the ``theses`` table; the
+            ``metadata_json`` blob is decoded into a ``metadata`` dict
+            for caller convenience. Returns ``[]`` when no closed
+            theses fall in the window.
+        """
+        if since_days < 0:
+            raise ValueError(f"since_days must be >= 0, got {since_days}")
+
+        cutoff = (datetime.now() - timedelta(days=since_days)).isoformat(
+            timespec="seconds"
+        )
+
+        sql = (
+            "SELECT * FROM theses "
+            "WHERE closed_at IS NOT NULL AND closed_at >= ? "
+            "ORDER BY closed_at DESC"
+        )
+        params: list = [cutoff]
+        if limit is not None:
+            if limit < 0:
+                raise ValueError(f"limit must be >= 0, got {limit}")
+            sql += " LIMIT ?"
+            params.append(int(limit))
+
+        with sqlite3.connect(self.db_path) as conn:
+            conn.row_factory = sqlite3.Row
+            rows = conn.execute(sql, params).fetchall()
+
+        return [self._row_to_thesis(dict(r)) for r in rows]
+
+    def get_thesis_by_id(self, thesis_id) -> Optional[dict]:
+        """Return the full thesis row for ``thesis_id``, or ``None``
+        if no such row exists.
+
+        ``thesis_id`` may be ``int`` or ``str`` — both are accepted
+        because the integration contract calls this with
+        ``str(thesis.get("id"))`` in some paths.
+        """
+        if thesis_id is None:
+            return None
+        try:
+            tid = int(thesis_id)
+        except (TypeError, ValueError):
+            return None
+
+        with sqlite3.connect(self.db_path) as conn:
+            conn.row_factory = sqlite3.Row
+            row = conn.execute(
+                "SELECT * FROM theses WHERE id = ?", (tid,)
+            ).fetchone()
+
+        return self._row_to_thesis(dict(row)) if row else None
+
+    def get_pnl_for_thesis(self, thesis: dict) -> Optional[dict]:
+        """Return realized P&L info for a thesis, or ``None`` if the
+        position is still open or P&L can't be computed.
+
+        Shape (matches ``rag/learning/scorer.py:177-179`` exactly):
+            ``{"return_pct": float,
+               "days_held": int,
+               "benchmark_return_pct": Optional[float]}``
+
+        Returns ``None`` (not a dict with zeros) when:
+            - ``thesis`` is None or has no ``id``
+            - the thesis isn't closed (``closed_at IS NULL``)
+            - we lack the entry/exit prices needed to compute return
+
+        Returning ``None`` is the documented "no P&L" signal — the
+        curator's no_realized_pnl warning then blocks indexing
+        (curator.py:266-267).
+        """
+        if not thesis:
+            return None
+        tid = thesis.get("id")
+        if tid is None:
+            return None
+
+        # Re-fetch the canonical row to avoid stale-input drift.
+        row = self.get_thesis_by_id(tid)
+        if row is None:
+            return None
+        if not row.get("closed_at"):
+            return None
+
+        entry = row.get("entry_price")
+        exit_ = row.get("exit_price")
+        if entry is None or exit_ is None:
+            return None
+        try:
+            entry_f = float(entry)
+            exit_f = float(exit_)
+        except (TypeError, ValueError):
+            return None
+        if entry_f <= 0:
+            return None
+
+        # Sign flip for short theses.
+        is_short = (row.get("stance") == "bear")
+        raw = (exit_f - entry_f) / entry_f
+        return_pct = -raw if is_short else raw
+
+        # Days held — bounded below at 1 to avoid divide-by-zero in
+        # the annualizer downstream (scorer.py:183).
+        days_held = self._days_between(row.get("created_at"), row.get("closed_at"))
+        if days_held is None or days_held < 1:
+            days_held = 1
+
+        # Optional benchmark return — only computed if the user wired
+        # a market_data lookup into the constructor. Missing/error
+        # cases return None, which scorer.py handles gracefully.
+        bench = None
+        if self._benchmark_lookup_fn is not None:
+            try:
+                bench = self._benchmark_lookup_fn(
+                    row.get("ticker"),
+                    row.get("created_at"),
+                    row.get("closed_at"),
+                )
+                bench = float(bench) if bench is not None else None
+            except Exception as e:  # noqa: BLE001
+                logger.debug(
+                    "portfolio_db.get_pnl_for_thesis | benchmark lookup failed: %s",
+                    e,
+                )
+                bench = None
+
+        return {
+            "return_pct": float(return_pct),
+            "days_held": int(days_held),
+            "benchmark_return_pct": bench,
+        }
+
+    def get_thesis_history(
+        self,
+        ticker: str,
+        limit: int = 50,
+    ) -> list[dict]:
+        """All thesis rows for ``ticker`` (open + closed), most recent
+        first. Backs ``rag/document_loaders/theses.py:ThesesLoader``
+        which was already coded against this signature
+        (``theses.py:42, 62``) but had no implementation.
+        """
+        ticker = ticker.upper()
+        if limit < 0:
+            raise ValueError(f"limit must be >= 0, got {limit}")
+        with sqlite3.connect(self.db_path) as conn:
+            conn.row_factory = sqlite3.Row
+            rows = conn.execute(
+                """
+                SELECT * FROM theses
+                WHERE ticker = ?
+                ORDER BY created_at DESC
+                LIMIT ?
+                """,
+                (ticker, int(limit)),
+            ).fetchall()
+        return [self._row_to_thesis(dict(r)) for r in rows]
+
+    # ------------------------------------------------------------------
+    # Internal helpers for thesis methods
+    # ------------------------------------------------------------------
+    @staticmethod
+    def _row_to_thesis(row: dict) -> dict:
+        """Decode the metadata blob and return a clean dict."""
+        meta_raw = row.pop("metadata_json", None)
+        try:
+            row["metadata"] = json.loads(meta_raw) if meta_raw else None
+        except (TypeError, ValueError):
+            row["metadata"] = None
+        return row
+
+    @staticmethod
+    def _days_between(start: Optional[str], end: Optional[str]) -> Optional[int]:
+        """ISO-string difference in whole days. Tolerant of formats with
+        or without time component, with or without trailing 'Z'."""
+        if not start or not end:
+            return None
+        try:
+            s = datetime.fromisoformat(str(start).replace("Z", "+00:00"))
+            e = datetime.fromisoformat(str(end).replace("Z", "+00:00"))
+        except ValueError:
+            return None
+        # Drop tz info if mixed (sqlite default datetime() has none)
+        if s.tzinfo and not e.tzinfo:
+            s = s.replace(tzinfo=None)
+        if e.tzinfo and not s.tzinfo:
+            e = e.replace(tzinfo=None)
+        delta = e - s
+        return max(0, int(delta.total_seconds() // 86400))
 
     # ------------------------------------------------------------------
     # Private helpers
