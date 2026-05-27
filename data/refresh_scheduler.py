@@ -732,7 +732,11 @@ class RefreshScheduler:
             except TypeError:
                 store = get_default_store()
 
-            indexer = Indexer(tracking_db_path=cfg.RAG_TRACKING_DB)
+            indexer = Indexer(
+                tracking_db_path=cfg.RAG_TRACKING_DB,
+                chunk_tokens=cfg.RAG_CHUNK_TOKENS,
+                overlap_tokens=cfg.RAG_OVERLAP_TOKENS,
+            )
             curator = Curator(
                 tracking_db_path=cfg.RAG_TRACKING_DB,
                 index_threshold=cfg.RAG_LEARNING_INDEX_THRESHOLD,
