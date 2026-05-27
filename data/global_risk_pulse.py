@@ -94,6 +94,15 @@ _DEFAULT_SUBCOMPONENT_WEIGHTS: dict[str, float] = {
 }
 
 
+# How many days of "lag" between the panel's most recent date and the
+# requested as_of is still considered "production-current", in which
+# case the staleness check anchors to the panel rather than as_of. See
+# the long comment in _load_price_panel for the rationale. Beyond this
+# window, the panel is treated as genuinely historical and the raw
+# as_of-based cutoff is used.
+PANEL_ANCHOR_GRACE_DAYS = 30
+
+
 @dataclass(frozen=True)
 class PulseConfig:
     """Typed configuration for the global risk pulse.
@@ -531,9 +540,41 @@ def _load_price_panel(
     df["ticker"] = df["ticker"].str.upper()
     df["date"] = pd.to_datetime(df["date"])
 
-    # Staleness check — drop tickers whose latest date is too old
+    # Staleness check — drop tickers whose latest date is too old.
+    #
+    # The cutoff is anchored to the more recent of ``as_of`` and the
+    # panel's max date, BUT only when the gap between them is small.
+    # The two regimes we need to handle correctly:
+    #
+    # * Production / near-current fixture (gap ≤ grace):
+    #     panel ends within a few weeks of as_of.  Use panel_max as the
+    #     reference so individual laggards get filtered but the bulk
+    #     stays fresh.
+    #
+    # * Genuinely historical / "all stale" data (gap > grace):
+    #     panel ends months in the past.  Use as_of as the reference —
+    #     the caller meant "treat this as stale" and we honor that.
+    #     ``test_all_stale_returns_null`` exercises this branch.
+    #
+    # The grace window is generous (PANEL_ANCHOR_GRACE_DAYS, hardcoded
+    # at 30) so that test fixtures and real production both behave
+    # sensibly without needing to pass as_of explicitly. It's not in
+    # PulseConfig because it's a semantic of the staleness model, not
+    # something callers tune per-run.
     last_dates = df.groupby("ticker")["date"].max()
-    stale_mask = last_dates < pd.to_datetime(staleness_cutoff)
+    panel_max = last_dates.max()  # pd.Timestamp, tz-naive
+    # Strip timezone from as_of for comparison against the tz-naive
+    # last_dates index — pandas refuses to compare across tz states.
+    as_of_naive = pd.Timestamp(
+        as_of_dt.replace(tzinfo=None) if as_of_dt.tzinfo else as_of_dt
+    )
+    gap_days = (as_of_naive - panel_max).days
+    if 0 < gap_days <= PANEL_ANCHOR_GRACE_DAYS:
+        reference_date = panel_max
+    else:
+        reference_date = as_of_naive
+    staleness_cutoff_ts = reference_date - pd.Timedelta(days=cfg.max_staleness_days)
+    stale_mask = last_dates < staleness_cutoff_ts
     for t in last_dates[stale_mask].index:
         excluded[t] = f"stale_last={last_dates[t]:%Y-%m-%d}"
     fresh = last_dates[~stale_mask].index

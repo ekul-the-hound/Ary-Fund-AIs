@@ -17,7 +17,6 @@ Usage:
 
 import logging
 from datetime import datetime
-from functools import lru_cache
 from typing import Any, Optional
 
 from data.sec_fetcher import SECFetcher
@@ -635,16 +634,31 @@ def _build_pipeline(db_path: str, cfg) -> "DataPipeline":
 # =============================================================================
 # The retriever is expensive to construct (BM25 unpickle, cross-encoder
 # load, optional Ollama probe). We build it once per process and cache
-# with ``lru_cache``. ``cfg`` is unhashable for the module case, so the
-# cache key is the ``id(cfg)`` — fine because callers reuse one cfg
-# object for the life of the process.
+# it in a module-level dict keyed by ``id(cfg)``.
+#
+# Why a manual id-keyed cache instead of ``functools.lru_cache``? The
+# obvious choice is ``@lru_cache(maxsize=1)``, but ``lru_cache`` keys
+# its entries by ``hash(arg)`` — and most realistic ``cfg`` objects
+# (the project's config module itself, ``SimpleNamespace`` instances
+# used in tests, ``argparse.Namespace`` from CLI plumbing) are not
+# hashable. We saw this in the wild: ``test_empty_registry_does_not_raise``
+# passes ``SimpleNamespace()`` and crashed here on
+# ``TypeError: unhashable type: 'types.SimpleNamespace'``.
+#
+# Using ``id(cfg)`` as the key gives the same "one retriever per cfg
+# object" lifetime guarantee without requiring cfg to be hashable.
+# Long-running processes that swap out cfg between runs (rare but
+# possible) get a fresh retriever; processes that reuse one cfg (the
+# common case) hit the cache.
 #
 # RAG is a soft dependency. Construction failures (missing chromadb,
 # missing nomic-embed-text, BM25 pickle corruption, etc.) downgrade to
 # "RAG disabled for this run" rather than failing the whole context
 # build. The agent still gets every other ctx field.
 
-@lru_cache(maxsize=1)
+_RAG_RETRIEVER_CACHE: dict[int, Any] = {}
+
+
 def _get_rag_retriever(cfg):
     """Construct the configured RAG retriever, cached for the process.
 
@@ -652,8 +666,16 @@ def _get_rag_retriever(cfg):
     treat None as "no retrieved context" — RAG is never a hard
     requirement for a context build to succeed.
     """
+    # Fast path: disabled means there's nothing to construct or cache.
+    # Doing this check BEFORE the cache lookup means a disabled cfg
+    # never claims a cache slot and re-enabling RAG (rare, but happens
+    # in test rigs) doesn't require manually clearing the cache.
     if not getattr(cfg, "RAG_ENABLED", False):
         return None
+
+    cache_key = id(cfg)
+    if cache_key in _RAG_RETRIEVER_CACHE:
+        return _RAG_RETRIEVER_CACHE[cache_key]
 
     try:
         from rag.bm25_index import BM25Index
@@ -712,9 +734,14 @@ def _get_rag_retriever(cfg):
             bm25 is not None, reranker is not None,
             getattr(cfg, "RAG_MMR", False),
         )
+        _RAG_RETRIEVER_CACHE[cache_key] = retriever
         return retriever
     except Exception as e:  # noqa: BLE001
         logger.warning("rag retriever init failed; disabling: %s", e)
+        # Cache the None too — otherwise every call re-attempts the
+        # expensive construction and re-logs the failure. Repeated
+        # warnings drown out the real logs.
+        _RAG_RETRIEVER_CACHE[cache_key] = None
         return None
 
 
