@@ -319,8 +319,44 @@ def extract_key_metrics_for_agent(
     # over the op_cf − capex derivation, so we can surface it directly.
     free_cash_flow_out = fcf
 
+    # --- Company identity & extra valuation multiples -------------------
+    # The essay prompt needs the company NAME (otherwise it falls back to
+    # the literal "Unknown Company"), and the review kept *inventing*
+    # price-to-book / price-to-sales because they weren't supplied. Pull
+    # all of them from the input metrics dict, tolerating both the flat
+    # shape (build_agent_context output) and the nested shape that
+    # market_data.get_fundamentals() returns (name/sector at root,
+    # multiples under a "valuation" sub-dict).
+    _val = m.get("valuation") if isinstance(m.get("valuation"), dict) else {}
+
+    def _pick_str(*keys: str) -> Optional[str]:
+        for src in (m, _val):
+            for k in keys:
+                v = src.get(k)
+                if isinstance(v, str) and v.strip():
+                    return v.strip()
+        return None
+
+    def _pick_num(*keys: str) -> Optional[float]:
+        # Top-level first, then nested "valuation".
+        v = _first_number(m, *keys)
+        if v is not None:
+            return v
+        return _first_number(_val, *keys)
+
+    company_name = _pick_str("name", "shortName", "longName", "company_name")
+    sector = _pick_str("sector")
+    industry = _pick_str("industry")
+    price_to_book = _pick_num("price_to_book", "priceToBook", "pb_ratio")
+    price_to_sales = _pick_num(
+        "price_to_sales", "priceToSalesTrailing12Months", "ps_ratio"
+    )
+
     snapshot: Dict[str, Any] = {
         "ticker": ticker,
+        "name": company_name,                # company identity for the essay header
+        "sector": sector,
+        "industry": industry,
         "price": _safe_float(price),
         "revenue_growth_3y": revenue_growth_3y,
         "revenue_growth_5y": revenue_growth_5y,
@@ -338,6 +374,8 @@ def extract_key_metrics_for_agent(
         "forward_pe": forward_pe,
         "ev_ebitda": ev_ebitda,
         "ev_to_ebitda": ev_ebitda,           # alias
+        "price_to_book": price_to_book,      # supplied so the review stops inventing it
+        "price_to_sales": price_to_sales,    # supplied so the review stops inventing it
         "cash_conversion": cash_conversion,  # OCF / NI
         "fcf_yield": fcf_yield,              # FCF / market cap
         "roic": roic,

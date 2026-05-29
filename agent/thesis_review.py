@@ -93,6 +93,14 @@ _SECTION_NAMES: List[str] = [
 
 _REVIEW_MIN_WORDS: int = 1200
 
+# Revision acceptance floor. A revision is a rewrite of the original
+# essay, so we gate on a fraction of the ORIGINAL length rather than a
+# fixed count (which had to be retuned every time the essay model
+# changed verbosity). _REVISION_ABS_MIN_WORDS is a hard floor that
+# catches truncated/garbage output regardless of original length.
+_REVISION_MIN_RATIO: float = 0.85   # revision must be >= 85% of original length
+_REVISION_ABS_MIN_WORDS: int = 250  # absolute floor; below this is broken output
+
 
 # =============================================================================
 # PUBLIC API
@@ -186,8 +194,23 @@ def revise_essay(
 
     try:
         text = _call_ollama_text(prompt, model_used, config, temperature=_REVISION_TEMPERATURE)
-        if not text or len(text.split()) < 1400:
-            raise RuntimeError(f"Revision too short ({len(text.split()) if text else 0} words)")
+        # The revision is an improved REWRITE of the original essay, so it
+        # should be at least roughly as long as what it replaces — not some
+        # fixed absolute count. The old fixed 1400-word floor was tuned for
+        # phi3's verbose output and rejected every revision from more concise
+        # models (llama3.1:8b writes ~500-word memos, so a faithful ~600-word
+        # revision was being thrown away). Gate on a fraction of the original
+        # length instead, with a small absolute floor to catch truncated or
+        # error output.
+        original_words = len(original_essay.split())
+        min_words = max(_REVISION_ABS_MIN_WORDS,
+                        int(original_words * _REVISION_MIN_RATIO))
+        revision_words = len(text.split()) if text else 0
+        if not text or revision_words < min_words:
+            raise RuntimeError(
+                f"Revision too short ({revision_words} words < "
+                f"{min_words} floor; original was {original_words})"
+            )
         elapsed_ms = (time.perf_counter() - started_at) * 1000.0
         logger.info(
             "thesis_review | %s | revision | model=%s | words=%d | elapsed_ms=%.0f",
@@ -253,6 +276,8 @@ def _build_review_prompt(
 === INSTRUCTIONS ===
 Your review must be at least {_REVIEW_MIN_WORDS} words. Be direct, use numbers, and prioritize judgment over coverage.
 
+CRITICAL — GROUND TRUTH ONLY: Every number you cite MUST come from the RAW DATA block above. Do NOT invent, estimate, or recall metrics from memory. If a metric you want to reference (e.g. price-to-book, price-to-sales) is NOT present in the RAW DATA, do not state a value for it — instead say it is "not in the provided data" and, if it matters, recommend it be sourced. Inventing a number like "P/B at 5.2x" when no P/B is given is the single worst thing you can do in this review, because the analyst will treat it as fact. When you flag a metric the memo omitted, only do so if that metric actually appears in the RAW DATA.
+
 For each of the 8 sections below, do exactly this:
 1. Score from 1 to 10.
 2. State the single biggest weakness in 1-2 sentences.
@@ -263,7 +288,10 @@ Do NOT list every possible improvement. Pick the ones that matter most.
 
 === SECTION-SPECIFIC RULES ===
 
-VALUATION: Choose the ONE most important missing valuation metric for this stock. Do not mention all of P/E, EV/EBITDA, FCF yield, and price-to-sales — pick the one that matters most and explain why. If the RAW DATA contains a valuation metric the memo ignores, flag it. State the threshold where valuation changes the verdict.
+VALUATION: There are TWO distinct cases — do not confuse them:
+  (a) A valuation metric is PRESENT in the RAW DATA but the memo did not discuss it. In this case, cite the actual value from the RAW DATA and say the memo should incorporate it. Example phrasing: "The data provides price-to-book of 42.98x, which the memo omits."
+  (b) A valuation metric is genuinely ABSENT from the RAW DATA. Only then may you say it is "not in the provided data" and recommend sourcing it. NEVER state a numeric value for a metric that is absent.
+Pick the ONE valuation point that matters most for this stock — do not enumerate every multiple. Before you call any metric "missing," scan the RAW DATA: if a number for it appears there, it is NOT missing — it is available and (at most) underused. State the threshold where valuation flips the verdict.
 
 MACRO: Discuss only the 3-5 most material macro variables for THIS stock. Do not dump every indicator. For each one, explain the transmission mechanism: how does it affect revenue, margins, or the multiple? Check the RAW DATA — if a macro number exists but the memo ignores it, flag it and explain what it means.
 
@@ -494,9 +522,17 @@ def _normalize_section_key(raw: str) -> str:
 def _compact_metrics(metrics: Dict[str, Any]) -> str:
     if not metrics:
         return "Metrics: (none available)"
-    lines = ["Metrics:"]
+    # The header line matters: it tells the reviewer that EVERY field
+    # listed below is available ground truth. This is what stops the
+    # model from labelling a present metric (e.g. price_to_book) as
+    # "missing" — if it's in this list, it is not missing.
+    lines = ["Metrics (ALL values below are available ground truth — "
+             "any metric NOT listed here is the only kind that is "
+             "genuinely absent):"]
     for key in (
+        "name", "sector", "industry",
         "price", "market_cap", "p_e", "forward_pe", "ev_ebitda",
+        "price_to_book", "price_to_sales",
         "gross_margin", "operating_margin", "profit_margin",
         "revenue_growth_yoy", "revenue_growth_3y", "revenue_growth_5y",
         "free_cash_flow", "fcf_yield", "cash_conversion", "roic",
