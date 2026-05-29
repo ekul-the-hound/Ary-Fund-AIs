@@ -84,18 +84,57 @@ def _cmd_index(args: argparse.Namespace) -> int:
 
 
 def _cmd_stats(args: argparse.Namespace) -> int:
-    """Delegate to Indexer.stats — no logic added here."""
+    """Delegate to Indexer.stats — no logic added here.
+
+    ``stats`` reports document/chunk counts from the tracking DB and the
+    vector store. It does NOT embed anything, so we deliberately avoid
+    constructing the default embedder — building it would probe Ollama
+    and, if absent, fall back to sentence-transformers and download the
+    MiniLM model (~90 MB) on first run, which can take far longer than a
+    caller expects from a read-only "stats" command. We build the store
+    directly (it only needs an embedding dimension, not a live embedder)
+    and hand it to the Indexer so no model is ever loaded.
+    """
     try:
         from rag.indexer import Indexer
     except Exception as e:  # noqa: BLE001
         print(f"rag stats: indexer unavailable ({e})", file=sys.stderr)
         return 2
+
+    # Try to build a store WITHOUT an embedder. The default embedding
+    # dimension (768, matching nomic-embed-text) is fine for a count —
+    # stats never compares vectors. If the store can't be opened, fail
+    # fast and cleanly rather than hang.
+    store = None
     try:
-        ix = Indexer(tracking_db_path=args.tracking_db)
+        from rag.vector_store import get_default_store
+
+        store = get_default_store(embedding_dim=768)
+    except Exception as e:  # noqa: BLE001
+        print(f"rag stats: vector store unavailable ({e})", file=sys.stderr)
+        return 2
+
+    # Indexer.__init__ eagerly builds get_default_embedder() unless one
+    # is supplied — and that's the call that probes Ollama / downloads
+    # MiniLM and can hang. stats() never uses the embedder, so we pass a
+    # tiny stub that only exposes the one attribute __init__ reads
+    # (.dimension). No model is loaded, no network call is made.
+    class _StubEmbedder:
+        dimension = 768
+
+    try:
+        ix = Indexer(
+            embedder=_StubEmbedder(), store=store,
+            tracking_db_path=args.tracking_db,
+        )
     except Exception as e:  # noqa: BLE001
         print(f"rag stats: could not build Indexer ({e})", file=sys.stderr)
         return 2
-    out = ix.stats()
+    try:
+        out = ix.stats()
+    except Exception as e:  # noqa: BLE001
+        print(f"rag stats: stats() failed ({e})", file=sys.stderr)
+        return 2
     # Print the same dict the method returns — no formatting beyond that.
     for k, v in (out or {}).items():
         print(f"{k}: {v}")

@@ -101,15 +101,25 @@ class TestSubcommandRouting:
     exit non-zero with a readable message, never a Python traceback."""
 
     def test_stats_without_deps_exits_cleanly(self):
-        # `rag.indexer` and friends are not in this test rig.
+        # "Cleanly" is the contract — NOT "non-zero". The outcome depends
+        # on the environment:
+        #   * deps absent (CI):  stats can't open the store → non-zero
+        #     exit with a readable "rag stats: ..." message.
+        #   * deps present (dev machine with ChromaDB): stats runs and
+        #     prints counts → exit 0.
+        # Either is correct. What must NEVER happen is an uncaught Python
+        # traceback leaking to stderr, or the command hanging. The 30s
+        # subprocess timeout in _run guards the hang case; this asserts
+        # the no-traceback case.
         r = _run(["stats"])
-        # Exit non-zero is correct (the subcommand can't actually run).
-        assert r.returncode != 0
-        # But the error must be a readable message, not an uncaught
-        # ImportError traceback dumped to stderr.
         assert "Traceback" not in r.stderr, (
             f"router leaked a traceback:\n{r.stderr}"
         )
+        # If it failed, the failure must be a readable routed message.
+        if r.returncode != 0:
+            assert "rag stats:" in r.stderr, (
+                f"non-zero exit without a readable message:\n{r.stderr}"
+            )
 
     def test_unknown_subcommand_errors(self):
         r = _run(["bogus"])

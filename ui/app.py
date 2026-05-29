@@ -1238,12 +1238,13 @@ def main() -> None:
 
     render_ticker_header(ticker, prices, context)
 
-    tab_screener, tab_overview, tab_briefing, tab_analyzer, tab_debug = st.tabs(
+    tab_screener, tab_overview, tab_briefing, tab_analyzer, tab_metrics, tab_debug = st.tabs(
         [
             "🔍 Screener",
             "📊 Overview",
             "📝 ARY QUANT Briefing",
             "🔎 Data-Point Analyzer",
+            "📈 Metrics",
             "🛠 Debug",
         ]
     )
@@ -1292,6 +1293,17 @@ def main() -> None:
     # ---------------- ARY QUANT Briefing tab ----------------
     with tab_briefing:
         render_briefing_tab(ticker, context)
+
+    # ---------------- Metrics tab ----------------
+    with tab_metrics:
+        try:
+            from ui.metrics_section import render_metrics_tab
+            render_metrics_tab(config=app_config)
+        except Exception as e:  # pragma: no cover - defensive UI boundary
+            st.error(
+                f"Metrics tab unavailable: {e}. Ensure `ui/metrics_section.py` "
+                "and `data/metrics_db.py` are present."
+            )
 
     # ---------------- Data-Point Analyzer tab ----------------
     with tab_analyzer:
