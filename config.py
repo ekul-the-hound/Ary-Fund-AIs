@@ -161,6 +161,15 @@ AGENT_MODELS: Dict[str, str] = {
     # scaling up to Qwen.
     "dev": "phi3:3.8b",
 
+    # ---- 8B grounding-quality test models (validation pass) ----
+    # phi3:3.8b validated the PIPELINE but hallucinated financial figures
+    # in generated prose (invented P/E, margins, revenue growth that didn't
+    # match the real key_metrics). These ~8B models are large enough to
+    # ground far better and both fit the RTX 2080's ~6.9 GB free VRAM at
+    # Q4. Test with:  python main.py --tickers AAPL --model dev_llama8
+    "dev_llama8": "llama3.1:8b",         # 8.0B, Q4_K_M (~4.9 GB)
+    "dev_qwen8": "qwen3-vl:latest",      # 8.8B, Q4_K_M (~6.1 GB)
+
     # Production target. Will be flipped to "qwen3:14b-instruct" or
     # "qwen3:30b" once hardware/quant thresholds are confirmed.
     # Kept as a placeholder; not active until DEFAULT_AGENT_MODEL == "prod".

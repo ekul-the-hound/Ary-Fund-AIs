@@ -334,8 +334,19 @@ class MacroData:
 
         # --- Recession Signals ---
         try:
+            # FRED's RECPROUSM156N ("Smoothed U.S. Recession Probabilities")
+            # is reported in PERCENTAGE POINTS, e.g. 1.82 means 1.82%, and
+            # 60.0 means 60%. Every downstream consumer in this project,
+            # however, expects a 0.0-1.0 FRACTION (risk_scanner compares it
+            # against thresholds like recession_prob_high=0.6, and
+            # thesis_generator formats it as `{rp * 100:.0f}%`). Without
+            # this conversion, a benign 1.82% reads as 1.82 -> formats as
+            # "182%" AND trips the 0.6 HIGH threshold (1.82 > 0.6), firing
+            # a false HIGH macro-risk flag on every run. Divide by 100 here,
+            # once, so the canonical value is a fraction everywhere.
+            _rec_prob_pct = self.get_series_latest("RECPROUSM156N")
             dashboard["recession_signals"]["recession_probability"] = (
-                self.get_series_latest("RECPROUSM156N")
+                (_rec_prob_pct / 100.0) if _rec_prob_pct is not None else None
             )
             dashboard["recession_signals"]["sahm_rule"] = self.get_series_latest(
                 "SAHMREALTIME"
@@ -696,6 +707,13 @@ class MacroData:
                 continue
             if val is None:
                 continue
+            # RECPROUSM156N comes from FRED in percentage points (e.g. 1.82
+            # = 1.82%). The canonical global.recession_prob field is a
+            # 0.0-1.0 fraction everywhere else, so normalize here too — this
+            # is the secondary ingestion path; the primary one is in
+            # get_macro_dashboard(). Both must agree.
+            if fred_id == "RECPROUSM156N":
+                val = val / 100.0
             self.registry.upsert_point(
                 "global", "global", field,
                 as_of=today, source_id="fred",
