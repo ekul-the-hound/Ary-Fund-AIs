@@ -311,7 +311,19 @@ def _process_ticker(
             context=context,
             tools=["filings", "prices", "macro"],
         )
-        response = base_agent.ask_agent(request, cfg)
+        # Use the instrumented wrapper so this call is captured in
+        # metrics.db (token usage / latency / cost). It returns the exact
+        # same AgentResponse ask_agent would — telemetry is recorded as a
+        # side effect and can never alter the result. Falls back to the
+        # plain call if the metrics module is unavailable for any reason.
+        try:
+            from agent import metrics as _agent_metrics
+
+            response = _agent_metrics.instrumented_ask(
+                request, cfg, agent_name="ticker_analysis", ticker=ticker,
+            )
+        except Exception:  # noqa: BLE001 — telemetry must never break the run
+            response = base_agent.ask_agent(request, cfg)
         # Support both new schema ("key_risks") and legacy ("risks") so mock
         # mode and real LLM responses both produce a valid risk list.
         agent_risks: List[str] = list(

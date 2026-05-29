@@ -50,6 +50,33 @@ SEC_CACHE_DB_PATH: str = str(CACHE_DIR / "sec_cache.db")
 MARKET_CACHE_DB_PATH: str = str(CACHE_DIR / "market_cache.db")
 MACRO_CACHE_DB_PATH: str = str(CACHE_DIR / "macro_cache.db")
 
+# Operational telemetry (agent token usage / latency / cost). Kept in a
+# SEPARATE database from portfolio.db: it's high-write-rate (one row per
+# LLM call) and never joins portfolio state, so isolating it keeps the
+# portfolio DB small and lets telemetry be rotated/wiped independently.
+METRICS_DB_PATH: str = str(DATA_DIR / "metrics.db")
+
+# Notional cost per 1K tokens used by agent.metrics.compute_cost. Local
+# Ollama inference is free, so this is a planning figure — set it to a
+# hosted provider's price to model what this workload would cost on a
+# cloud API. Default $0.0001 / 1K tokens.
+METRICS_COST_PER_1K_TOKENS: float = 0.0001
+
+# ----------------------------------------------------------------------
+# Telemetry alerter thresholds (agent/metrics_alerts.py)
+# ----------------------------------------------------------------------
+# These tune the three built-in alert rules. Set any to 0 / negative to
+# disable that rule. Cooldown prevents Slack spam when a rule keeps
+# tripping — the alerter records each firing and suppresses repeats
+# within the cooldown window.
+ALERT_CONSECUTIVE_FAILURES: int = 5         # N consecutive failures per agent
+ALERT_LATENCY_P95_MS: float = 15_000.0       # qwen3:30b runs ~3.5s, 15s = degraded
+ALERT_LATENCY_WINDOW_MIN: int = 60           # latency rule looks at last hour
+ALERT_MIN_SAMPLES_FOR_LATENCY: int = 10      # don't alert on tiny samples
+ALERT_COST_BUDGET_USD: float = 1.0           # notional daily cost budget
+ALERT_COST_WINDOW_HOURS: int = 24
+ALERT_COOLDOWN_MINUTES: int = 60             # dedup window per (rule, scope)
+
 # Ensure required directories exist on import. Cheap and idempotent.
 for _d in (DATA_DIR, CACHE_DIR, LOG_DIR):
     _d.mkdir(parents=True, exist_ok=True)
