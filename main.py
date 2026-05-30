@@ -257,6 +257,7 @@ def _process_ticker(
     ticker: str,
     db_path: str,
     cfg: Any,
+    peer_stats_all: Optional[Dict[str, Any]] = None,
 ) -> Optional[Dict[str, Any]]:
     """Run the full agent chain for one ticker. Returns the final opinion
     dict on success, ``None`` on failure.
@@ -333,12 +334,26 @@ def _process_ticker(
         )
 
         # 4. Rule-based risk flags (reads the agent's risks).
+        # Slice the precomputed universe peer-stats down to this ticker's
+        # sector and feed it in, so the scanner z-scores against real peers
+        # rather than its hardcoded defaults. Empty slice -> scanner uses
+        # its own sector defaults, exactly as before.
+        _sector = (key_metrics.get("sector") if isinstance(key_metrics, dict) else None)
+        _peer_slice = None
+        if peer_stats_all and _sector:
+            try:
+                from data.peer_stats import peer_stats_for_sector
+                _peer_slice = peer_stats_for_sector(peer_stats_all, _sector) or None
+            except Exception:  # noqa: BLE001
+                _peer_slice = None
+
         risk_flags = risk_scanner.compute_risk_flags(
             ticker=ticker,
             metrics=key_metrics,
             macro=macro,
             agent_risks=agent_risks,
             config=cfg,
+            peer_stats=_peer_slice,
         )
 
         # 5. Heuristic thesis (shape-compatible with future LLM version).
@@ -520,9 +535,19 @@ def main(
             traceback.format_exc(),
         )
 
+    # Compute real sector peer statistics once per run (cached 24h on disk).
+    # These calibrate risk_scanner's sector-relative z-scores against the
+    # actual universe instead of its coarse hardcoded defaults. Best-effort:
+    # on any failure we pass {} and the scanner falls back to its defaults.
+    try:
+        peer_stats_all = pipeline.get_sector_peer_stats(db_path, cfg)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("main | peer stats computation failed: %s; using defaults", exc)
+        peer_stats_all = {}
+
     results: List[Dict[str, Any]] = []
     for ticker in tickers:
-        opinion = _process_ticker(ticker, db_path, cfg)
+        opinion = _process_ticker(ticker, db_path, cfg, peer_stats_all=peer_stats_all)
         if opinion is not None:
             results.append(opinion)
 

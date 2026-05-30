@@ -115,6 +115,46 @@ A compact summary table is printed at the end.
 
 ---
 
+## What’s Not in Scope
+
+ARY QUANT is intentionally focused on **long-term equity research** for a
+student-run hedge fund. The following are explicitly out of scope:
+
+- **High-frequency trading**: No sub-second execution, no order-book
+  management, no market-making (except as research in `avellaneda_stoikov.py`).
+- **Cryptocurrency**: No crypto price feeds, no on-chain data, no blockchain
+  analysis.
+- **Options trading**: Options pricing models (`black_scholes.py`, `sabr.py`,
+  `longstaff_schwartz.py`) are research tools only, not wired into live trading.
+- **Real-time alerting**: `notifiers.py` is a best-effort Slack webhook; no
+  PagerDuty, no SMS, no email fallback.
+- **Cloud deployment**: Everything is local-first; no AWS/GCP/Azure deployment,
+  no containerization (Docker/K8s).
+- **Multi-portfolio support**: Single `portfolio.db`; no support for multiple
+  strategy books or separate risk books.
+- **Automated execution**: No broker integration, no order routing, no position
+  execution; all trades are manual.
+- **Compliance/regs**: No SEC filing automation beyond the EDGAR fetcher, no
+  Form 13F automation, no compliance reporting.
+
+**Research-only modules** (not wired into the main pipeline):
+
+- `monte_carlo.py`, `wavelet_regimes.py`, `lyapunov.py`, `lempel_ziv.py`,
+  `fft_analysis.py`
+- `ergodicity.py`, `sandpile.py`, `omori.py`, `girsanov.py`, `gan_synthetic.py`
+- `wave_function_collapse.py`, `yield_curve_3d.py`
+
+**Experimental modules** (use with caution):
+
+- Hawkes process (`poisson.py`) — MLE can be unstable on thin data.
+- HMM regime (`regime_hmm.py`) — `hmmlearn` is optional, degrades gracefully.
+- GARCH forecast (`volatility.py`) — the `arch` package is optional.
+
+See `MODULE_STATUS.md` for the full production / experimental / research-only
+classification.
+
+---
+
 ## Data Layer
 
 ### DataRegistry (`data_registry.py`)

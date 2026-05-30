@@ -1393,6 +1393,70 @@ class DataPipeline:
 
 
 # ---------------------------------------------------------------------------
+# Sector peer statistics (risk_scanner calibration)
+# ---------------------------------------------------------------------------
+
+def get_sector_peer_stats(
+    db_path: str,
+    cfg,
+    *,
+    max_age_hours: float = 24.0,
+    force: bool = False,
+) -> dict:
+    """Return real per-sector peer statistics for risk_scanner calibration.
+
+    This is the bridge between the universe's actual fundamentals and the
+    sector-relative z-scores in ``agent/risk_scanner``. It computes, per
+    sector and per z-scored metric, the real mean/std/n across the
+    universe, so ``compute_risk_flags`` can be called with ``peer_stats=``
+    derived from *this* universe instead of the module's coarse hardcoded
+    defaults.
+
+    The metric snapshots are produced by the SAME code path the scanner
+    consumes (``build_agent_context`` -> ``extract_key_metrics_for_agent``),
+    so the peer distribution is defined identically to the value being
+    z-scored — no formula drift.
+
+    Expensive (one context build per universe ticker), so results are
+    cached to ``data/peer_stats_cache.json`` for ``max_age_hours``. Returns
+    the full ``{sector: {metric: {mean, std, n}}}`` map; callers slice it
+    per-ticker with ``peer_stats.peer_stats_for_sector(...)``.
+
+    Degrades to ``{}`` (scanner then uses its own defaults) if the
+    peer_stats module is unavailable.
+    """
+    try:
+        from data import peer_stats as _peer_stats
+        from agent.filing_analyzer import extract_key_metrics_for_agent
+    except Exception as e:  # noqa: BLE001
+        logger.warning("peer stats unavailable (%s); scanner uses defaults", e)
+        return {}
+
+    data_dir = str(getattr(cfg, "DATA_DIR", "data"))
+
+    def _metrics_for(tk: str):
+        # Build the same metric snapshot the scanner sees for this ticker.
+        try:
+            ctx = build_agent_context(tk, db_path, cfg)
+            metrics_raw = ctx.get("metrics") or {}
+            prices = ctx.get("prices") or {}
+            price = ctx.get("price") or prices.get("last") or prices.get("price") or 0.0
+            snap = extract_key_metrics_for_agent(tk, metrics_raw, float(price or 0.0))
+            # Ensure the sector tag is present for bucketing.
+            if isinstance(snap, dict) and not snap.get("sector"):
+                snap["sector"] = metrics_raw.get("sector")
+            return snap
+        except Exception as e:  # noqa: BLE001 — one ticker must not abort calibration
+            logger.debug("peer stats | %s | snapshot failed: %s", tk, e)
+            return None
+
+    return _peer_stats.get_or_compute_peer_stats(
+        _metrics_for, config=cfg, data_dir=data_dir,
+        max_age_hours=max_age_hours, force=force,
+    )
+
+
+# ---------------------------------------------------------------------------
 # CLI entry point
 # ---------------------------------------------------------------------------
 if __name__ == "__main__":
