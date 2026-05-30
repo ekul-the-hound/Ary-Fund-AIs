@@ -1,13 +1,28 @@
 """
 tests/test_essay_metrics.py
 ===========================
-Verifies that ``thesis_essay.generate_thesis_essay`` records a telemetry
-row through the observability layer for every essay it produces — mock,
-live success, and live failure — without changing essay behaviour or
-breaking when telemetry itself fails.
+Verifies that ``agent.thesis_essay.generate_thesis_essay`` records a
+telemetry row for every real (non-mock) LLM call, labeled
+``agent_name="thesis_essay"``, and that a telemetry failure can never
+break essay generation.
 
-All tests point the metrics writer at a temp DB and stub the Ollama text
-call, so no server and no real inference are needed.
+The essay module does not route through ``base_agent.ask_agent`` — it
+owns a private ``_call_ollama_text`` path — so the observability layer
+reaches it via the ``metrics.record_metrics`` escape hatch rather than
+``instrumented_ask``. These tests exercise that wiring at its real seam:
+
+* ``_call_ollama_text`` is monkeypatched to canned text, so no Ollama
+  server is needed and the test is deterministic.
+* A fake config forces a non-"mock" model so the instrumented branch
+  (not the deterministic fallback) runs.
+* ``metrics.record_metrics`` is patched to a spy so we can assert on the
+  exact dict the production code hands it — without touching any real
+  metrics.db.
+
+One integration test patches ``metrics_db._default_db_path`` to a temp
+file and reads the row back through the real DB layer, proving the
+record actually lands in the ``agent_metrics`` table with the right
+agent label.
 """
 from __future__ import annotations
 
@@ -16,96 +31,248 @@ import tempfile
 
 import pytest
 
-import config
+from agent import thesis_essay
+from agent import metrics as agent_metrics
 from data import metrics_db
-import agent.metrics as agent_metrics
-import agent.thesis_essay as thesis_essay
+
+
+# ----------------------------------------------------------------------
+# Fixtures
+# ----------------------------------------------------------------------
+class _FakeConfig:
+    """Minimal config that resolves to a real (non-mock) model so the
+    instrumented Ollama branch runs. ``AGENT_MODELS`` maps the default
+    tag to a non-"mock" string; ``_resolve_model`` returns that string,
+    which makes ``generate_thesis_essay`` take the ``_call_ollama_text``
+    path instead of the deterministic fallback."""
+
+    DEFAULT_AGENT_MODEL = "prod"
+    AGENT_MODELS = {"prod": "qwen3:30b", "mock": "mock"}
+    OLLAMA_BASE_URL = "http://localhost:11434"
+    AGENT_TIMEOUT = 30
+    MAX_TOKENS = 4096
+    METRICS_COST_PER_1K_TOKENS = 0.0001
 
 
 @pytest.fixture
-def tmp_metrics_db(monkeypatch):
-    fd, path = tempfile.mkstemp(suffix=".db")
-    os.close(fd)
-    metrics_db.create_metrics_table(path)
-    # Route every record_metrics write to this temp DB.
-    real_insert = metrics_db.insert_metric
+def fake_config():
+    return _FakeConfig()
+
+
+@pytest.fixture
+def essay_inputs():
+    """The six content inputs ``generate_thesis_essay`` needs. Values are
+    only ever interpolated into the prompt string, so light stubs are
+    fine — the LLM call itself is mocked."""
+    thesis = {
+        "ticker": "AAPL",
+        "outlook": "bullish",
+        "price_direction": "moderate_up",
+        "confidence": 0.6,
+        "bias_score": 0.3,
+        "key_risks": ["valuation"],
+        "key_opportunities": ["services growth"],
+        "rationale": "Services mix expanding; balance sheet strong.",
+        "short_rationale": "AAPL: bullish",
+        "valuation": {"current_price": 190.0, "missing_inputs": []},
+    }
+    metrics_in = {
+        "sector": "Technology",
+        "revenue_growth_3y": 0.08,
+        "debt_ebitda": 1.2,
+        "fcf_yield": 0.04,
+    }
+    macro = {"as_of": "2026-05-30", "regime": "expansion"}
+    risk_flags = {"levels": {"combined": "MEDIUM"}}
+    filings = {"management_tone": "confident", "red_flags": [], "by_year": {}}
+    return thesis, filings, metrics_in, macro, risk_flags
+
+
+# A long canned essay so the >150-word success guard in
+# generate_thesis_essay passes.
+_CANNED_ESSAY = " ".join(["AAPL"] + ["word"] * 400)
+
+
+# ----------------------------------------------------------------------
+# Spy helper
+# ----------------------------------------------------------------------
+class _RecordSpy:
+    """Captures every record_metrics call's first positional arg (the
+    metadata dict)."""
+
+    def __init__(self):
+        self.calls: list[dict] = []
+
+    def __call__(self, call_metadata, *args, **kwargs):
+        self.calls.append(dict(call_metadata))
+        return 1  # mimic the real return type (row id)
+
+
+# ----------------------------------------------------------------------
+# Tests
+# ----------------------------------------------------------------------
+def test_essay_records_metrics_on_success(monkeypatch, fake_config, essay_inputs):
+    """A successful essay generation records exactly one telemetry row."""
+    thesis, filings, metrics_in, macro, risk_flags = essay_inputs
+
     monkeypatch.setattr(
-        agent_metrics.metrics_db, "insert_metric",
-        lambda rec, db_path=None: real_insert(rec, db_path=path),
+        thesis_essay, "_call_ollama_text", lambda **kw: _CANNED_ESSAY
     )
-    yield path
-    try:
-        if os.path.exists(path):
-            os.unlink(path)
-    except (PermissionError, OSError):
-        pass
+    spy = _RecordSpy()
+    # The module imported metrics as a name; patch the attribute it uses.
+    monkeypatch.setattr(thesis_essay._metrics, "record_metrics", spy)
 
-
-def _args():
-    return dict(
+    out = thesis_essay.generate_thesis_essay(
         ticker="AAPL",
-        thesis={"outlook": "neutral", "direction": "flat"},
-        filings_summary={},
-        metrics={"name": "Apple Inc.", "ticker": "AAPL", "p_e": 37.7},
-        macro={},
-        risk_flags={},
+        thesis=thesis,
+        filings_summary=filings,
+        metrics=metrics_in,
+        macro=macro,
+        risk_flags=risk_flags,
+        config=fake_config,
     )
 
-
-class _MockCfg:
-    DEFAULT_AGENT_MODEL = "mock"
-    AGENT_MODELS = {"mock": "mock"}
+    assert out["fallback"] is False
+    assert len(spy.calls) == 1
 
 
-class TestEssayMetricRecording:
-    def test_mock_mode_records_row(self, tmp_metrics_db):
-        out = thesis_essay.generate_thesis_essay(config=_MockCfg, **_args())
-        assert out["text"]  # essay still produced
-        rows = metrics_db.get_metrics(db_path=tmp_metrics_db)
+def test_essay_metric_has_agent_name_and_ticker(
+    monkeypatch, fake_config, essay_inputs
+):
+    """The recorded row is labeled agent_name='thesis_essay' and carries
+    the ticker, model, token estimates, latency, and success flag."""
+    thesis, filings, metrics_in, macro, risk_flags = essay_inputs
+
+    monkeypatch.setattr(
+        thesis_essay, "_call_ollama_text", lambda **kw: _CANNED_ESSAY
+    )
+    spy = _RecordSpy()
+    monkeypatch.setattr(thesis_essay._metrics, "record_metrics", spy)
+
+    thesis_essay.generate_thesis_essay(
+        ticker="AAPL",
+        thesis=thesis,
+        filings_summary=filings,
+        metrics=metrics_in,
+        macro=macro,
+        risk_flags=risk_flags,
+        config=fake_config,
+    )
+
+    rec = spy.calls[0]
+    assert rec["agent_name"] == "thesis_essay"
+    assert rec["ticker"] == "AAPL"
+    assert rec["model"] == "qwen3:30b"
+    assert rec["success"] is True
+    assert rec["error_message"] is None
+    assert rec["prompt_tokens"] > 0
+    assert rec["completion_tokens"] > 0
+    assert rec["latency_ms"] >= 0
+
+
+def test_essay_records_failure_metric(monkeypatch, fake_config, essay_inputs):
+    """When the LLM call raises, the failure is recorded with success=False
+    and a non-empty error_message, and the essay still returns (fallback)."""
+    thesis, filings, metrics_in, macro, risk_flags = essay_inputs
+
+    def _boom(**kw):
+        raise RuntimeError("ollama unreachable")
+
+    monkeypatch.setattr(thesis_essay, "_call_ollama_text", _boom)
+    spy = _RecordSpy()
+    monkeypatch.setattr(thesis_essay._metrics, "record_metrics", spy)
+
+    out = thesis_essay.generate_thesis_essay(
+        ticker="AAPL",
+        thesis=thesis,
+        filings_summary=filings,
+        metrics=metrics_in,
+        macro=macro,
+        risk_flags=risk_flags,
+        config=fake_config,
+    )
+
+    # Essay generation survived via deterministic fallback.
+    assert out["fallback"] is True
+    assert isinstance(out["text"], str) and len(out["text"]) > 0
+
+    # A failure metric was recorded.
+    assert len(spy.calls) == 1
+    rec = spy.calls[0]
+    assert rec["agent_name"] == "thesis_essay"
+    assert rec["success"] is False
+    assert "ollama unreachable" in (rec["error_message"] or "")
+
+
+def test_essay_survives_telemetry_failure(monkeypatch, fake_config, essay_inputs):
+    """If record_metrics itself raises, essay generation must NOT break —
+    telemetry is best-effort and the caller gets a valid essay."""
+    thesis, filings, metrics_in, macro, risk_flags = essay_inputs
+
+    monkeypatch.setattr(
+        thesis_essay, "_call_ollama_text", lambda **kw: _CANNED_ESSAY
+    )
+
+    def _explode(call_metadata, *a, **k):
+        raise RuntimeError("metrics db locked")
+
+    monkeypatch.setattr(thesis_essay._metrics, "record_metrics", _explode)
+
+    out = thesis_essay.generate_thesis_essay(
+        ticker="AAPL",
+        thesis=thesis,
+        filings_summary=filings,
+        metrics=metrics_in,
+        macro=macro,
+        risk_flags=risk_flags,
+        config=fake_config,
+    )
+
+    # The essay is the real (non-fallback) LLM output despite telemetry
+    # blowing up — the try/except around record_metrics absorbed it.
+    assert out["fallback"] is False
+    assert out["text"] == _CANNED_ESSAY
+
+
+def test_essay_metric_lands_in_db(monkeypatch, fake_config, essay_inputs):
+    """Integration: drive the real record_metrics -> metrics_db path against
+    a temp DB and read the row back, confirming agent_name='thesis_essay'
+    actually persists to the agent_metrics table."""
+    thesis, filings, metrics_in, macro, risk_flags = essay_inputs
+
+    fd, db_path = tempfile.mkstemp(suffix=".db")
+    os.close(fd)
+    metrics_db.create_metrics_table(db_path)
+    # Force every default-path lookup in the DB layer to our temp file.
+    monkeypatch.setattr(metrics_db, "_default_db_path", lambda: db_path)
+
+    monkeypatch.setattr(
+        thesis_essay, "_call_ollama_text", lambda **kw: _CANNED_ESSAY
+    )
+
+    try:
+        thesis_essay.generate_thesis_essay(
+            ticker="AAPL",
+            thesis=thesis,
+            filings_summary=filings,
+            metrics=metrics_in,
+            macro=macro,
+            risk_flags=risk_flags,
+            config=fake_config,
+        )
+
+        rows = metrics_db.get_metrics(
+            agent_name="thesis_essay", since_days=1, db_path=db_path
+        )
         assert len(rows) == 1
-        assert rows[0]["agent_name"] == "thesis_essay"
-        assert rows[0]["ticker"] == "AAPL"
-
-    def test_live_success_records_success(self, tmp_metrics_db, monkeypatch):
-        class Cfg:
-            DEFAULT_AGENT_MODEL = "dev"
-            AGENT_MODELS = {"dev": "phi3:3.8b"}
-        # Stub the Ollama text call with a long-enough essay.
-        monkeypatch.setattr(
-            thesis_essay, "_call_ollama_text",
-            lambda prompt, model_name, config: "word " * 400,
-        )
-        out = thesis_essay.generate_thesis_essay(config=Cfg, **_args())
-        assert not out["fallback"]
-        row = metrics_db.get_metrics(db_path=tmp_metrics_db)[0]
+        row = rows[0]
         assert row["agent_name"] == "thesis_essay"
-        assert row["success"] == 1
-        assert row["model"] == "phi3:3.8b"
-        # token counts are estimated, so just assert they're populated
-        assert row["prompt_tokens"] and row["completion_tokens"]
-
-    def test_live_failure_records_failure(self, tmp_metrics_db, monkeypatch):
-        class Cfg:
-            DEFAULT_AGENT_MODEL = "dev"
-            AGENT_MODELS = {"dev": "phi3:3.8b"}
-
-        def _boom(prompt, model_name, config):
-            raise ConnectionError("no ollama")
-
-        monkeypatch.setattr(thesis_essay, "_call_ollama_text", _boom)
-        out = thesis_essay.generate_thesis_essay(config=Cfg, **_args())
-        assert out["fallback"]  # deterministic fallback used
-        row = metrics_db.get_metrics(db_path=tmp_metrics_db)[0]
-        assert row["agent_name"] == "thesis_essay"
-        assert row["success"] == 0
-        assert row["model"].endswith("(failed)")
-
-    def test_telemetry_failure_does_not_break_essay(self, tmp_metrics_db, monkeypatch):
-        # If record_metrics raises, the essay must still be returned.
-        monkeypatch.setattr(
-            agent_metrics, "record_metrics",
-            lambda *a, **k: (_ for _ in ()).throw(RuntimeError("disk full")),
-        )
-        out = thesis_essay.generate_thesis_essay(config=_MockCfg, **_args())
-        assert out["text"]
-        assert "word_count" in out
+        assert row["ticker"] == "AAPL"
+        # Derived fields filled by record_metrics.
+        assert row["total_tokens"] == row["prompt_tokens"] + row["completion_tokens"]
+        assert row["cost_usd"] is not None
+    finally:
+        try:
+            os.unlink(db_path)
+        except (PermissionError, OSError):
+            pass

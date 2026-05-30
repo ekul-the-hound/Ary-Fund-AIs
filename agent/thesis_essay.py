@@ -56,6 +56,7 @@ import logging
 import time
 from typing import Any, Dict, List, Optional
 
+from agent import metrics as _metrics  # aliased: 'metrics' is shadowed by a param below
 from agent.base_agent import AgentRequest, _estimate_tokens, _resolve_model
 
 
@@ -150,17 +151,39 @@ def generate_thesis_essay(
             risk_flags=risk_flags,
         )
         elapsed_ms = (time.perf_counter() - started_at) * 1000.0
-        return _wrap(text, model_used="mock", elapsed_ms=elapsed_ms, fallback=True,
-                     ticker=ticker, prompt=prompt, config=config)
+        return _wrap(text, model_used="mock", elapsed_ms=elapsed_ms, fallback=True)
 
     # Real Ollama path. Text-mode, not JSON-mode.
     try:
+        call_start = time.perf_counter()
         text = _call_ollama_text(prompt=prompt, model_name=model_used, config=config)
+        call_elapsed_ms = (time.perf_counter() - call_start) * 1000.0
+        
         if not text or len(text.split()) < 150:
             # Model returned nothing useful (empty, truncated, or refused).
             raise RuntimeError(
                 f"LLM returned too-short essay ({len(text.split()) if text else 0} words)"
             )
+        
+        # Record metrics for the LLM call (non-fatal if it fails).
+        try:
+            prompt_tokens = _estimate_tokens(prompt)
+            completion_tokens = _estimate_tokens(text)
+            _metrics.record_metrics(
+                {
+                    "agent_name": "thesis_essay",
+                    "ticker": ticker,
+                    "model": model_used,
+                    "prompt_tokens": prompt_tokens,
+                    "completion_tokens": completion_tokens,
+                    "latency_ms": call_elapsed_ms,
+                    "success": True,
+                    "error_message": None,
+                }
+            )
+        except Exception as e:  # noqa: BLE001
+            logger.debug("thesis_essay metrics recording failed (non-fatal): %s", e)
+        
         elapsed_ms = (time.perf_counter() - started_at) * 1000.0
         logger.info(
             "thesis_essay | %s | model=%s | words=%d | elapsed_ms=%.0f",
@@ -169,14 +192,30 @@ def generate_thesis_essay(
             len(text.split()),
             elapsed_ms,
         )
-        return _wrap(text, model_used=model_used, elapsed_ms=elapsed_ms, fallback=False,
-                     ticker=ticker, prompt=prompt, config=config)
+        return _wrap(text, model_used=model_used, elapsed_ms=elapsed_ms, fallback=False)
     except Exception as exc:  # noqa: BLE001
         logger.warning(
             "thesis_essay | %s | LLM call failed: %s -> deterministic fallback",
             ticker,
             exc,
         )
+        # Record the failed metrics attempt as well.
+        try:
+            _metrics.record_metrics(
+                {
+                    "agent_name": "thesis_essay",
+                    "ticker": ticker,
+                    "model": f"{model_used} (failed)",
+                    "prompt_tokens": _estimate_tokens(prompt),
+                    "completion_tokens": 0,
+                    "latency_ms": (time.perf_counter() - started_at) * 1000.0,
+                    "success": False,
+                    "error_message": str(exc),
+                }
+            )
+        except Exception as e:  # noqa: BLE001
+            logger.debug("thesis_essay metrics recording failed on exception path (non-fatal): %s", e)
+        
         text = _deterministic_fallback_essay(
             ticker=ticker,
             thesis=thesis,
@@ -191,9 +230,6 @@ def generate_thesis_essay(
             model_used=f"{model_used} (failed)",
             elapsed_ms=elapsed_ms,
             fallback=True,
-            ticker=ticker,
-            prompt=prompt,
-            config=config,
         )
 
 
@@ -696,78 +732,16 @@ def _deterministic_fallback_essay(
 # =============================================================================
 
 def _wrap(
-    text: str,
-    model_used: str,
-    elapsed_ms: float,
-    fallback: bool,
-    *,
-    ticker: Optional[str] = None,
-    prompt: Optional[str] = None,
-    config: Any = None,
+    text: str, model_used: str, elapsed_ms: float, fallback: bool
 ) -> Dict[str, Any]:
-    """Normalise the essay return shape, and record telemetry as a side effect.
-
-    All three essay return paths (mock, Ollama success, Ollama failure)
-    funnel through here, so this is the one place that needs to record a
-    metrics row — which is why ticker/prompt/config are accepted as
-    keyword-only extras (defaulting to None so older call sites, and tests
-    that call _wrap directly, keep working untouched).
-
-    The essay uses Ollama's /api/generate endpoint via _call_ollama_text,
-    which discards prompt_eval_count/eval_count, so token counts are
-    ESTIMATED from the prompt and output text rather than read from the
-    response. Telemetry is best-effort and can never break essay return.
-    """
-    out = {
+    """Normalise the essay return shape."""
+    return {
         "text": text,
         "model_used": model_used,
         "elapsed_ms": round(elapsed_ms, 1),
         "fallback": fallback,
         "word_count": len(text.split()),
     }
-    _record_essay_metric(
-        ticker=ticker, prompt=prompt, text=text,
-        model_used=model_used, elapsed_ms=elapsed_ms, config=config,
-    )
-    return out
-
-
-def _record_essay_metric(
-    ticker: Optional[str],
-    prompt: Optional[str],
-    text: str,
-    model_used: str,
-    elapsed_ms: float,
-    config: Any,
-) -> None:
-    """Persist one thesis_essay telemetry row. Best-effort; never raises.
-
-    success is inferred the same way the observability layer infers it
-    elsewhere: a model_used ending in "(failed)" means the call fell back
-    to the deterministic essay. Mock runs are recorded too (model "mock"),
-    so the metrics tab reflects every essay produced, not just live ones.
-    """
-    try:
-        from agent import metrics as _agent_metrics
-
-        prompt_tokens = _estimate_tokens(prompt) if prompt else None
-        completion_tokens = _estimate_tokens(text) if text else None
-        failed = model_used.endswith("(failed)")
-        _agent_metrics.record_metrics(
-            {
-                "agent_name": "thesis_essay",
-                "model": model_used,
-                "ticker": ticker,
-                "prompt_tokens": prompt_tokens,
-                "completion_tokens": completion_tokens,
-                "latency_ms": round(elapsed_ms, 1),
-                "success": not failed,
-                "error_message": "deterministic fallback used" if failed else None,
-            },
-            config=config,
-        )
-    except Exception as exc:  # noqa: BLE001 — telemetry must never break the essay
-        logger.warning("thesis_essay | metrics record failed (non-fatal): %s", exc)
 
 
 def _as_float(x: Any) -> Optional[float]:

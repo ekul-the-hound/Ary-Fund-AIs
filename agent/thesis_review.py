@@ -65,9 +65,10 @@ import json
 import logging
 import re
 import time
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List
 
-from agent.base_agent import AgentRequest, _resolve_model, _estimate_tokens
+from agent import metrics as _metrics  # aliased: 'metrics' is shadowed by a param below
+from agent.base_agent import AgentRequest, _estimate_tokens, _resolve_model
 
 
 logger = logging.getLogger(__name__)
@@ -140,28 +141,65 @@ def review_essay(
         text = _deterministic_review(ticker, essay_text, metrics, macro)
         elapsed_ms = (time.perf_counter() - started_at) * 1000.0
         scores = _extract_scores(text)
-        return _wrap(text, scores, model_used="mock", elapsed_ms=elapsed_ms, fallback=True,
-                     ticker=ticker, prompt=prompt, config=config)
+        return _wrap(text, scores, model_used="mock", elapsed_ms=elapsed_ms, fallback=True)
 
     try:
+        call_start = time.perf_counter()
         text = _call_ollama_text(prompt, model_used, config, temperature=_REVIEW_TEMPERATURE)
+        call_elapsed_ms = (time.perf_counter() - call_start) * 1000.0
+        
         if not text or len(text.split()) < 200:
             raise RuntimeError(f"Review too short ({len(text.split()) if text else 0} words)")
+        
+        # Record metrics for the review call (non-fatal if it fails).
+        try:
+            prompt_tokens = _estimate_tokens(prompt)
+            completion_tokens = _estimate_tokens(text)
+            _metrics.record_metrics(
+                {
+                    "agent_name": "thesis_review",
+                    "ticker": ticker,
+                    "model": model_used,
+                    "prompt_tokens": prompt_tokens,
+                    "completion_tokens": completion_tokens,
+                    "latency_ms": call_elapsed_ms,
+                    "success": True,
+                    "error_message": None,
+                }
+            )
+        except Exception as e:  # noqa: BLE001
+            logger.debug("thesis_review metrics recording failed (non-fatal): %s", e)
+        
         elapsed_ms = (time.perf_counter() - started_at) * 1000.0
         scores = _extract_scores(text)
         logger.info(
             "thesis_review | %s | model=%s | overall=%.1f | words=%d | elapsed_ms=%.0f",
             ticker, model_used, scores.get("overall", 0), len(text.split()), elapsed_ms,
         )
-        return _wrap(text, scores, model_used=model_used, elapsed_ms=elapsed_ms, fallback=False,
-                     ticker=ticker, prompt=prompt, config=config)
+        return _wrap(text, scores, model_used=model_used, elapsed_ms=elapsed_ms, fallback=False)
     except Exception as exc:
         logger.warning("thesis_review | %s | LLM failed: %s -> fallback", ticker, exc)
+        # Record the failed metrics attempt.
+        try:
+            _metrics.record_metrics(
+                {
+                    "agent_name": "thesis_review",
+                    "ticker": ticker,
+                    "model": f"{model_used} (failed)",
+                    "prompt_tokens": _estimate_tokens(prompt),
+                    "completion_tokens": 0,
+                    "latency_ms": (time.perf_counter() - started_at) * 1000.0,
+                    "success": False,
+                    "error_message": str(exc),
+                }
+            )
+        except Exception as e:  # noqa: BLE001
+            logger.debug("thesis_review metrics recording failed on exception path (non-fatal): %s", e)
+        
         text = _deterministic_review(ticker, essay_text, metrics, macro)
         elapsed_ms = (time.perf_counter() - started_at) * 1000.0
         scores = _extract_scores(text)
-        return _wrap(text, scores, model_used=f"{model_used} (failed)", elapsed_ms=elapsed_ms, fallback=True,
-                     ticker=ticker, prompt=prompt, config=config)
+        return _wrap(text, scores, model_used=f"{model_used} (failed)", elapsed_ms=elapsed_ms, fallback=True)
 
 
 def revise_essay(
@@ -186,10 +224,6 @@ def revise_essay(
 
     if model_used == "mock":
         elapsed_ms = (time.perf_counter() - started_at) * 1000.0
-        _record_review_metric(
-            agent_name="thesis_revision", ticker=ticker, prompt=prompt,
-            text=original_essay, model_used="mock", elapsed_ms=elapsed_ms, config=config,
-        )
         return {
             "text": original_essay,
             "model_used": "mock",
@@ -200,7 +234,10 @@ def revise_essay(
         }
 
     try:
+        call_start = time.perf_counter()
         text = _call_ollama_text(prompt, model_used, config, temperature=_REVISION_TEMPERATURE)
+        call_elapsed_ms = (time.perf_counter() - call_start) * 1000.0
+        
         # The revision is an improved REWRITE of the original essay, so it
         # should be at least roughly as long as what it replaces — not some
         # fixed absolute count. The old fixed 1400-word floor was tuned for
@@ -218,14 +255,30 @@ def revise_essay(
                 f"Revision too short ({revision_words} words < "
                 f"{min_words} floor; original was {original_words})"
             )
+        
+        # Record metrics for the revision call (non-fatal if it fails).
+        try:
+            prompt_tokens = _estimate_tokens(prompt)
+            completion_tokens = _estimate_tokens(text)
+            _metrics.record_metrics(
+                {
+                    "agent_name": "thesis_review",  # same agent, revision pass
+                    "ticker": ticker,
+                    "model": model_used,
+                    "prompt_tokens": prompt_tokens,
+                    "completion_tokens": completion_tokens,
+                    "latency_ms": call_elapsed_ms,
+                    "success": True,
+                    "error_message": None,
+                }
+            )
+        except Exception as e:  # noqa: BLE001
+            logger.debug("thesis_review (revision) metrics recording failed (non-fatal): %s", e)
+        
         elapsed_ms = (time.perf_counter() - started_at) * 1000.0
         logger.info(
             "thesis_review | %s | revision | model=%s | words=%d | elapsed_ms=%.0f",
             ticker, model_used, len(text.split()), elapsed_ms,
-        )
-        _record_review_metric(
-            agent_name="thesis_revision", ticker=ticker, prompt=prompt,
-            text=text, model_used=model_used, elapsed_ms=elapsed_ms, config=config,
         )
         return {
             "text": text,
@@ -237,12 +290,24 @@ def revise_essay(
         }
     except Exception as exc:
         logger.warning("thesis_review | %s | revision failed: %s -> keeping original", ticker, exc)
+        # Record the failed revision attempt.
+        try:
+            _metrics.record_metrics(
+                {
+                    "agent_name": "thesis_review",
+                    "ticker": ticker,
+                    "model": f"{model_used} (failed)",
+                    "prompt_tokens": _estimate_tokens(prompt),
+                    "completion_tokens": 0,
+                    "latency_ms": (time.perf_counter() - started_at) * 1000.0,
+                    "success": False,
+                    "error_message": str(exc),
+                }
+            )
+        except Exception as e:  # noqa: BLE001
+            logger.debug("thesis_review (revision) metrics recording failed on exception path (non-fatal): %s", e)
+        
         elapsed_ms = (time.perf_counter() - started_at) * 1000.0
-        _record_review_metric(
-            agent_name="thesis_revision", ticker=ticker, prompt=prompt,
-            text=original_essay, model_used=f"{model_used} (failed)",
-            elapsed_ms=elapsed_ms, config=config,
-        )
         return {
             "text": original_essay,
             "model_used": f"{model_used} (failed)",
@@ -796,12 +861,8 @@ def _wrap(
     model_used: str,
     elapsed_ms: float,
     fallback: bool,
-    *,
-    ticker: Optional[str] = None,
-    prompt: Optional[str] = None,
-    config: Any = None,
 ) -> Dict[str, Any]:
-    out = {
+    return {
         "text": text,
         "scores": scores,
         "overall_score": scores.get("overall", 5.0),
@@ -810,45 +871,3 @@ def _wrap(
         "fallback": fallback,
         "word_count": len(text.split()),
     }
-    _record_review_metric(
-        agent_name="thesis_review", ticker=ticker, prompt=prompt, text=text,
-        model_used=model_used, elapsed_ms=elapsed_ms, config=config,
-    )
-    return out
-
-
-def _record_review_metric(
-    agent_name: str,
-    ticker: Optional[str],
-    prompt: Optional[str],
-    text: str,
-    model_used: str,
-    elapsed_ms: float,
-    config: Any,
-) -> None:
-    """Persist one telemetry row for the review or revision pass.
-
-    Best-effort; never raises. Token counts are ESTIMATED (the review uses
-    Ollama's /api/generate via _call_ollama_text, which discards the
-    server-side token counts). success is inferred from a "(failed)"
-    suffix on model_used, matching the rest of the observability layer.
-    """
-    try:
-        from agent import metrics as _agent_metrics
-
-        failed = model_used.endswith("(failed)")
-        _agent_metrics.record_metrics(
-            {
-                "agent_name": agent_name,
-                "model": model_used,
-                "ticker": ticker,
-                "prompt_tokens": _estimate_tokens(prompt) if prompt else None,
-                "completion_tokens": _estimate_tokens(text) if text else None,
-                "latency_ms": round(elapsed_ms, 1),
-                "success": not failed,
-                "error_message": "deterministic fallback used" if failed else None,
-            },
-            config=config,
-        )
-    except Exception as exc:  # noqa: BLE001 — telemetry must never break review
-        logger.warning("thesis_review | metrics record failed (non-fatal): %s", exc)
