@@ -22,6 +22,9 @@ It is safe and surgical:
 
 Run from the project root:
     python fix_recession_prob.py
+
+STATUS: Operational script — safe to delete after cleanup. Idempotent;
+        not part of runtime contracts.
 """
 from __future__ import annotations
 

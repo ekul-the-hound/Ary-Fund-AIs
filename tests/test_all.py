@@ -5172,5 +5172,258 @@ def test_empty_registry_does_not_raise(
     assert ctx["portfolio"] == {}
 
 
+# =============================================================================
+# 17. test_essay_metrics.py + test_review_metrics.py  (MERGED)
+# =============================================================================
+# Verifies that the thesis_essay and thesis_review paths — which own a
+# private ``_call_ollama_text`` and do NOT route through
+# ``base_agent.ask_agent`` — record telemetry via the
+# ``metrics.record_metrics`` escape hatch, labeled with the right
+# ``agent_name``, and that telemetry failures never break generation.
+#
+# Helpers/fixtures are scoped inside each class (nested) to avoid any
+# module-level name collision in this consolidated file.
+
+from agent import thesis_essay as _te
+from agent import thesis_review as _tr
+from data import metrics_db as _metrics_db
+
+
+class _MetricsFakeConfig:
+    """Resolves to a real (non-'mock') model so the instrumented Ollama
+    branch runs instead of the deterministic fallback."""
+
+    DEFAULT_AGENT_MODEL = "prod"
+    AGENT_MODELS = {"prod": "qwen3:30b", "mock": "mock"}
+    OLLAMA_BASE_URL = "http://localhost:11434"
+    AGENT_TIMEOUT = 30
+    MAX_TOKENS = 4096
+    METRICS_COST_PER_1K_TOKENS = 0.0001
+
+
+class _MetricsRecordSpy:
+    """Captures each record_metrics call's metadata dict."""
+
+    def __init__(self):
+        self.calls: list[dict] = []
+
+    def __call__(self, call_metadata, *args, **kwargs):
+        self.calls.append(dict(call_metadata))
+        return 1  # mimic the real return type (row id)
+
+
+# Long enough to clear the essay's >150-word success guard.
+_CANNED_ESSAY = " ".join(["AAPL"] + ["word"] * 400)
+# Long enough to clear the review's >=200-word guard; leading score line
+# so _extract_scores has something to parse.
+_CANNED_REVIEW = "Thesis Quality: 8/10\n" + " ".join(["critique"] * 300)
+
+
+class TestEssayMetrics:
+    """thesis_essay.generate_thesis_essay records labeled telemetry."""
+
+    @staticmethod
+    def _inputs():
+        thesis = {
+            "ticker": "AAPL",
+            "outlook": "bullish",
+            "price_direction": "moderate_up",
+            "confidence": 0.6,
+            "bias_score": 0.3,
+            "key_risks": ["valuation"],
+            "key_opportunities": ["services growth"],
+            "rationale": "Services mix expanding; balance sheet strong.",
+            "short_rationale": "AAPL: bullish",
+            "valuation": {"current_price": 190.0, "missing_inputs": []},
+        }
+        metrics_in = {
+            "sector": "Technology",
+            "revenue_growth_3y": 0.08,
+            "debt_ebitda": 1.2,
+            "fcf_yield": 0.04,
+        }
+        macro = {"as_of": "2026-05-30", "regime": "expansion"}
+        risk_flags = {"levels": {"combined": "MEDIUM"}}
+        filings = {"management_tone": "confident", "red_flags": [], "by_year": {}}
+        return thesis, filings, metrics_in, macro, risk_flags
+
+    def _run(self, config):
+        thesis, filings, metrics_in, macro, risk_flags = self._inputs()
+        return _te.generate_thesis_essay(
+            ticker="AAPL",
+            thesis=thesis,
+            filings_summary=filings,
+            metrics=metrics_in,
+            macro=macro,
+            risk_flags=risk_flags,
+            config=config,
+        )
+
+    def test_essay_records_metrics_on_success(self, monkeypatch):
+        monkeypatch.setattr(_te, "_call_ollama_text", lambda **kw: _CANNED_ESSAY)
+        spy = _MetricsRecordSpy()
+        monkeypatch.setattr(_te._metrics, "record_metrics", spy)
+
+        out = self._run(_MetricsFakeConfig())
+        assert out["fallback"] is False
+        assert len(spy.calls) == 1
+
+    def test_essay_metric_has_agent_name_and_ticker(self, monkeypatch):
+        monkeypatch.setattr(_te, "_call_ollama_text", lambda **kw: _CANNED_ESSAY)
+        spy = _MetricsRecordSpy()
+        monkeypatch.setattr(_te._metrics, "record_metrics", spy)
+
+        self._run(_MetricsFakeConfig())
+        rec = spy.calls[0]
+        assert rec["agent_name"] == "thesis_essay"
+        assert rec["ticker"] == "AAPL"
+        assert rec["model"] == "qwen3:30b"
+        assert rec["success"] is True
+        assert rec["error_message"] is None
+        assert rec["prompt_tokens"] > 0
+        assert rec["completion_tokens"] > 0
+        assert rec["latency_ms"] >= 0
+
+    def test_essay_records_failure_metric(self, monkeypatch):
+        def _boom(**kw):
+            raise RuntimeError("ollama unreachable")
+
+        monkeypatch.setattr(_te, "_call_ollama_text", _boom)
+        spy = _MetricsRecordSpy()
+        monkeypatch.setattr(_te._metrics, "record_metrics", spy)
+
+        out = self._run(_MetricsFakeConfig())
+        assert out["fallback"] is True
+        assert isinstance(out["text"], str) and len(out["text"]) > 0
+        assert len(spy.calls) == 1
+        rec = spy.calls[0]
+        assert rec["agent_name"] == "thesis_essay"
+        assert rec["success"] is False
+        assert "ollama unreachable" in (rec["error_message"] or "")
+
+    def test_essay_survives_telemetry_failure(self, monkeypatch):
+        monkeypatch.setattr(_te, "_call_ollama_text", lambda **kw: _CANNED_ESSAY)
+
+        def _explode(call_metadata, *a, **k):
+            raise RuntimeError("metrics db locked")
+
+        monkeypatch.setattr(_te._metrics, "record_metrics", _explode)
+
+        out = self._run(_MetricsFakeConfig())
+        assert out["fallback"] is False
+        assert out["text"] == _CANNED_ESSAY
+
+    def test_essay_metric_lands_in_db(self, monkeypatch, tmp_path):
+        db_path = str(tmp_path / "essay_metrics.db")
+        _metrics_db.create_metrics_table(db_path)
+        monkeypatch.setattr(_metrics_db, "_default_db_path", lambda: db_path)
+        monkeypatch.setattr(_te, "_call_ollama_text", lambda **kw: _CANNED_ESSAY)
+
+        self._run(_MetricsFakeConfig())
+
+        rows = _metrics_db.get_metrics(
+            agent_name="thesis_essay", since_days=1, db_path=db_path
+        )
+        assert len(rows) == 1
+        row = rows[0]
+        assert row["agent_name"] == "thesis_essay"
+        assert row["ticker"] == "AAPL"
+        assert row["total_tokens"] == row["prompt_tokens"] + row["completion_tokens"]
+        assert row["cost_usd"] is not None
+
+
+class TestReviewMetrics:
+    """thesis_review.review_essay records labeled telemetry."""
+
+    @staticmethod
+    def _inputs():
+        essay_text = " ".join(["The"] + ["analysis"] * 300)
+        metrics_in = {"sector": "Technology", "revenue_growth_3y": 0.08}
+        macro = {"as_of": "2026-05-30", "regime": "expansion"}
+        risk_flags = {"levels": {"combined": "MEDIUM"}}
+        return essay_text, metrics_in, macro, risk_flags
+
+    def _run(self, config):
+        essay_text, metrics_in, macro, risk_flags = self._inputs()
+        return _tr.review_essay(
+            ticker="AAPL",
+            essay_text=essay_text,
+            metrics=metrics_in,
+            macro=macro,
+            risk_flags=risk_flags,
+            config=config,
+        )
+
+    def test_review_records_metrics_on_success(self, monkeypatch):
+        monkeypatch.setattr(_tr, "_call_ollama_text", lambda *a, **k: _CANNED_REVIEW)
+        spy = _MetricsRecordSpy()
+        monkeypatch.setattr(_tr._metrics, "record_metrics", spy)
+
+        out = self._run(_MetricsFakeConfig())
+        assert out["fallback"] is False
+        assert len(spy.calls) >= 1
+
+    def test_review_metric_has_agent_name(self, monkeypatch):
+        monkeypatch.setattr(_tr, "_call_ollama_text", lambda *a, **k: _CANNED_REVIEW)
+        spy = _MetricsRecordSpy()
+        monkeypatch.setattr(_tr._metrics, "record_metrics", spy)
+
+        self._run(_MetricsFakeConfig())
+        assert spy.calls, "no metrics recorded"
+        for rec in spy.calls:
+            assert rec["agent_name"] == "thesis_review"
+        rec0 = spy.calls[0]
+        assert rec0["ticker"] == "AAPL"
+        assert rec0["model"] == "qwen3:30b"
+        assert rec0["success"] is True
+        assert rec0["prompt_tokens"] > 0
+        assert rec0["completion_tokens"] > 0
+
+    def test_review_records_failure_metric(self, monkeypatch):
+        def _boom(*a, **k):
+            raise RuntimeError("ollama timeout")
+
+        monkeypatch.setattr(_tr, "_call_ollama_text", _boom)
+        spy = _MetricsRecordSpy()
+        monkeypatch.setattr(_tr._metrics, "record_metrics", spy)
+
+        out = self._run(_MetricsFakeConfig())
+        assert out["fallback"] is True
+        assert len(spy.calls) >= 1
+        failure_rows = [r for r in spy.calls if r["success"] is False]
+        assert failure_rows, "expected a success=False row"
+        assert all(r["agent_name"] == "thesis_review" for r in spy.calls)
+        assert "ollama timeout" in (failure_rows[0]["error_message"] or "")
+
+    def test_review_survives_telemetry_failure(self, monkeypatch):
+        monkeypatch.setattr(_tr, "_call_ollama_text", lambda *a, **k: _CANNED_REVIEW)
+
+        def _explode(call_metadata, *a, **k):
+            raise RuntimeError("metrics db locked")
+
+        monkeypatch.setattr(_tr._metrics, "record_metrics", _explode)
+
+        out = self._run(_MetricsFakeConfig())
+        assert out["fallback"] is False
+        assert isinstance(out["text"], str) and len(out["text"].split()) >= 200
+
+    def test_review_metric_lands_in_db(self, monkeypatch, tmp_path):
+        db_path = str(tmp_path / "review_metrics.db")
+        _metrics_db.create_metrics_table(db_path)
+        monkeypatch.setattr(_metrics_db, "_default_db_path", lambda: db_path)
+        monkeypatch.setattr(_tr, "_call_ollama_text", lambda *a, **k: _CANNED_REVIEW)
+
+        self._run(_MetricsFakeConfig())
+
+        rows = _metrics_db.get_metrics(
+            agent_name="thesis_review", since_days=1, db_path=db_path
+        )
+        assert len(rows) >= 1
+        row = rows[0]
+        assert row["agent_name"] == "thesis_review"
+        assert row["ticker"] == "AAPL"
+        assert row["total_tokens"] == row["prompt_tokens"] + row["completion_tokens"]
+
+
 if __name__ == "__main__":
     raise SystemExit(pytest.main([__file__, "-v"]))
