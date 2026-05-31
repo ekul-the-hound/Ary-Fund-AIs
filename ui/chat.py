@@ -220,14 +220,33 @@ def stream_chat_response(
 def _resolve_chat_model(config: Any) -> str:
     """Pick which Ollama model to use for chat.
 
-    Mirrors base_agent._resolve_model's precedence without importing it
-    (that module is JSON-mode focused and we want independence). Checks:
-        1. config.CHAT_MODEL — explicit chat override if present
-        2. config.DEFAULT_AGENT_MODEL — main chain default
-        3. "mock" — safe dead end
+    Mirrors ``base_agent._resolve_model``'s precedence: pick a *tag*, then
+    map that tag through ``config.AGENT_MODELS`` to the real Ollama model
+    name. The previous version returned the tag itself (e.g. "dev_llama8"),
+    which Ollama has no model for -> every chat request 404'd while the
+    briefing path (which resolves correctly) worked. Resolution:
+        1. config.CHAT_MODEL — explicit override. If it's a known tag, map
+           it; if it's already a real model name, use it as-is.
+        2. config.DEFAULT_AGENT_MODEL — the main-chain tag, mapped through
+           AGENT_MODELS.
+        3. "mock" — safe dead end (unknown tag or "mock").
     """
-    for attr in ("CHAT_MODEL", "DEFAULT_AGENT_MODEL"):
-        model = getattr(config, attr, None)
-        if model:
-            return str(model)
+    models = getattr(config, "AGENT_MODELS", {}) or {}
+
+    # 1. Explicit chat override. Allow either a tag or a literal model name.
+    chat_override = getattr(config, "CHAT_MODEL", None)
+    if chat_override:
+        if chat_override in models:
+            resolved = models[chat_override]
+            return "mock" if resolved == "mock" else str(resolved)
+        # Not a known tag -> treat as a literal Ollama model name.
+        return str(chat_override)
+
+    # 2. Fall back to the main-chain default tag, mapped through AGENT_MODELS.
+    tag = getattr(config, "DEFAULT_AGENT_MODEL", "mock")
+    if tag in models:
+        resolved = models[tag]
+        return "mock" if resolved == "mock" else str(resolved)
+
+    # 3. Unknown tag -> safe dead end rather than 404 on a bad model name.
     return "mock"

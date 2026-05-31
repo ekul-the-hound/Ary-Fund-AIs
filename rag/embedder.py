@@ -63,8 +63,10 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
+import os
 import sqlite3
 import threading
+import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from typing import Iterable, Literal, Optional
@@ -95,7 +97,9 @@ Role = Literal["document", "query"]
 # Backend probes
 # ----------------------------------------------------------------------
 
-def _probe_ollama(url: str, model: str, timeout: float = 2.0) -> bool:
+def _probe_ollama(
+    url: str, model: str, timeout: float = 8.0, retries: int = 3
+) -> bool:
     """Check whether Ollama is reachable AND the model is pulled.
 
     A reachable Ollama with the wrong model loaded is just as broken
@@ -103,20 +107,35 @@ def _probe_ollama(url: str, model: str, timeout: float = 2.0) -> bool:
     both at once by asking the embeddings endpoint to embed a tiny
     test string.
 
+    Retries with backoff: at app startup (especially Streamlit, which
+    simultaneously imports the heavy transformers stack and fires
+    network calls) Ollama can take several seconds to answer the first
+    request. A single short-timeout probe would spuriously fail and
+    drop us onto the 384-dim MiniLM fallback while the vector store
+    holds 768-dim nomic vectors — every later retrieval then mismatches.
+    A longer timeout plus a couple of retries makes the probe robust to
+    a momentarily-busy server.
+
     Returns True iff we successfully got an embedding back.
     """
-    try:
-        resp = requests.post(
-            f"{url}/api/embeddings",
-            json={"model": model, "prompt": "x"},
-            timeout=timeout,
-        )
-        if resp.status_code != 200:
-            return False
-        data = resp.json()
-        return isinstance(data.get("embedding"), list) and len(data["embedding"]) > 0
-    except Exception:  # noqa: BLE001 — probe must never raise
-        return False
+    for attempt in range(max(1, retries)):
+        try:
+            resp = requests.post(
+                f"{url}/api/embeddings",
+                json={"model": model, "prompt": "x"},
+                timeout=timeout,
+            )
+            if resp.status_code == 200:
+                data = resp.json()
+                if isinstance(data.get("embedding"), list) and len(data["embedding"]) > 0:
+                    return True
+            # Non-200 or empty body: server reachable but not ready/loaded.
+            # Fall through to retry.
+        except Exception:  # noqa: BLE001 — probe must never raise
+            pass
+        if attempt < retries - 1:
+            time.sleep(1.0 * (attempt + 1))  # 1s, 2s backoff
+    return False
 
 
 # ----------------------------------------------------------------------
@@ -156,11 +175,35 @@ class Embedder:
         self.ollama_model = ollama_model
         self.n_workers = n_workers
 
+        # Env override: set ARY_EMBED_BACKEND=ollama to forbid the silent
+        # MiniLM fallback. Useful in production where the vector store holds
+        # 768-dim nomic vectors and a 384-dim fallback would corrupt every
+        # retrieval. An explicit force_backend argument still wins over env.
+        if force_backend is None:
+            env_backend = os.environ.get("ARY_EMBED_BACKEND", "").strip().lower()
+            if env_backend in ("ollama", "minilm"):
+                force_backend = env_backend  # type: ignore[assignment]
+
         # Auto-detect backend. Subclasses or tests can override via
         # force_backend, but normal callers let this run.
-        if force_backend == "ollama" or (
-            force_backend is None and _probe_ollama(ollama_url, ollama_model)
-        ):
+        if force_backend == "ollama":
+            # Caller insists on Ollama. Probe to give a clear error rather
+            # than silently producing wrong-dimension vectors — but DO still
+            # probe so we fail fast with a useful message if it's down.
+            if not _probe_ollama(ollama_url, ollama_model):
+                raise RuntimeError(
+                    f"force_backend='ollama' but the Ollama embeddings endpoint "
+                    f"at {ollama_url} did not return an embedding for model "
+                    f"'{ollama_model}'. Start Ollama and run "
+                    f"`ollama pull {ollama_model}`, or unset the forced backend "
+                    f"to allow the MiniLM fallback (note: 384-dim, will NOT "
+                    f"match a 768-dim vector store)."
+                )
+            self.backend_name = "ollama"
+            self.model_name = ollama_model
+            self.dimension = 768
+            self._minilm_model = None  # not loaded
+        elif force_backend is None and _probe_ollama(ollama_url, ollama_model):
             self.backend_name = "ollama"
             self.model_name = ollama_model
             self.dimension = 768
@@ -169,6 +212,15 @@ class Embedder:
             self.backend_name = "minilm"
             self.model_name = "sentence-transformers/all-MiniLM-L6-v2"
             self.dimension = 384
+            # Loud warning: this path silently changes the embedding
+            # dimension to 384. If the vector store was built with nomic
+            # (768-dim), every retrieval will be rejected. Make it visible.
+            logger.warning(
+                "Embedder falling back to MiniLM (384-dim). If the vector "
+                "store was built with nomic-embed-text (768-dim), retrieval "
+                "will mismatch. Set ARY_EMBED_BACKEND=ollama and ensure "
+                "Ollama is running to prevent this."
+            )
             # Lazy-import sentence_transformers so users without it
             # installed can still construct the class (and fail at
             # embed-time with a clearer error).

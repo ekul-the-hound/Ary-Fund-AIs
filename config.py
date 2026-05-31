@@ -178,11 +178,17 @@ AGENT_MODELS: Dict[str, str] = {
 
 # Which model to use by default when an ``AgentRequest`` does not specify
 # a ``model_tag``. "mock" means the system runs fully offline with no LLM.
-DEFAULT_AGENT_MODEL: str = "dev"
+# Switched from "dev" (phi3:3.8b) to "dev_llama8" (llama3.1:8b): phi3
+# validated the pipeline but hallucinated financial figures in generated
+# prose. The 8B model grounds far better and fits the RTX 2080's VRAM.
+DEFAULT_AGENT_MODEL: str = "dev_llama8"
 
 # Hard wall-clock limit for a single agent call, in seconds. Ollama calls
 # that exceed this are aborted and fall back to a safe default response.
-AGENT_TIMEOUT: int = 30
+# Raised 30 -> 120 when moving to an 8B model: llama3.1:8b generations run
+# ~12-16s each on the RTX 2080, and multi-step agent calls need headroom
+# under the limit so they don't spuriously trip the safe-default fallback.
+AGENT_TIMEOUT: int = 120
 
 # Maximum tokens the agent is allowed to generate per call. Keeps prompts
 # and outputs within a predictable budget for logging and DB storage.
@@ -273,10 +279,11 @@ RAG_RERANK_MODEL: str = "cross-encoder/ms-marco-MiniLM-L-6-v2"
 RAG_MMR: bool = False
 RAG_MMR_LAMBDA: float = 0.7
 
-# LLM-driven query expansion. Uses phi3 for fast 1-2 expansion calls per
-# retrieve(). Disable for ultra-low-latency paths.
+# LLM-driven query expansion. Runs 1-2 expansion calls per retrieve().
+# On llama3.1:8b (phi3 removed) this is slower per call but more reliable;
+# disable for ultra-low-latency paths.
 RAG_QUERY_EXPAND: bool = True
-RAG_QUERY_EXPAND_MODEL: str = "phi3:3.8b"
+RAG_QUERY_EXPAND_MODEL: str = "llama3.1:8b"
 
 # ---- Indexing (Phase 2) -----------------------------------------------------
 # Contextualization prepends a short LLM-written summary to each chunk
@@ -284,7 +291,7 @@ RAG_QUERY_EXPAND_MODEL: str = "phi3:3.8b"
 # LLM call per chunk per indexing run — meaningful on a 10-K with 300+
 # chunks. Leave OFF until you have a feel for retrieval quality without.
 RAG_CONTEXTUALIZE: bool = False
-RAG_CONTEXTUALIZE_MODEL: str = "phi3:3.8b"
+RAG_CONTEXTUALIZE_MODEL: str = "llama3.1:8b"
 
 # ---- Learning loop (Phase 4) ------------------------------------------------
 # Self-indexing of closed-position theses. Thresholds are intentionally

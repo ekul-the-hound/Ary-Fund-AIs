@@ -575,7 +575,7 @@ def _derive_value(context: Dict[str, Any], key: str) -> Any:
 # CONSTANTS
 # =============================================================================
 
-_PARAGRAPH_TEMPERATURE: float = 0.30
+_PARAGRAPH_TEMPERATURE: float = 0.15
 _TARGET_WORDS_PER_PARA_MIN: int = 150
 _TARGET_WORDS_PER_PARA_MAX: int = 200
 
@@ -854,15 +854,30 @@ def _build_prompt(
 
     # Render the per-point output template — this drives the LLM toward the
     # "Display Name:" header format we'll parse later.
+    #
+    # IMPORTANT (number grounding): each per-point body is templated to OPEN
+    # by restating the exact value supplied above. Small models (8B) tend to
+    # echo the header correctly but then substitute a plausible-but-wrong
+    # number in the prose. Forcing the first sentence to repeat the given
+    # value verbatim makes the correct number the path of least resistance.
+    # The value is NEVER placed on the header line itself — the output parser
+    # rejects any header containing ``$``, ``%``, ``=`` or an "X is Y" span,
+    # so headers must stay as the bare display name.
     output_template_lines = [
         "Overview:",
-        "[150-200 word synthesis of all selected points]",
+        "[150-200 word synthesis of all selected points, using only the exact "
+        "values given above]",
         "",
     ]
     for k in selected_keys:
         display = get_display_name(k)
+        value = get_formatted_value(context, k)
         output_template_lines.append(f"{display}:")
-        output_template_lines.append(f"[150-200 word analysis of {display}]")
+        output_template_lines.append(
+            f"{display} for {company_name} stands at {value}. "
+            f"[Continue for 150-200 words interpreting this exact value — do "
+            f"NOT state any other number for {display}.]"
+        )
         output_template_lines.append("")
     output_template = "\n".join(output_template_lines)
 
@@ -891,17 +906,28 @@ Produce {total_paragraphs} paragraphs total: ONE overview paragraph plus one par
 1. OVERVIEW (150-200 words): Synthesize the selected points into a single investment thesis for {company_name} ({ticker}). State which selected metrics are most bullish, which are most bearish, and a clear BUY / HOLD / AVOID stance. Reference numbers from the selected points only — do not invent.
 
 2. PER-POINT PARAGRAPHS (150-200 words each): For each selected point, write one paragraph that:
-   - Quotes the exact value shown above.
+   - Opens by restating the EXACT value shown above for that metric, verbatim. This is the only correct value — do not change it.
    - Applies the GUIDANCE for that metric — interpret high/low correctly for that specific field.
    - Compares the value to a relevant benchmark (sector average, historical norm, peer, or macro context).
    - Explains the investment implication for {company_name} ({ticker}): how it affects cash flow, valuation, growth, or risk for THIS company.
    - Ends with an explicit stance for that single metric: "supports buying," "is a sell signal," or "is neutral."
 
 === RULES ===
+- NUMBER GROUNDING (most important): The value printed next to each data
+  point above is the ONLY correct value for that metric. When you write the
+  paragraph for a metric, you MUST use that exact value. Do NOT substitute,
+  round differently, or invent a different number. If "Total Cash: $78.23B"
+  is given, every mention of total cash must say $78.23B — never $170B or any
+  other figure. Restating a metric with a number that differs from the one
+  given above is a critical error.
+- Each paragraph discusses ONLY its own metric's value. Do not reuse another
+  metric's number (e.g. do not describe Total Debt using the Total Cash
+  figure). If you reference a second metric for comparison, use that second
+  metric's exact given value.
 - Use the EXACT display names above as paragraph headers (e.g. "Trailing P/E:", "Fed Funds Rate:").
 - Every paragraph must include at least one number AND mention {company_name} or {ticker} by name.
 - Apply the GUIDANCE attached to each metric — don't fall back to generic sector commentary.
-- Do not invent metrics that are not in the data.
+- Do not invent metrics that are not in the data. Discuss only {company_name} ({ticker}); do not reference other companies' products or risks (e.g. do not mention iPhone for a non-Apple company).
 - No bullet points inside paragraphs — write in prose.
 - No filler ("appears," "may," "could") unless paired with a specific number or condition.
 - Do not summarize the prompt or describe the task. Just write the paragraphs.
