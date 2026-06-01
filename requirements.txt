@@ -3,7 +3,11 @@
 
 # Data & numerics
 pandas>=2.1
-numpy>=1.26
+# numpy MUST stay <2: the cross-encoder reranker (torch) and onnxruntime
+# native layers, plus the pure-Python vector store, are unstable on the
+# numpy 2.x C ABI on this Windows/py3.12 environment. A 2.x install was
+# the proximate cause of native ("Python has stopped working") crashes.
+numpy>=1.26,<2
 requests>=2.31
 yfinance>=0.2.40
 sqlalchemy>=2.0
@@ -20,11 +24,12 @@ plotly>=5.20
 reportlab>=4.0
 
 # RAG — vector store + retrieval
-# chromadb is the persistent vector DB. sentence-transformers is the
-# fallback embedder (when Ollama / nomic-embed-text is unreachable) and
-# also powers the cross-encoder reranker. rank-bm25 backs the BM25
-# half of the hybrid retriever.
-chromadb>=0.5.0
+# The vector store is a pure-Python NumPy implementation (rag/vector_store.py);
+# chromadb was removed because its native chroma-hnswlib layer segfaults on
+# write on this environment and a non-crashing version needs a C++ compiler
+# to build. sentence-transformers is the fallback embedder (when Ollama /
+# nomic-embed-text is unreachable) and also powers the cross-encoder
+# reranker. rank-bm25 backs the BM25 half of the hybrid retriever.
 sentence-transformers>=2.7
 rank-bm25>=0.2.2
 

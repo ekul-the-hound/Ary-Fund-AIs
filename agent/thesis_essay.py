@@ -95,6 +95,7 @@ def generate_thesis_essay(
     macro: Dict[str, Any],
     risk_flags: Dict[str, Any],
     config: Any,
+    rag_block: str = "",
 ) -> Dict[str, Any]:
     """Produce a 2+ page institutional-memo essay for a single ticker.
 
@@ -132,6 +133,7 @@ def generate_thesis_essay(
         metrics=metrics,
         macro=macro,
         risk_flags=risk_flags,
+        rag_block=rag_block,
     )
 
     # Resolve which model we'd actually hit so we can short-circuit mock
@@ -244,6 +246,7 @@ def _build_essay_prompt(
     metrics: Dict[str, Any],
     macro: Dict[str, Any],
     risk_flags: Dict[str, Any],
+    rag_block: str = "",
 ) -> str:
     """Construct the full prompt for the LLM essay writer.
 
@@ -277,6 +280,27 @@ def _build_essay_prompt(
         f"Industry: {industry}"
     )
 
+    # RAG-retrieved filing excerpts (verbatim 10-K/10-Q text pulled by the
+    # hybrid retriever). Only inserted when non-empty. rag_block already
+    # carries its own "=== RETRIEVED CONTEXT ===" header from
+    # _format_retrieved_chunks, so we add a short framing line and a blank
+    # separator rather than another header.
+    rag_section = ""
+    if rag_block and rag_block.strip():
+        rag_section = (
+            "\n=== RETRIEVED FILING EXCERPTS (verbatim from SEC filings) ===\n"
+            "These are actual passages from this company's own SEC filings. "
+            "They are the ONLY filing evidence you have. In the Filings & "
+            "Management Signal section you must quote or closely paraphrase "
+            "at least two specific items drawn from these passages (a stated "
+            "risk factor, a disclosure, a segment or market-risk detail). "
+            "Do NOT introduce any claim about this company's filings, "
+            "controversies, or disclosures that is not present in these "
+            "excerpts or in KEY METRICS — no outside knowledge, no recalled "
+            "news. If a topic is not in the excerpts, do not mention it.\n"
+            f"{rag_block}\n"
+        )
+
     return f"""You are a senior equity analyst writing a formal investment memo for a hedge-fund investment committee. Your job is to interpret the provided financial data and deliver a decisive analytical verdict. Every major claim must be grounded in a specific number from the context below.
 
 === COMPANY ===
@@ -290,7 +314,7 @@ def _build_essay_prompt(
 
 === FILINGS CONTEXT ===
 {filings_block}
-
+{rag_section}
 === MACRO BACKDROP ===
 {macro_block}
 
@@ -306,7 +330,7 @@ Write an institutional-quality investment memo of {_TARGET_WORDS_MIN}-{_TARGET_W
 
 3. **Valuation** (1-2 paragraphs). State the actual P/E, forward P/E, and EV/EBITDA from the data. Compare them against reasonable benchmarks — the S&P 500 average (~20-22x trailing P/E), the {sector} sector, or {company_name}'s own historical range. State clearly whether {ticker} looks cheap, fair, or expensive for its quality and growth profile, and why. If a valuation metric is unavailable, say so in one sentence and base the assessment on what IS available (e.g. FCF yield alone). Never infer or reconstruct unavailable multiples.
 
-4. **Filings & Management Signal** (1 paragraph). If filings were analyzed, comment on management tone and notable disclosures. If no filings were retrieved, state that in one sentence and move on — do not write speculative analysis from an empty data set.
+4. **Filings & Management Signal** (1 paragraph). When RETRIEVED FILING EXCERPTS are provided above, this paragraph must be built ENTIRELY from them: cite at least two specific disclosures, risk factors, or market-risk details by name, and state what each implies for the investment case. Use only what the excerpts and KEY METRICS contain — never add controversies, lawsuits, or events from outside knowledge. If the excerpts are thin or only cover narrow topics, say so plainly and limit the paragraph to what they support. If no filings were retrieved, state that in one sentence and move on — do not write speculative analysis from an empty data set.
 
 5. **Macro & Industry Context** (1 paragraph). Connect specific macro variables (recession probability, VIX, yield curve, rates) to {company_name}'s specific exposure. For example: "A fed funds rate of X% pressures {industry} demand, but {company_name}'s [specific business attribute] provides partial insulation." If macro data is absent, say so briefly and move on.
 

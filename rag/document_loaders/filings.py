@@ -88,64 +88,101 @@ class FilingsLoader:
     def load_for_ticker(self, ticker: str) -> Iterable[RawDocument]:
         """Yield RawDocuments for one ticker. Yields lazily so the
         indexer can stream rather than buffering everything.
+
+        Fetches each form type EXPLICITLY with its own small count,
+        mirroring how the pipeline calls ``get_filings(ticker, "10-K",
+        count=1)``. This matters: a single ``get_filings(ticker)`` call
+        defaults to ``count=10``, and ``get_filings`` only returns from
+        cache when ``len(cached) >= count`` — so with one cached 10-K it
+        would fall through to a live EDGAR fetch (slow / network-gated /
+        often empty here), yielding nothing. Per-type low counts hit the
+        cache the same way the working pipeline path does.
         """
         ticker = ticker.upper()
 
-        # Pull filings list — your sec_fetcher.get_filings returns
-        # rows with form_type, filing_date, accession_number, etc.
+        # (form_type, count) pairs, fetched explicitly so we know the type
+        # without relying on a field name in the returned row.
+        requests = [
+            ("10-K", self.n_10k),
+            ("DEF 14A", self.n_proxy),
+            ("10-Q", self.n_10q),
+            ("8-K", self.n_8k),
+        ]
+
+        for form_type, count in requests:
+            rows = self._get_filings_cache_first(ticker, form_type, count)
+            for filing in rows:
+                doc = self._build_document(ticker, filing, form_type)
+                if doc:
+                    yield doc
+
+    def _get_filings_cache_first(self, ticker: str, form_type: str, count: int) -> list:
+        """Return cached filing rows WITHOUT triggering a network call.
+
+        ``SECFetcher.get_filings`` calls ``get_cik`` first — which hits
+        sec.gov on a fresh process (empty in-memory CIK cache) BEFORE it
+        checks the local filing cache. In a short-lived script like the
+        RAG filler that network call can fail or hang, and the failure
+        gets swallowed as "zero rows", so nothing indexes even though the
+        filing text is sitting in the DB.
+
+        We avoid that by reading the SQLite cache directly via the
+        fetcher's own ``_get_cached_filings`` (pure DB, no network). Only
+        if the cache is empty do we fall back to the full ``get_filings``
+        (which may fetch from EDGAR). This keeps the offline/cached path
+        completely network-free, matching where the data already lives.
+        """
+        # 1. Direct cache read — no network.
         try:
-            filings = self.sec.get_filings(ticker)
+            cached = self.sec._get_cached_filings(
+                ticker, form_type, count, None, None
+            )
+            if cached:
+                return cached[:count]
         except Exception as e:  # noqa: BLE001
-            logger.warning("filings_loader | %s | get_filings failed: %s", ticker, e)
-            return
+            logger.warning(
+                "filings_loader | %s | cache read (%s) failed: %s",
+                ticker, form_type, e,
+            )
 
-        # Group by form type and take the most recent N of each.
-        by_type: dict[str, list] = {"10-K": [], "10-Q": [], "8-K": [], "DEF 14A": []}
-        for f in filings or []:
-            ft = (f.get("form_type") or "").upper().replace(" ", "")
-            if ft in ("10-K", "10K"):
-                by_type["10-K"].append(f)
-            elif ft in ("10-Q", "10Q"):
-                by_type["10-Q"].append(f)
-            elif ft in ("8-K", "8K"):
-                by_type["8-K"].append(f)
-            elif ft.startswith("DEF14A") or ft == "DEF14A":
-                by_type["DEF 14A"].append(f)
-
-        # Sort each by date desc (sec_fetcher usually returns this way,
-        # but be defensive — re-sort here).
-        for ft in by_type:
-            by_type[ft].sort(key=lambda x: x.get("filing_date") or "", reverse=True)
-
-        # Yield in priority order so the indexer hits highest-signal
-        # filings first.
-        targets = (
-            [(f, "10-K") for f in by_type["10-K"][: self.n_10k]]
-            + [(f, "DEF 14A") for f in by_type["DEF 14A"][: self.n_proxy]]
-            + [(f, "10-Q") for f in by_type["10-Q"][: self.n_10q]]
-            + [(f, "8-K") for f in by_type["8-K"][: self.n_8k]]
-        )
-
-        for filing, ft in targets:
-            doc = self._build_document(ticker, filing, ft)
-            if doc:
-                yield doc
+        # 2. Fall back to the full fetcher (may hit EDGAR). Network
+        #    failures here are non-fatal — we just get no rows for this
+        #    form type.
+        try:
+            return self.sec.get_filings(ticker, form_type, count=count) or []
+        except Exception as e:  # noqa: BLE001
+            logger.warning(
+                "filings_loader | %s | get_filings(%s) failed: %s",
+                ticker, form_type, e,
+            )
+            return []
 
     def _build_document(self, ticker: str, filing: dict, form_type: str) -> Optional[RawDocument]:
         """Fetch full text and assemble a RawDocument. Returns None
         on failure (the indexer just skips it)."""
-        accession = filing.get("accession_number") or filing.get("accession")
-        filing_date = filing.get("filing_date") or filing.get("date")
+        accession = (
+            filing.get("accession_number")
+            or filing.get("accession")
+        )
+        filing_date = (
+            filing.get("filed_date")      # cache rows use filed_date
+            or filing.get("filing_date")  # some paths use filing_date
+            or filing.get("date")
+        )
         if not accession:
             return None
 
         try:
-            text = self.sec.get_filing_text(ticker, accession)
+            text = self.sec.get_filing_text(accession)
         except Exception as e:  # noqa: BLE001
             logger.warning("filings_loader | %s | text fetch failed for %s: %s",
                            ticker, accession, e)
             return None
         if not text or not text.strip():
+            logger.warning(
+                "filings_loader | %s | %s %s | empty text, skipping",
+                ticker, form_type, accession,
+            )
             return None
 
         # For 8-Ks, filter by item: only index if it touches one of
@@ -161,6 +198,10 @@ class FilingsLoader:
 
         title = f"{ticker} {form_type} filed {filing_date}"
 
+        logger.info(
+            "filings_loader | %s | built doc %s | %d chars",
+            ticker, doc_id, len(text),
+        )
         return RawDocument(
             doc_id=doc_id,
             doc_type="filing",
@@ -168,7 +209,7 @@ class FilingsLoader:
             title=title,
             ticker=ticker,
             as_of=filing_date,
-            source_url=filing.get("url"),
+            source_url=filing.get("url") or filing.get("primary_doc_url"),
             metadata={
                 "form_type": form_type,
                 "accession_number": accession,

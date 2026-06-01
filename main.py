@@ -377,6 +377,7 @@ def _process_ticker(
             macro=macro,
             risk_flags=risk_flags,
             config=cfg,
+            rag_block=rag_block,
         )
         thesis["essay"] = essay["text"]
         thesis["essay_meta"] = {

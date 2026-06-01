@@ -14,7 +14,7 @@ authors = [{ name = "Hedge Fund AI" }]
 dependencies = [
     # Data & numerics
     "pandas>=2.1",
-    "numpy>=1.26",
+    "numpy>=1.26,<2",  # <2 required: native libs unstable on numpy 2.x ABI
     "requests>=2.31",
     "yfinance>=0.2.40",
     "sqlalchemy>=2.0",
@@ -30,8 +30,9 @@ dependencies = [
     # PDF report generation
     "reportlab>=4.0",
 
-    # RAG — vector store, fallback embedder + cross-encoder, BM25
-    "chromadb>=0.5.0",
+    # RAG — pure-Python vector store (rag/vector_store.py), fallback
+    # embedder + cross-encoder reranker, BM25. chromadb removed: native
+    # layer segfaults on write here; the NumPy store replaces it.
     "sentence-transformers>=2.7",
     "rank-bm25>=0.2.2",
 ]

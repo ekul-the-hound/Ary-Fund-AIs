@@ -756,8 +756,17 @@ def _rag_retrieve(ticker: str, cfg) -> list[dict]:
         return []
 
     try:
+        # Query phrased in language that actually appears in 10-K/10-Q
+        # text. The prior query ("investment analysis: thesis, recent
+        # moves") was a meta-description with no lexical/semantic overlap
+        # with filing prose, so the reranker scored everything negative
+        # and surfaced boilerplate (proxy TOC, holders-of-record) over the
+        # substantive risk-factor and MD&A sections. These terms mirror
+        # the headings and disclosure language in the filings themselves.
         query = (
-            f"investment analysis: thesis, risks, and recent moves for {ticker}"
+            f"{ticker} risk factors, management discussion and analysis, "
+            "revenue and segment results, margins, liquidity and capital "
+            "resources, competition, and material business risks"
         )
         # Phase 4 guard: only retrieve self-indexed theses with high
         # composite quality; always retrieve external content.

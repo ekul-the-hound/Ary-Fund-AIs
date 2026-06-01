@@ -135,6 +135,11 @@ def generate_essay(
     if isinstance(filings_summary, list):
         filings_summary = {"recent": filings_summary}
 
+    # RAG-retrieved filing chunks from build_agent_context. Format them into
+    # the same prompt-ready block main.py uses, so the briefing essay can
+    # ground its Filings section in real 10-K text. Empty/absent → "".
+    rag_block = _format_rag_block(context.get("retrieved_context") or [])
+
     try:
         essay = thesis_essay.generate_thesis_essay(
             ticker=ticker,
@@ -144,6 +149,7 @@ def generate_essay(
             macro=macro,
             risk_flags=risk_flags,
             config=config_module,
+            rag_block=rag_block,
         )
     except Exception as e:
         logger.exception("Essay generation failed for %s", ticker)
@@ -165,3 +171,33 @@ def _error_marker(message: str) -> dict[str, Any]:
         "word_count": 0,
         "error": True,
     }
+
+def _format_rag_block(chunks: list, max_chars: int = 6000) -> str:
+    """Render retrieved RAG chunks into a prompt-ready block.
+
+    Mirrors main.py's _format_retrieved_chunks so the Streamlit briefing
+    and the CLI produce identical RAG context. Chunks arrive pre-sorted by
+    score; we stop once the char budget is hit. Empty list -> "".
+    """
+    if not chunks:
+        return ""
+    lines = ["=== RETRIEVED CONTEXT ==="]
+    used = len(lines[0])
+    for c in chunks:
+        header = (
+            f"\n[{c.get('source', '?')} | "
+            f"{c.get('ticker') or '-'} | "
+            f"{c.get('as_of') or '-'}"
+        )
+        section = c.get("section")
+        if section:
+            header += f" | {section}"
+        score = c.get("score", 0) or 0
+        header += f" | score={score:.2f}]"
+        body = (c.get("text") or "").strip()
+        block = header + "\n" + body
+        if used + len(block) > max_chars:
+            break
+        lines.append(block)
+        used += len(block)
+    return "\n".join(lines)

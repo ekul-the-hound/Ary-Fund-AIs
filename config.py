@@ -273,10 +273,13 @@ RAG_HYBRID: bool = True
 RAG_RERANK: bool = True
 RAG_RERANK_MODEL: str = "cross-encoder/ms-marco-MiniLM-L-6-v2"
 
-# MMR diversifies the top-K. Off by default because for narrow ticker
-# queries you usually WANT redundancy (multiple 10-Ks repeating a risk
-# is signal, not noise). Flip on for broad sector/macro queries.
-RAG_MMR: bool = False
+# MMR diversifies the top-K. Enabled: in practice retrieval was pulling
+# near-identical cross-year copies of the same section (e.g. three years
+# of the same share-repurchase header) into the top-8, crowding out
+# distinct content. MMR penalizes redundancy so the 8 slots carry more
+# unique material (risk factors + MD&A + market risk) rather than
+# triplicates. Lambda 0.7 = mostly relevance, modest diversity nudge.
+RAG_MMR: bool = True
 RAG_MMR_LAMBDA: float = 0.7
 
 # LLM-driven query expansion. Runs 1-2 expansion calls per retrieve().

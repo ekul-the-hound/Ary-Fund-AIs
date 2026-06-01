@@ -55,10 +55,11 @@ def main(argv=None) -> int:
     from rag.indexer import Indexer
 
     # --- Build the real loaders the CLI omits -----------------------------
-    # SECFetcher defaults its own db_path; pass agent identity from config
-    # if present. Filings text is cached by the fetcher (your main.py run
-    # logged "Returning cached filings for MSFT"), so this reuses that.
-    sec_kwargs = {}
+    # CRITICAL: SECFetcher must use the SAME db_path the pipeline uses
+    # (config.PORTFOLIO_DB_PATH), not its own default "data/hedgefund.db".
+    # The cached MSFT filings live in portfolio.db; pointing at the default
+    # finds an empty DB and get_filings() returns nothing -> 0 indexed.
+    sec_kwargs = {"db_path": config.PORTFOLIO_DB_PATH}
     if getattr(config, "SEC_AGENT_NAME", None):
         sec_kwargs["agent_name"] = config.SEC_AGENT_NAME
     if getattr(config, "SEC_AGENT_EMAIL", None):
