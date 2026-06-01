@@ -55,7 +55,6 @@ from __future__ import annotations
 import logging
 import pickle
 import re
-import sqlite3
 from collections import Counter
 from pathlib import Path
 from typing import Optional
@@ -214,12 +213,15 @@ class BM25Index:
         """Load from disk if possible; rebuild if stale or missing.
 
         Staleness check: compare the saved chunk_count against the
-        current count in the tracking DB. If they differ, the corpus
-        has changed and we must rebuild.
+        current chunk count in the vector store. Both are chunk counts
+        from the same source, so they match exactly when the corpus is
+        unchanged and differ the moment chunks are added/removed/re-indexed
+        — including re-indexes that change a document's chunk count, which
+        the old document-count proxy silently missed.
 
-        For test setups without a tracking DB, pass tracking_db_path
-        =None and we'll skip the staleness check (you should
-        explicitly force_rebuild instead).
+        ``tracking_db_path`` is accepted for backwards compatibility but is
+        no longer used for the staleness comparison; the store's own count
+        is authoritative.
         """
         if force_rebuild:
             self.build_from_store(store, collection=collection)
@@ -234,27 +236,17 @@ class BM25Index:
             self.build_from_store(store, collection=collection)
             return
 
-        # Staleness check
-        if tracking_db_path and Path(tracking_db_path).exists():
-            try:
-                with sqlite3.connect(tracking_db_path) as conn:
-                    current = conn.execute(
-                        "SELECT COUNT(*) FROM rag_documents"
-                    ).fetchone()[0]
-            except Exception:  # noqa: BLE001
-                current = self._chunk_count  # can't tell — assume fresh
-            # Document count is a proxy for chunk count. Imperfect but
-            # cheap. If a doc was re-indexed with more/fewer chunks the
-            # doc count is unchanged — in that case we miss the staleness.
-            # That's acceptable for an hourly-ish refresh cadence.
-            # For absolute correctness, run with force_rebuild=True
-            # after big re-index runs.
-            if current != self._chunk_count:
-                logger.info(
-                    "bm25 | doc count changed (%d → %d), rebuilding",
-                    self._chunk_count, current,
-                )
-                self.build_from_store(store, collection=collection)
+        # Staleness check: chunks-in-store vs chunks-in-index (like-for-like).
+        try:
+            current = store.count(collection)
+        except Exception:  # noqa: BLE001
+            current = self._chunk_count  # can't tell — assume fresh
+        if current != self._chunk_count:
+            logger.info(
+                "bm25 | chunk count changed (%d → %d), rebuilding",
+                self._chunk_count, current,
+            )
+            self.build_from_store(store, collection=collection)
 
     # ------------------------------------------------------------------
     # Query

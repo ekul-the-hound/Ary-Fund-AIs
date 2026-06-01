@@ -113,6 +113,49 @@ def _format_retrieved_chunks(
     return "\n".join(lines)
 
 
+def _hydrate_filing_text(filings: List[dict], db_path: str) -> List[dict]:
+    """Populate each filing dict's ``text`` field from the SEC cache.
+
+    ``build_agent_context`` supplies filing metadata only (form, accession,
+    URL, date), so the downstream tone / risk-factor / red-flag analysis
+    has no body to read. We look up each filing's full text by accession
+    via ``SECFetcher.get_filing_text`` — cache-first (cache file, then the
+    ``full_text`` DB column), so it's pure-local for any filing already
+    backfilled and never blocks on the network here.
+
+    Returns a new list of shallow-copied dicts with ``text`` filled in;
+    filings that already carry text, or whose text can't be found, pass
+    through unchanged. Never raises — a hydration miss just means that
+    filing contributes no tone/risk signal, exactly as before.
+    """
+    if not filings:
+        return filings
+    try:
+        from data.sec_fetcher import SECFetcher
+        fetcher = SECFetcher(db_path=db_path)
+    except Exception as e:  # noqa: BLE001
+        logger.debug("filing-text hydration skipped (fetcher init): %s", e)
+        return filings
+
+    hydrated: List[dict] = []
+    for f in filings:
+        if f.get("text"):
+            hydrated.append(f)
+            continue
+        accession = f.get("accession_number") or f.get("accession")
+        if not accession:
+            hydrated.append(f)
+            continue
+        try:
+            text = fetcher.get_filing_text(accession)
+        except Exception:  # noqa: BLE001 — missing text is non-fatal
+            text = ""
+        if text:
+            f = {**f, "text": text}
+        hydrated.append(f)
+    return hydrated
+
+
 # =============================================================================
 # PROMPT BUILDER
 # =============================================================================
@@ -296,6 +339,14 @@ def _process_ticker(
 
         # 2. Shape filings & metrics for the agent.
         max_filings = getattr(cfg, "MAX_FILINGS_PER_TICKER", 10)
+        # build_agent_context returns filing METADATA only (form, accession,
+        # url, date) — no body text. The tone / risk-factor / red-flag
+        # analysis needs the actual filing text, so hydrate each filing's
+        # "text" field from the SEC cache (cache-first: cache file, then the
+        # full_text DB column; no network for already-backfilled filings).
+        # Without this, summarize sees empty text and always reports
+        # tone=neutral / risks=0 / red_flags=0, zeroing the filings bias.
+        filings = _hydrate_filing_text(filings, db_path)
         filings_summary = filing_analyzer.summarize_filings_by_year(
             ticker, filings, max_filings=max_filings
         )

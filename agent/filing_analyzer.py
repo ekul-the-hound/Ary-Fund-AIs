@@ -56,24 +56,43 @@ _CAUTIOUS_TERMS: frozenset = frozenset({
     "moderate", "weaker", "decline", "contraction",
 })
 
-_DEFENSIVE_TERMS: frozenset = frozenset({
-    "allegation", "investigation", "restatement", "material weakness",
-    "going concern", "litigation", "subpoena", "sec inquiry",
-    "non-reliance", "adverse opinion", "impairment",
+# Severe signals: rare, and genuinely indicative of trouble. Presence of
+# any one of these legitimately flips tone to "defensive" — a going-concern
+# or restatement phrase is not balanced out by upbeat language elsewhere.
+_SEVERE_TERMS: frozenset = frozenset({
+    "restatement", "material weakness", "going concern",
+    "non-reliance", "adverse opinion", "sec inquiry", "subpoena",
 })
 
+# Routine legal/accounting terms that appear in essentially EVERY large-cap
+# 10-K as standard disclosure (a company this size always has some
+# litigation, some investigation, some impairment somewhere in 1.5M chars
+# of filing text). On a full-filing corpus these are NOT a defensive signal
+# on mere presence — treating them as such made tone=defensive nearly
+# deterministic for every real filing. They contribute only as cautious
+# signal when they appear at meaningful frequency (handled in _infer_tone).
+_ROUTINE_NEGATIVE_TERMS: frozenset = frozenset({
+    "litigation", "investigation", "allegation", "impairment",
+})
+
+# Kept for backwards compatibility (some callers/tests import this name).
+_DEFENSIVE_TERMS: frozenset = _SEVERE_TERMS
+
 # Phrases that warrant a standalone "red flag" entry in the output.
+#
+# Split into two tiers because the severe conditions (going concern,
+# material weakness, restatement, non-reliance, adverse opinion, SEC
+# enforcement) appear in DEFINITIONAL and HYPOTHETICAL form in essentially
+# every 10-K ("a material weakness exists when ..."; "if we were to
+# restate ..."). Matching them as bare substrings flagged healthy filings.
+# For those we reuse _AFFIRMATIVE_SEVERE_PATTERNS (declaration-context
+# only). The patterns below are already specific enough that a bare match
+# is a genuine signal — they don't have a common definitional form.
 _RED_FLAG_PATTERNS: Tuple[re.Pattern, ...] = (
-    re.compile(r"going concern", re.IGNORECASE),
-    re.compile(r"material weakness", re.IGNORECASE),
-    re.compile(r"restatement", re.IGNORECASE),
-    re.compile(r"non-reliance", re.IGNORECASE),
-    re.compile(r"sec (?:inquiry|investigation|subpoena)", re.IGNORECASE),
     re.compile(r"auditor\s+resign", re.IGNORECASE),
     re.compile(r"delist(?:ing)?", re.IGNORECASE),
     re.compile(r"covenant\s+(?:breach|violation|waiver)", re.IGNORECASE),
     re.compile(r"impair(?:ment|ed)\s+(?:goodwill|assets)", re.IGNORECASE),
-    re.compile(r"adverse\s+opinion", re.IGNORECASE),
 )
 
 # Item 1A is where 10-K risk factors live. Match the header and grab what
@@ -454,42 +473,148 @@ def _extract_risk_sentences(text: str, limit: int = 20) -> List[str]:
     return picked
 
 
-def _infer_tone(text: str) -> str:
-    """Classify overall tone by lexicon frequency.
+def _has_affirmative_severe_signal(lower: str) -> bool:
+    """True only when a severe condition is AFFIRMATIVELY DECLARED.
 
-    Returns one of: ``"confident"``, ``"cautious"``, ``"defensive"``,
-    ``"neutral"``. "defensive" wins when any defensive/legal term appears,
-    since those signals dominate the others.
+    Distinguishes "we identified a material weakness" (real) from "if we
+    identify a material weakness ... investors could lose confidence"
+    (hypothetical risk-factor boilerplate present in nearly every 10-K).
+
+    Strategy: for each severe condition, require declaration phrasing —
+    a first-person/possessive or past-tense verb asserting the condition
+    actually occurred — rather than the bare term, which appears in
+    hypothetical form in healthy filings.
+    """
+    return any(p.search(lower) for p in _AFFIRMATIVE_SEVERE_PATTERNS)
+
+
+# Patterns that indicate a severe condition is actually present, not merely
+# described as a hypothetical risk. Tuned to avoid the "if/could/would/may"
+# hedged constructions that dominate risk-factor sections.
+_AFFIRMATIVE_SEVERE_PATTERNS: Tuple[re.Pattern, ...] = (
+    # AFFIRMATIVE material weakness: the company declaring one was found.
+    # Must NOT match (a) the standard definition every 10-K includes
+    # ("a material weakness is a deficiency ..."; "a material weakness
+    # exists when ..."), nor (b) negated conclusions ("no material
+    # weakness was identified"; "did not identify any material weakness").
+    # We therefore require a first-person/possessive subject paired with an
+    # affirmative finding verb, and forbid an immediately-preceding "no/not/
+    # any/without" within the short window.
+    re.compile(
+        r"(?:we|management|the\s+company)\s+"
+        r"(?:identified|concluded\s+(?:that\s+)?(?:there\s+(?:was|is|were)\s+)?"
+        r"a?|determined\s+(?:that\s+)?(?:there\s+(?:was|is|were)\s+)?a?|"
+        r"reported)\b"
+        r"(?:(?!\b(?:no|not|any|without|effective|did\s+not)\b)[^.]){0,50}?"
+        r"material\s+weakness",
+        re.IGNORECASE,
+    ),
+    re.compile(
+        r"(?:identified|reported|disclosed)\s+(?:a|one\s+or\s+more)\s+"
+        r"material\s+weakness",
+        re.IGNORECASE,
+    ),
+    # Actual restatement (past tense / completed action), not "a restatement
+    # could be required". Only the past-tense verb forms are unambiguous;
+    # "restatement of our financial statements" appears in hypothetical
+    # risk-factor language too, so we do NOT match the noun phrase.
+    re.compile(
+        r"(?:we|the\s+company)\s+(?:have\s+)?restated\b",
+        re.IGNORECASE,
+    ),
+    # Going concern actually raised, not hypothetical.
+    re.compile(
+        r"substantial\s+doubt\b[^.]{0,40}going\s+concern",
+        re.IGNORECASE,
+    ),
+    # Non-reliance / Item 4.02 (companies file this only when restating).
+    re.compile(r"non-reliance", re.IGNORECASE),
+    # Adverse audit opinion actually expressed.
+    re.compile(
+        r"(?:expressed|issued|rendered)\b[^.]{0,40}adverse\s+opinion",
+        re.IGNORECASE,
+    ),
+    # Active SEC enforcement actually disclosed (not "if the SEC were to...").
+    re.compile(
+        r"(?:received|are\s+subject\s+to|is\s+subject\s+to|served\s+with)"
+        r"\b[^.]{0,40}(?:subpoena|sec\s+(?:inquiry|investigation))",
+        re.IGNORECASE,
+    ),
+)
+
+
+def _infer_tone(text: str) -> str:
+    """Classify overall tone by lexicon frequency, length-normalized.
+
+    Returns one of ``"confident"``, ``"cautious"``, ``"defensive"``,
+    ``"neutral"``.
+
+    Design notes (important on full-filing text):
+      * Only SEVERE terms (going concern, restatement, material weakness,
+        ...) flip tone to "defensive" on presence. They are rare and real.
+      * Routine legal/accounting terms (litigation, impairment, ...) appear
+        in every large 10-K, so they are NOT defensive triggers. They add
+        to the cautious side, but only frequency above a small floor counts
+        — one stray "litigation" in 1.5M chars is noise.
+      * Confident vs cautious is decided on RATE per 100k chars with a
+        margin requirement, so a long filing doesn't trivially win one side
+        just by having more words.
     """
     if not text:
         return "neutral"
 
     lower = text.lower()
-    # Defensive terms trump everything — presence of a going-concern or
-    # restatement phrase is not balanced out by enthusiastic marketing copy.
-    for term in _DEFENSIVE_TERMS:
-        if term in lower:
-            return "defensive"
 
-    confident = sum(lower.count(t) for t in _CONFIDENT_TERMS)
-    cautious = sum(lower.count(t) for t in _CAUTIOUS_TERMS)
+    # Severe signals trump everything — BUT only when AFFIRMATIVELY DECLARED,
+    # not merely described as a hypothetical risk. Every large-cap 10-K's
+    # risk-factor section mentions "material weakness", "restatement", etc.
+    # in the abstract ("if we were to identify a material weakness, investors
+    # could lose confidence"). Those hypothetical mentions are not a defensive
+    # signal — only an actual declaration is ("we identified a material
+    # weakness", "we restated our financial statements"). Matching bare
+    # substrings made every healthy filing read as defensive.
+    if _has_affirmative_severe_signal(lower):
+        return "defensive"
 
-    if confident == 0 and cautious == 0:
+    n = len(lower)
+    if n == 0:
         return "neutral"
-    if confident >= 2 * cautious:
+    per100k = 100_000.0 / n  # scale raw counts to a per-100k-char rate
+
+    confident = sum(lower.count(t) for t in _CONFIDENT_TERMS) * per100k
+    cautious = sum(lower.count(t) for t in _CAUTIOUS_TERMS) * per100k
+    # Routine negatives count toward caution, but only the portion above a
+    # small floor (they're partly boilerplate). Half-weighted.
+    routine = sum(lower.count(t) for t in _ROUTINE_NEGATIVE_TERMS) * per100k
+    cautious += 0.5 * max(0.0, routine - 2.0)
+
+    # Require a meaningful signal and a clear margin before leaving neutral.
+    if confident < 1.0 and cautious < 1.0:
+        return "neutral"
+    if confident >= 1.5 * cautious and confident >= 1.0:
         return "confident"
-    if cautious >= 2 * confident:
+    if cautious >= 1.5 * confident and cautious >= 1.0:
         return "cautious"
     return "neutral"
 
 
 def _find_red_flags(text: str) -> List[str]:
-    """Return distinct red-flag phrases, each with a short context snippet."""
+    """Return distinct red-flag phrases, each with a short context snippet.
+
+    Two sources:
+      * ``_AFFIRMATIVE_SEVERE_PATTERNS`` — severe conditions, but only when
+        affirmatively declared (not the definitional/hypothetical mentions
+        that appear in every 10-K). Shared with tone classification so the
+        two stay consistent.
+      * ``_RED_FLAG_PATTERNS`` — already-specific phrases (auditor
+        resignation, delisting, covenant breach, goodwill/asset impairment)
+        with no common definitional form, so a bare match is a real signal.
+    """
     if not text:
         return []
     hits: List[str] = []
     seen: set = set()
-    for pat in _RED_FLAG_PATTERNS:
+    for pat in (*_AFFIRMATIVE_SEVERE_PATTERNS, *_RED_FLAG_PATTERNS):
         m = pat.search(text)
         if not m:
             continue
