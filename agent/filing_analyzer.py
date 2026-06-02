@@ -95,11 +95,38 @@ _RED_FLAG_PATTERNS: Tuple[re.Pattern, ...] = (
     re.compile(r"impair(?:ment|ed)\s+(?:goodwill|assets)", re.IGNORECASE),
 )
 
-# Item 1A is where 10-K risk factors live. Match the header and grab what
-# follows, stopping at the next Item header or end of text.
-_RISK_SECTION_RE = re.compile(
-    r"item\s*1a[\.\s]*risk\s*factors(.+?)(?=item\s*1b|item\s*2|item\s*7|$)",
-    re.IGNORECASE | re.DOTALL,
+# Locating the Item 1A risk-factors section is format-dependent: real
+# filings write the header inconsistently — "Item 1A. Risk Factors",
+# "Item 1A.Risk Factors" (no space), "Item 1ARisk Factors" (no space, no
+# period) — and some (e.g. MSFT) have no usable header adjacent to the
+# actual prose at all. We therefore use a HYBRID strategy (see
+# _extract_risk_sentences): try to isolate a valid Item 1A section, and if
+# that fails, fall back to a selective whole-document cue scan.
+
+# Header: "Item 1A" then optional punctuation/space then "Risk Factors",
+# tolerating missing spaces. \W* allows ".", "", "-", whitespace between.
+_RISK_HEADER_RE = re.compile(r"item\s*1a\W{0,3}risk\s*factors", re.IGNORECASE)
+
+# Section END boundary: the next genuine item header that reliably follows
+# Item 1A. We use 1B / 1C / 2 only — Item 7 / 8 appear as stray
+# cross-references ("refer to Item 7") that truncate the section early.
+_RISK_BOUNDARY_RE = re.compile(r"item\s*(?:1b|1c|2)\b", re.IGNORECASE)
+
+# A captured region must be at least this large to be the real section
+# rather than a table-of-contents line ("Item 1A. Risk Factors 16").
+_MIN_RISK_REGION_CHARS = 1200
+
+# Cue phrases that mark a sentence as an actual risk factor (forward-looking
+# adverse-consequence language). Deliberately stricter than the bare word
+# "risk" so the whole-doc fallback doesn't grab cover-page boilerplate
+# ("indicate by check mark ...") or cross-references.
+_RISK_CUE_RE = re.compile(
+    r"(?:could|may|might|would)\s+(?:adversely|materially|negatively|"
+    r"seriously)?\s*(?:affect|harm|impact|reduce|impair|result|"
+    r"disrupt|damage)|adversely\s+affect|subject\s+to\s+(?:various|"
+    r"numerous|significant|certain)?\s*risks|depend(?:s|ent)?\s+(?:on|"
+    r"upon)|materially\s+adversely",
+    re.IGNORECASE,
 )
 
 # Coarse sentence splitter. Good enough for risk-bullet extraction; no need
@@ -171,9 +198,20 @@ def summarize_filings_by_year(
 
     risk_factors: List[str] = []
     for f in safe_filings:
-        risk_factors.extend(_extract_risk_sentences(str(f.get("text") or "")))
-    # Dedup while preserving order; cap length for prompt-budget reasons.
-    risk_factors = _dedup_preserve_order(risk_factors)[:20]
+        # Pass a high limit so the TRUE count survives (the default limit of
+        # 20 would pre-cap each filing before we can measure real magnitude).
+        risk_factors.extend(
+            _extract_risk_sentences(str(f.get("text") or ""), limit=200)
+        )
+    # Dedup while preserving order. Keep the TRUE count (uncapped) for
+    # scoring — the displayed sentence list is capped at 20 for prompt
+    # budget, but every large-cap 10-K saturates that cap, which destroys
+    # the variance any count-based signal needs. The true count is stored
+    # separately as ``risk_factor_count`` so a future sector-relative
+    # penalty can compare real magnitudes across tickers.
+    risk_factors = _dedup_preserve_order(risk_factors)
+    risk_factor_count = len(risk_factors)
+    risk_factors = risk_factors[:20]
 
     management_tone = _infer_tone(all_text)
     red_flags = _find_red_flags(all_text)
@@ -204,10 +242,11 @@ def summarize_filings_by_year(
     )
 
     logger.info(
-        "filing_analyzer.summarize | %s | filings=%d | risks=%d | "
-        "red_flags=%d | tone=%s",
+        "filing_analyzer.summarize | %s | filings=%d | risks=%d "
+        "(shown %d) | red_flags=%d | tone=%s",
         ticker,
         len(safe_filings),
+        risk_factor_count,
         len(risk_factors),
         len(red_flags),
         management_tone,
@@ -218,6 +257,7 @@ def summarize_filings_by_year(
         "filings_considered": len(safe_filings),
         "summary": summary,
         "risk_factors": risk_factors,
+        "risk_factor_count": risk_factor_count,
         "management_tone": management_tone,
         "red_flags": red_flags,
         "by_year": by_year_out,
@@ -428,6 +468,7 @@ def _empty_summary(ticker: str) -> Dict[str, Any]:
         "filings_considered": 0,
         "summary": f"No filings available for {ticker}.",
         "risk_factors": [],
+        "risk_factor_count": 0,
         "management_tone": "neutral",
         "red_flags": [],
         "by_year": {},
@@ -442,35 +483,83 @@ def _extract_year(date_str: Optional[str]) -> Optional[str]:
     return m.group(1) if m else None
 
 
-def _extract_risk_sentences(text: str, limit: int = 20) -> List[str]:
-    """Pull sentences from the Item 1A risk-factors section of a 10-K.
+def _select_risk_region(text: str) -> Optional[str]:
+    """Isolate the real Item 1A section, or return None if not locatable.
 
-    Falls back to scanning the whole document for sentences containing risk
-    cue words if no Item 1A header is found (common for 10-Q / 8-K filings,
-    which don't have a formal risk-factors section).
+    For each "Item 1A ... Risk Factors" header occurrence, slice from the
+    header to the next 1B/1C/2 boundary and keep the largest such slice.
+    Returns the region only if it clears ``_MIN_RISK_REGION_CHARS`` AND
+    contains real risk-cue language (guards against a table-of-contents
+    slice). Returns None when no valid section is found, signalling the
+    caller to fall back to a whole-document scan.
     """
-    if not text:
-        return []
+    best = ""
+    for h in _RISK_HEADER_RE.finditer(text):
+        start = h.end()
+        nb = _RISK_BOUNDARY_RE.search(text, start)
+        end = nb.start() if nb else len(text)
+        region = text[start:end]
+        if len(region) > len(best):
+            best = region
+    if len(best) >= _MIN_RISK_REGION_CHARS and _RISK_CUE_RE.search(best):
+        return best
+    return None
 
-    match = _RISK_SECTION_RE.search(text)
-    region = match.group(1) if match else text
 
-    sentences = _SENT_SPLIT_RE.split(region)
+def _scan_for_risk_sentences(region: str, limit: int) -> List[str]:
+    """Pull risk-factor-like sentences from a text region.
+
+    Splits on sentence punctuation and newlines (filing text often uses
+    line breaks instead of ". "), then keeps reasonable-length sentences
+    matching the strict ``_RISK_CUE_RE`` (forward-looking adverse
+    consequences), de-duplicated in order.
+    """
+    pieces: List[str] = []
+    for chunk in _SENT_SPLIT_RE.split(region):
+        pieces.extend(chunk.split("\n"))
+
     picked: List[str] = []
-    cue_words = ("risk", "could adversely", "may adversely", "uncertain",
-                 "depend on", "subject to")
-
-    for s in sentences:
+    seen: set = set()
+    for s in pieces:
         s_clean = re.sub(r"\s+", " ", s).strip()
         if not (40 <= len(s_clean) <= 400):
             continue
-        lower = s_clean.lower()
-        if any(cue in lower for cue in cue_words):
-            picked.append(s_clean)
-            if len(picked) >= limit:
-                break
-
+        if not _RISK_CUE_RE.search(s_clean):
+            continue
+        key = s_clean.lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        picked.append(s_clean)
+        if len(picked) >= limit:
+            break
     return picked
+
+
+def _extract_risk_sentences(text: str, limit: int = 20) -> List[str]:
+    """Pull risk-factor sentences from a filing — hybrid strategy.
+
+    1. Try to isolate a valid Item 1A section (``_select_risk_region``),
+       handling the header-spacing variants seen in real filings
+       ("Item 1A. Risk Factors", "Item 1A.Risk Factors", "Item 1ARisk
+       Factors").
+    2. If no usable section is found (e.g. a filing whose risk prose has no
+       adjacent Item 1A header, or a 10-Q/8-K with no formal section), fall
+       back to scanning the WHOLE document.
+
+    Either way, only sentences matching the strict risk-cue pattern are
+    kept, so the whole-doc fallback does not pick up cover-page boilerplate
+    or cross-references.
+    """
+    if not text:
+        return []
+    region = _select_risk_region(text)
+    if region is not None:
+        hits = _scan_for_risk_sentences(region, limit)
+        if hits:
+            return hits
+    # Fallback: scan the entire document with the same strict cue filter.
+    return _scan_for_risk_sentences(text, limit)
 
 
 def _has_affirmative_severe_signal(lower: str) -> bool:

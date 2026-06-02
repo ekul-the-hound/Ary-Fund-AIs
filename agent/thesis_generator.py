@@ -428,10 +428,22 @@ def _score_filings_bias(filings_summary: Dict[str, Any]) -> float:
     # Each red flag knocks meaningful bias off; cap the hit.
     red_flag_penalty = min(0.8, 0.3 * len(red_flags))
 
-    # A huge list of risk factors is mild negative signal (lazy-prices style).
+    # Risk-factor COUNT penalty — currently DISABLED.
+    #
+    # The old rule ("len(risk_factors) >= 15 -> -0.2") was an absolute
+    # threshold. It only discriminated while risk extraction was broken and
+    # most tickers reported 0-3 factors. With extraction fixed, every
+    # large-cap 10-K lists 15-20+ risk factors, so the penalty fired
+    # universally — a constant, not a signal — and pushed clean, healthy
+    # filings (e.g. AAPL, PEP) to a negative filings bias purely for having
+    # a normal number of risks.
+    #
+    # The count is preserved on the summary as ``risk_factor_count`` (true,
+    # uncapped) so this can be reintroduced as a SECTOR-RELATIVE penalty:
+    # penalize only when a ticker's risk count is materially above its
+    # peer-group mean (via data/peer_stats.py), which is the real signal.
+    # Until that lands, the count contributes nothing.
     rf_penalty = 0.0
-    if len(risk_factors) >= 15:
-        rf_penalty = 0.2
 
     bias = tone_score - red_flag_penalty - rf_penalty
     return _clip(bias, -1.0, 1.0)
