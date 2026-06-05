@@ -703,6 +703,7 @@ def _find_red_flags(text: str) -> List[str]:
         return []
     hits: List[str] = []
     seen: set = set()
+    flagged_spans: List[tuple] = []  # (start, end) of matched cores
     for pat in (*_AFFIRMATIVE_SEVERE_PATTERNS, *_RED_FLAG_PATTERNS):
         m = pat.search(text)
         if not m:
@@ -710,10 +711,18 @@ def _find_red_flags(text: str) -> List[str]:
         key = pat.pattern
         if key in seen:
             continue
+        # Positional dedup: if this match overlaps a span already
+        # flagged, it is the SAME underlying event picked up by a second
+        # pattern (e.g. "material weakness" and "controls not effective"
+        # in one sentence). Count the event once.
+        ms, me = m.start(), m.end()
+        if any(ms < fe and me > fs for fs, fe in flagged_spans):
+            continue
         seen.add(key)
+        flagged_spans.append((ms, me))
         # ~80-char context window for human review.
-        start = max(0, m.start() - 40)
-        end = min(len(text), m.end() + 40)
+        start = max(0, ms - 40)
+        end = min(len(text), me + 40)
         snippet = re.sub(r"\s+", " ", text[start:end]).strip()
         hits.append(snippet)
     return hits

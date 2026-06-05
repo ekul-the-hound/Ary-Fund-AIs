@@ -42,6 +42,14 @@ RAG failures degrade silently to an empty list; the agent still runs.
 
 from __future__ import annotations
 
+# Load cached HuggingFace models (reranker cross-encoder, embedder)
+# without re-validating against huggingface.co on every startup. Must be
+# set before any import pulls in a huggingface library, so it lives here
+# at the top of the entry point rather than in a lazy loader.
+import os as _os
+_os.environ.setdefault("HF_HUB_OFFLINE", "1")
+_os.environ.setdefault("TRANSFORMERS_OFFLINE", "1")
+
 import argparse
 import json
 import logging
@@ -414,6 +422,7 @@ def _process_ticker(
             metrics=key_metrics,
             macro=macro,
             risk_flags=risk_flags,
+            peer_stats=_peer_slice,
         )
 
         # 5b. Generate the institutional-memo essay and review it.

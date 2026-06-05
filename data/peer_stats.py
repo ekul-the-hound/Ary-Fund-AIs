@@ -10,20 +10,20 @@ Why this matters
 ----------------
 ``risk_scanner`` already z-scores fundamentals against a peer cohort, but
 when no real peer stats are supplied it falls back to ``_SECTOR_DEFAULTS``
-— values its own comment describes as "coarse — broad-market averages."
+â€” values its own comment describes as "coarse â€” broad-market averages."
 That means a REIT's leverage is compared against a rough guess at "typical
 real-estate leverage," not against the leverage of the REITs you actually
 track. This module closes that gap: it aggregates the real mean / std / n
 for each (sector, metric) pair from the universe and hands them to
 ``compute_risk_flags`` through the ``peer_stats`` kwarg that module already
-exposes. **No change to risk_scanner is required** — we feed the channel it
+exposes. **No change to risk_scanner is required** â€” we feed the channel it
 already reads.
 
 Consistency principle
 ---------------------
 The z-scored metrics include *derived* ratios (``debt_ebitda``,
 ``fcf_yield``, ``roic``, ``cash_conversion``, ``net_debt_ebitda``) that are
-NOT stored as single registry fields — they are computed inside
+NOT stored as single registry fields â€” they are computed inside
 ``filing_analyzer.extract_key_metrics_for_agent``. To avoid two divergent
 definitions of the same ratio, peer stats are computed from **metric
 snapshots produced by that same function**, not by re-deriving the ratios
@@ -51,7 +51,7 @@ logger = logging.getLogger(__name__)
 
 
 # Metrics we compute peer stats for. This list MUST stay in sync with
-# ``risk_scanner._METRIC_DIRECTIONS`` — those are the only metrics the
+# ``risk_scanner._METRIC_DIRECTIONS`` â€” those are the only metrics the
 # scanner z-scores, so computing stats for anything else is wasted work.
 Z_SCORED_METRICS: tuple[str, ...] = (
     "debt_ebitda",
@@ -62,6 +62,7 @@ Z_SCORED_METRICS: tuple[str, ...] = (
     "operating_margin",
     "gross_margin",
     "cash_conversion",
+    "risk_factor_count",
 )
 
 # Minimum valid peers before a (sector, metric) stat is trustworthy.
@@ -75,17 +76,17 @@ _CACHE_FILENAME = "peer_stats_cache.json"
 # Universe & sector helpers
 # ---------------------------------------------------------------------------
 
-def get_universe_tickers(config: Any = None) -> List[str]:
-    """Return the universe ticker list.
+def get_universe_tickers(config: Any = None, tickers: Optional[List[str]] = None) -> List[str]:
+    """Return the ticker list for peer-stats computation.
 
-    Prefers ``config.WATCHLIST`` when present and non-empty (lets a user
-    scope the calibration to what they actually track); otherwise falls
-    back to the full ``universe.US_UNIVERSE`` (~600 names).
+    Defaults to the full ``universe.US_UNIVERSE``. ``config.WATCHLIST`` is
+    intentionally ignored: peer-relative scoring needs a real per-sector
+    distribution, and scoping to the handful of names being analyzed
+    collapses every sector to 0-few peers. An explicit ``tickers`` list may
+    be injected (used by tests) to override the universe source.
     """
-    if config is not None:
-        wl = getattr(config, "WATCHLIST", None)
-        if wl:
-            return list(wl)
+    if tickers is not None:
+        return list(tickers)
     try:
         from data.universe import US_UNIVERSE
         return list(US_UNIVERSE)
@@ -130,7 +131,7 @@ def compute_all_sector_peer_stats(
 
     A (sector, metric) entry is omitted when fewer than ``_MIN_PEERS``
     tickers have a usable value. Sample standard deviation (ddof=1) is
-    used — these are samples of a population, not the population itself.
+    used â€” these are samples of a population, not the population itself.
     """
     # First pass: bucket raw values by sector -> metric -> [values].
     buckets: Dict[str, Dict[str, List[float]]] = {}
@@ -138,7 +139,7 @@ def compute_all_sector_peer_stats(
     for tk in tickers:
         try:
             m = get_metrics_fn(tk)
-        except Exception as e:  # noqa: BLE001 — one bad ticker must not abort the run
+        except Exception as e:  # noqa: BLE001 â€” one bad ticker must not abort the run
             logger.debug("peer_stats | %s | metrics fetch failed: %s", tk, e)
             continue
         if not isinstance(m, dict):
@@ -180,7 +181,7 @@ def peer_stats_for_sector(
 ) -> Dict[str, Dict[str, float]]:
     """Pull the ``{metric: {mean, std, n}}`` block for one sector.
 
-    Returns ``{}`` when the sector is unknown or absent — which makes the
+    Returns ``{}`` when the sector is unknown or absent â€” which makes the
     scanner fall back to its own sector defaults, exactly as if no real
     stats existed for that sector.
     """
@@ -243,7 +244,11 @@ def load_peer_stats_cache(
     if not isinstance(epoch, (int, float)):
         return None
     age_hours = (time.time() - epoch) / 3600.0
-    if age_hours > max_age_hours:
+    # >= (not >) so that max_age_hours=0.0 means "any cache is stale" — a
+    # just-written cache has age ~0.0, and 0.0 > 0.0 is False, which would
+    # wrongly serve it. The boundary case (age exactly == max_age) is also
+    # correctly treated as stale.
+    if age_hours >= max_age_hours:
         logger.info("peer_stats | cache stale (%.1fh > %.1fh)", age_hours, max_age_hours)
         return None
 
@@ -261,6 +266,7 @@ def get_or_compute_peer_stats(
     data_dir: str = "data",
     max_age_hours: float = 24.0,
     force: bool = False,
+    tickers: Optional[List[str]] = None,
 ) -> Dict[str, Dict[str, Dict[str, float]]]:
     """Return peer stats, using the disk cache when it is fresh.
 
@@ -269,14 +275,25 @@ def get_or_compute_peer_stats(
     the cache. ``force=True`` bypasses the cache (useful for a manual
     refresh).
     """
+    # Minimum sectors a healthy cache must contain. A degenerate cache (e.g.
+    # 1 sector from a prior run that only saw watchlist tech names) is treated
+    # as invalid and forces a recompute, regardless of age. This self-heals
+    # the poisoning failure mode where a thin cache stayed "fresh" for 24h.
+    _MIN_HEALTHY_SECTORS = 5
+
     if not force:
         cached = load_peer_stats_cache(max_age_hours=max_age_hours, data_dir=data_dir)
-        if cached is not None:
+        if cached is not None and (tickers is not None or len(cached) >= _MIN_HEALTHY_SECTORS):
             logger.info("peer_stats | using cached stats (%d sectors)", len(cached))
             return cached
+        if cached is not None:
+            logger.info(
+                "peer_stats | cache has only %d sector(s) (< %d) — recomputing",
+                len(cached), _MIN_HEALTHY_SECTORS,
+            )
 
-    tickers = get_universe_tickers(config)
-    stats = compute_all_sector_peer_stats(get_metrics_fn, tickers)
+    universe = get_universe_tickers(config, tickers=tickers)
+    stats = compute_all_sector_peer_stats(get_metrics_fn, universe)
     cache_peer_stats(stats, data_dir=data_dir)
     return stats
 

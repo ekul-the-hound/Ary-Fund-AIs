@@ -756,17 +756,8 @@ def _rag_retrieve(ticker: str, cfg) -> list[dict]:
         return []
 
     try:
-        # Query phrased in language that actually appears in 10-K/10-Q
-        # text. The prior query ("investment analysis: thesis, recent
-        # moves") was a meta-description with no lexical/semantic overlap
-        # with filing prose, so the reranker scored everything negative
-        # and surfaced boilerplate (proxy TOC, holders-of-record) over the
-        # substantive risk-factor and MD&A sections. These terms mirror
-        # the headings and disclosure language in the filings themselves.
         query = (
-            f"{ticker} risk factors, management discussion and analysis, "
-            "revenue and segment results, margins, liquidity and capital "
-            "resources, competition, and material business risks"
+            f"investment analysis: thesis, risks, and recent moves for {ticker}"
         )
         # Phase 4 guard: only retrieve self-indexed theses with high
         # composite quality; always retrieve external content.
@@ -1436,28 +1427,103 @@ def get_sector_peer_stats(
     """
     try:
         from data import peer_stats as _peer_stats
-        from agent.filing_analyzer import extract_key_metrics_for_agent
+        from agent.filing_analyzer import summarize_filings_by_year
     except Exception as e:  # noqa: BLE001
         logger.warning("peer stats unavailable (%s); scanner uses defaults", e)
         return {}
 
     data_dir = str(getattr(cfg, "DATA_DIR", "data"))
 
-    def _metrics_for(tk: str):
-        # Build the same metric snapshot the scanner sees for this ticker.
-        try:
-            ctx = build_agent_context(tk, db_path, cfg)
-            metrics_raw = ctx.get("metrics") or {}
-            prices = ctx.get("prices") or {}
-            price = ctx.get("price") or prices.get("last") or prices.get("price") or 0.0
-            snap = extract_key_metrics_for_agent(tk, metrics_raw, float(price or 0.0))
-            # Ensure the sector tag is present for bucketing.
-            if isinstance(snap, dict) and not snap.get("sector"):
-                snap["sector"] = metrics_raw.get("sector")
-            return snap
-        except Exception as e:  # noqa: BLE001 — one ticker must not abort calibration
-            logger.debug("peer stats | %s | snapshot failed: %s", tk, e)
+    # Universe peer stats for the risk-count penalty need only TWO things per
+    # ticker: its sector and its risk_factor_count. Both are available cheaply
+    # and OFFLINE from the cache tables the backfills populated
+    # (fundamentals_cache for sector, sec_filings for filing text). We
+    # deliberately do NOT call build_agent_context here: that goes through the
+    # registry/RAG/lazy-network path, which is expensive and fails for the
+    # ~500 universe names that were filing/fundamentals-backfilled but never
+    # fully run through the registry — collapsing the distribution to a
+    # handful of tickers. The financial-ratio peer stats (debt_ebitda, etc.)
+    # are a separate concern and are not computed in this universe pass.
+    try:
+        _md = MarketData(db_path=db_path)
+    except Exception:  # noqa: BLE001
+        _md = None
+    try:
+        _sec = SECFetcher(db_path=db_path)
+    except Exception:  # noqa: BLE001
+        _sec = None
+
+    def _sector_for(tk: str):
+        """Sector tag read DIRECTLY from the fundamentals_cache table.
+
+        Strictly offline: no get_fundamentals (which is cache-FIRST and
+        falls through to a live yfinance fetch on a stale entry), and no
+        TTL check. Sector is immutable, so any cached row is authoritative.
+        Returns None if the ticker has no cached fundamentals row.
+        """
+        if _md is None:
             return None
+        try:
+            import json as _json
+            import sqlite3 as _sqlite3
+            with _sqlite3.connect(_md.db_path) as _conn:
+                _row = _conn.execute(
+                    "SELECT data_json FROM fundamentals_cache WHERE ticker = ?",
+                    (tk,),
+                ).fetchone()
+            if not _row or not _row[0]:
+                return None
+            _data = _json.loads(_row[0])
+        except Exception:  # noqa: BLE001
+            return None
+        if not isinstance(_data, dict):
+            return None
+        s = _data.get("sector")
+        return s.strip() if isinstance(s, str) and s.strip() else None
+
+    def _risk_count_for(tk: str) -> int:
+        """risk_factor_count from CACHED filings only (no network). 0 if none."""
+        if _sec is None:
+            return 0
+        filings = []
+        # Match the AGENT path's annual/quarterly basis (1x 10-K, 2x 10-Q)
+        # so a ticker's CONTRIBUTED count == the count it is SCORED as.
+        # 8-Ks are excluded: they rarely carry Item-1A risk language and
+        # their date-relative selection would make the distribution drift.
+        for kind, _n in (("10-K", 1), ("10-Q", 2)):
+            try:
+                cached = _sec._get_cached_filings(tk, kind, _n, None, None)
+            except Exception:  # noqa: BLE001
+                cached = []
+            for f in cached:
+                acc = f.get("accession_number")
+                if not acc:
+                    continue
+                try:
+                    txt = _sec.get_filing_text(acc)
+                except Exception:  # noqa: BLE001
+                    txt = ""
+                if txt:
+                    filings.append({**f, "text": txt})
+        if not filings:
+            return 0
+        try:
+            summ = summarize_filings_by_year(tk, filings)
+            return int(summ.get("risk_factor_count") or 0)
+        except Exception:  # noqa: BLE001
+            return 0
+
+    def _metrics_for(tk: str):
+        # Cheap, offline snapshot: sector (for bucketing) + risk_factor_count
+        # (the only metric the risk-count penalty reads). Returns None when the
+        # ticker has no sector, so the aggregator skips it.
+        sector = _sector_for(tk)
+        if sector is None:
+            return None
+        return {
+            "sector": sector,
+            "risk_factor_count": _risk_count_for(tk),
+        }
 
     return _peer_stats.get_or_compute_peer_stats(
         _metrics_for, config=cfg, data_dir=data_dir,

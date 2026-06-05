@@ -1,7 +1,7 @@
 """
 tests/test_peer_stats.py
 ========================
-Tests for data/peer_stats.py — real per-sector peer-statistic computation,
+Tests for data/peer_stats.py â€” real per-sector peer-statistic computation,
 caching, and the proof that real stats differ from the scanner's hardcoded
 sector defaults (which is the entire point of the module).
 """
@@ -96,7 +96,7 @@ class TestCompute:
 class TestDiffersFromDefaults:
     def test_real_stats_reflect_actual_cohort_not_defaults(self):
         """Real peer stats are derived from the actual cohort, so they
-        carry the cohort's true ``n`` and ``std`` — not the hardcoded
+        carry the cohort's true ``n`` and ``std`` â€” not the hardcoded
         default's representative ``n``. (We assert on n/std rather than
         mean, because a default mean can coincidentally equal a small
         synthetic cohort's mean.)"""
@@ -166,13 +166,13 @@ class TestCache:
             WATCHLIST = _TICKERS
 
         first = peer_stats.get_or_compute_peer_stats(
-            _counting, config=Cfg, data_dir=str(tmp_path),
+            _counting, config=Cfg, data_dir=str(tmp_path), tickers=_TICKERS,
         )
         n_after_first = calls["n"]
         assert n_after_first > 0  # computed
 
         second = peer_stats.get_or_compute_peer_stats(
-            _counting, config=Cfg, data_dir=str(tmp_path),
+            _counting, config=Cfg, data_dir=str(tmp_path), tickers=_TICKERS,
         )
         assert calls["n"] == n_after_first  # cache hit -> no further calls
         assert second == first
@@ -180,10 +180,10 @@ class TestCache:
     def test_force_bypasses_cache(self, tmp_path):
         class Cfg:
             WATCHLIST = _TICKERS
-        peer_stats.get_or_compute_peer_stats(_get_metrics, config=Cfg, data_dir=str(tmp_path))
+        peer_stats.get_or_compute_peer_stats(_get_metrics, config=Cfg, data_dir=str(tmp_path), tickers=_TICKERS)
         # force should recompute even though cache is fresh
         out = peer_stats.get_or_compute_peer_stats(
-            _get_metrics, config=Cfg, data_dir=str(tmp_path), force=True,
+            _get_metrics, config=Cfg, data_dir=str(tmp_path), force=True, tickers=_TICKERS,
         )
         assert "technology" in out
 

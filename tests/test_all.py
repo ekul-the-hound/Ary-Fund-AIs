@@ -1,4 +1,4 @@
-﻿"""
+"""
 Combined Test Suite — ARY Fund
 ==============================
 

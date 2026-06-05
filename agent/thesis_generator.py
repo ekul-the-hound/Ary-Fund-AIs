@@ -144,6 +144,7 @@ def generate_thesis(
     metrics: Dict[str, Any],
     macro: Dict[str, Any],
     risk_flags: Dict[str, Any],
+    peer_stats: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     """Produce a 1-year thesis dict for a single ticker.
 
@@ -173,7 +174,7 @@ def generate_thesis(
     # Three component biases, each in roughly [-1, +1].
     fund_bias = _score_fundamentals_bias(m)
     macro_bias = _score_macro_bias(mc)
-    filings_bias = _score_filings_bias(fs)
+    filings_bias = _score_filings_bias(fs, peer_stats=peer_stats)
 
     raw_bias = (
         _WEIGHT_FUNDAMENTALS * fund_bias
@@ -412,11 +413,25 @@ def _score_macro_bias(macro: Dict[str, Any]) -> float:
     return _clip(sum(signals) / len(signals), -1.0, 1.0)
 
 
-def _score_filings_bias(filings_summary: Dict[str, Any]) -> float:
-    """Map management tone and red flags to a bias."""
+def _score_filings_bias(
+    filings_summary: Dict[str, Any],
+    peer_stats: Optional[Dict[str, Any]] = None,
+) -> float:
+    """Map management tone, red flags, and (sector-relative) risk count to a bias.
+
+    Parameters
+    ----------
+    filings_summary:
+        Output of ``summarize_filings_by_year`` — carries ``management_tone``,
+        ``red_flags`` and ``risk_factor_count`` (true, uncapped).
+    peer_stats:
+        Optional ``{metric: {mean, std, n}}`` slice for THIS ticker's sector
+        (from ``peer_stats.peer_stats_for_sector``). When it contains a
+        ``risk_factor_count`` entry, the risk-count penalty is applied
+        SECTOR-RELATIVELY. Absent / thin sector -> no risk-count penalty.
+    """
     tone = filings_summary.get("management_tone", "neutral")
     red_flags = filings_summary.get("red_flags") or []
-    risk_factors = filings_summary.get("risk_factors") or []
 
     tone_score = {
         "confident": 0.5,
@@ -428,25 +443,59 @@ def _score_filings_bias(filings_summary: Dict[str, Any]) -> float:
     # Each red flag knocks meaningful bias off; cap the hit.
     red_flag_penalty = min(0.8, 0.3 * len(red_flags))
 
-    # Risk-factor COUNT penalty — currently DISABLED.
+    # Risk-factor COUNT penalty — SECTOR-RELATIVE.
     #
-    # The old rule ("len(risk_factors) >= 15 -> -0.2") was an absolute
-    # threshold. It only discriminated while risk extraction was broken and
-    # most tickers reported 0-3 factors. With extraction fixed, every
-    # large-cap 10-K lists 15-20+ risk factors, so the penalty fired
-    # universally — a constant, not a signal — and pushed clean, healthy
-    # filings (e.g. AAPL, PEP) to a negative filings bias purely for having
-    # a normal number of risks.
-    #
-    # The count is preserved on the summary as ``risk_factor_count`` (true,
-    # uncapped) so this can be reintroduced as a SECTOR-RELATIVE penalty:
-    # penalize only when a ticker's risk count is materially above its
-    # peer-group mean (via data/peer_stats.py), which is the real signal.
-    # Until that lands, the count contributes nothing.
-    rf_penalty = 0.0
+    # An absolute threshold (">=15 risks -> penalty") is useless: every
+    # large-cap 10-K lists 15-100+ risk-cue sentences, so it fires
+    # universally. What's actually informative is listing materially MORE
+    # risk than your sector peers. We z-score the ticker's true
+    # ``risk_factor_count`` against the sector distribution and penalize only
+    # the right tail. No peer stats (unknown/thin sector) -> no penalty, so
+    # the term degrades gracefully to neutral rather than to a false signal.
+    rf_penalty = _risk_count_penalty(
+        int(filings_summary.get("risk_factor_count") or 0),
+        peer_stats,
+    )
 
     bias = tone_score - red_flag_penalty - rf_penalty
     return _clip(bias, -1.0, 1.0)
+
+
+# How many sample std-devs above the sector mean before the risk count
+# counts as a real signal, and the maximum penalty it can apply.
+_RISK_Z_THRESHOLD = 1.0   # only the upper tail (>1σ above peers) is penalized
+_RISK_Z_FULLSCALE = 3.0   # z at which the penalty saturates
+_RISK_MAX_PENALTY = 0.3   # cap, comparable to one red flag
+
+
+def _risk_count_penalty(
+    count: int,
+    peer_stats: Optional[Dict[str, Any]],
+) -> float:
+    """Penalty in [0, _RISK_MAX_PENALTY] for an unusually high risk count.
+
+    Linear ramp from ``_RISK_Z_THRESHOLD`` to ``_RISK_Z_FULLSCALE`` standard
+    deviations above the sector mean. Returns 0.0 when peer stats are
+    missing, the sector lacks a ``risk_factor_count`` distribution, or the
+    std is degenerate — i.e. whenever a sector-relative judgement can't be
+    made, so the term never invents a signal.
+    """
+    if not peer_stats or not isinstance(peer_stats, dict):
+        return 0.0
+    stats = peer_stats.get("risk_factor_count")
+    if not isinstance(stats, dict):
+        return 0.0
+    mean = stats.get("mean")
+    std = stats.get("std")
+    if mean is None or std is None or std <= 0:
+        return 0.0
+    z = (count - mean) / std
+    if z <= _RISK_Z_THRESHOLD:
+        return 0.0
+    # Linear ramp; clamp to full-scale.
+    frac = (z - _RISK_Z_THRESHOLD) / (_RISK_Z_FULLSCALE - _RISK_Z_THRESHOLD)
+    frac = max(0.0, min(1.0, frac))
+    return _RISK_MAX_PENALTY * frac
 
 
 # =============================================================================

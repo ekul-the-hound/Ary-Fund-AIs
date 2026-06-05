@@ -1,4 +1,4 @@
-﻿from __future__ import annotations
+from __future__ import annotations
 import argparse, sqlite3, sys, time
 from typing import List, Set
 import config
