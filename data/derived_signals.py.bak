@@ -250,8 +250,6 @@ class DerivedSignals:
             )
 
         # Push canonical fields to the registry
-        # Regime (hoisted so it is always defined for the return)
-        regime = self._classify_regime(close.iloc[-1], sma50, sma200, dd)
         if self.registry:
             for field, val in (
                 ("ticker.signal.rsi_14", rsi14),
@@ -268,7 +266,7 @@ class DerivedSignals:
                     value_num=float(val), confidence=1.0,
                 )
             # Regime
-            # (regime computed above; value reused here)
+            regime = self._classify_regime(close.iloc[-1], sma50, sma200, dd)
             if regime:
                 self.registry.upsert_point(
                     ticker, "ticker", "ticker.signal.regime",
@@ -283,7 +281,6 @@ class DerivedSignals:
             "rsi_14": rsi14, "sma_50": sma50, "sma_200": sma200,
             "realized_vol_30d": rv30, "drawdown_252d": dd,
             "rs_pairs": len(rs_results),
-            "regime": regime,
         }
 
     @staticmethod

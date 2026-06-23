@@ -1273,26 +1273,24 @@ def _render_filter_bar() -> None:
 
 
 def _reset_filters() -> None:
-    """Clear all filter state by DELETING widget keys.
+    """Clear all filter state. Bound to a 'Clear filters' button."""
+    for k, default in _FILTER_DEFAULTS.items():
+        st.session_state[k] = default
+        # Also clear paired widget keys (sliders use a separate _widget key
+        # so we can mirror values into the canonical state key).
+        st.session_state.pop(f"{k}_widget", None)
+    # Multiselect-only keys
+    for k in ("_flt_mcap", "_flt_sector", "_flt_rating"):
+        st.session_state[k] = []
+    # Price min/max number inputs
+    st.session_state["_flt_price_min"] = 0.0
+    st.session_state["_flt_price_max"] = 1_000_000.0
 
-    Assigning to a widget-backed key after the widget is instantiated raises
-    StreamlitAPIException. Deleting the key (so the widget re-initializes from
-    its default on the next run) is the supported reset pattern. This function
-    is invoked from the top of render_screener_tab BEFORE any widget is built,
-    via the `_screener_do_reset` flag set by the Clear-filters button.
-    """
-    keys = list(_FILTER_DEFAULTS.keys()) + [
-        f"{k}_widget" for k in _FILTER_DEFAULTS
-    ] + [
-        "_flt_mcap", "_flt_sector", "_flt_rating",
-        "_flt_price_min", "_flt_price_max",
-        "_flt_change_widget", "_flt_pe_widget", "_flt_epsg_widget",
-        "_flt_dy_widget", "_flt_revg_widget", "_flt_peg_widget",
-        "_flt_roe_widget", "_flt_beta_widget",
-    ]
-    for k in keys:
-        st.session_state.pop(k, None)
 
+
+# ======================================================================
+# Category radio (Overview / Performance / …)
+# ======================================================================
 def _render_category_tabs() -> str:
     """Horizontal radio styled as TradingView pill tabs."""
     st.markdown("<div class='ary-screener-cats'>", unsafe_allow_html=True)
@@ -1419,11 +1417,6 @@ def _render_data_source_banner(df: pd.DataFrame) -> None:
 # ======================================================================
 def render_screener_tab() -> None:
     """Render the entire Screener tab. Safe to call inside a `with tab_x:`."""
-    # Handle a pending Clear-filters request BEFORE any widget is
-    # instantiated. Deleting widget keys here (rather than assigning
-    # to them after the widgets exist) is the only crash-free reset.
-    if st.session_state.pop("_screener_do_reset", False):
-        _reset_filters()
     st.markdown(_SCREENER_CSS, unsafe_allow_html=True)
     _render_header()
     _render_search_box()  # Issue #4: free-text ticker search
@@ -1442,10 +1435,7 @@ def render_screener_tab() -> None:
             key="_screener_clear_filters",
             disabled=(active_filters == 0),
         ):
-            # Set a flag and rerun; the actual key deletion happens at
-            # the top of render_screener_tab BEFORE widgets are built,
-            # which is the only safe place to reset widget-backed keys.
-            st.session_state["_screener_do_reset"] = True
+            _reset_filters()
             st.rerun()
 
     st.markdown("")  # spacer

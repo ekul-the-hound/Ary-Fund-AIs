@@ -421,6 +421,7 @@ def panel_risk_triplet(risk_flags: Mapping[str, Any] | None,
         ("Fundamental", "fundamental"),
         ("Macro", "macro"),
         ("Market", "market"),
+        ("Agent (LLM)", "agent"),
     ]
     for label, key in axes:
         level = levels.get(key, "unknown")
@@ -465,6 +466,7 @@ def inline_risk_triplet(risk_flags: Mapping[str, Any] | None) -> str:
         _dot("fundamental", "F"),
         _dot("macro", "M"),
         _dot("market", "Mk"),
+        _dot("agent", "A"),
     ])
     combined = levels.get("combined", "unknown")
     return (
@@ -619,9 +621,18 @@ def card_evidence(chunk: Mapping[str, Any]) -> None:
     )
 
     snippet = text if len(text) <= 320 else text[:317].rstrip() + "…"
+    # Escape HTML/markdown-significant characters so raw filing text (which
+    # often contains leading spaces, parentheses, and dollar figures) renders
+    # as plain prose rather than being styled as green code blocks by
+    # markdown. We render inside an explicit HTML span, so we escape < > &
+    # and collapse runs of leading whitespace that markdown treats as code.
+    import html as _html
+    safe_snippet = _html.escape(snippet)
+    safe_title = _html.escape(text[:1000])
     body = (
-        f"<div style='font-size:0.84em;line-height:1.5;color:#cbd5e1;' "
-        f"title='{text[:1000].replace(chr(39), chr(8217))}'>{snippet}</div>"
+        f"<div style='font-size:0.84em;line-height:1.5;color:#cbd5e1;"
+        f"white-space:normal;' "
+        f"title='{safe_title}'>{safe_snippet}</div>"
     )
 
     footer_bits = []
@@ -757,6 +768,15 @@ def panel_review_scorecard(review: Mapping[str, Any] | None) -> None:
                 f"font-variant-numeric:tabular-nums;'>{val:.0f}</span></div>",
                 unsafe_allow_html=True,
             )
+
+    # Full review reasoning (the prose behind the scores). The reviewer emits
+    # a 'text' field explaining each section's score and the main weakness;
+    # surfacing it lets the analyst see WHY a section scored low, not just THAT
+    # it did.
+    review_text = (review or {}).get("text")
+    if review_text and isinstance(review_text, str) and review_text.strip():
+        with st.expander("Why these scores? (full review)", expanded=False):
+            st.markdown(review_text)
 
 
 # ======================================================================

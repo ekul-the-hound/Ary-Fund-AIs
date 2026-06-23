@@ -3863,7 +3863,11 @@ def db(tmp_path: Path) -> str:
 
 @pytest.fixture
 def base_universe(db: str) -> list[str]:
-    return _seed_universe(db)
+    # Seed ending today so the data is fresh relative to the default
+    # as_of=now used by the fixture-based tests (the pulse freshness
+    # filter excludes prices older than max_staleness_days). The
+    # as_of-pinned tests call _seed_universe directly and are unaffected.
+    return _seed_universe(db, end_date=datetime.now())
 
 
 # ===========================================================================
