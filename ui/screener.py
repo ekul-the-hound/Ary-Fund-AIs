@@ -889,11 +889,15 @@ def _build_screener_frame() -> pd.DataFrame:
         sym = df.at[ridx, "symbol"]
         if not sym:
             continue
-        # Skip if we already have fundamentals (market_cap + pe + sector).
+        # Skip only if we already have DEEP fundamentals. We key on
+        # gross_margin specifically because the offline fallback fills the
+        # shallow fields (market_cap + pe + sector) for megacaps but NOT the
+        # deep ones — keying on pe/sector here would wrongly skip those names
+        # and leave their margins/ROE/PEG/etc. permanently None.
         already = (
-            pd.notna(df.at[ridx, "market_cap"])
-            and pd.notna(df.at[ridx, "pe"])
-            and df.at[ridx, "sector"] not in (None, "", "—")
+            pd.notna(df.at[ridx, "gross_margin"])
+            and pd.notna(df.at[ridx, "roe"])
+            and pd.notna(df.at[ridx, "market_cap"])
         )
         if already:
             continue

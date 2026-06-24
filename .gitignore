@@ -131,3 +131,6 @@ $RECYCLE.BIN/
 *.py.bak
 *.bak
 *.py.bak
+
+*.bak
+*.py.bak

@@ -187,22 +187,69 @@ def render_data_point_analyzer_section(
     )
 
     result_key = f"dpa_result_{ticker}"
+    job_key = f"dpa_job_{ticker}"
+
+    # Deep per-point generation makes N+1 LLM calls and can take several
+    # minutes, so we run it as a BACKGROUND JOB (via ui.state.submit_job)
+    # rather than blocking the UI. The worker calls analyze_data_points
+    # (pure backend, no st.*); we poll the job and render when it finishes.
+    try:
+        from ui import state as S
+        _HAS_JOBS = True
+    except Exception:
+        _HAS_JOBS = False
 
     if generate:
-        with st.spinner(
-            f"Generating {total_paragraphs}-paragraph analysis for {ticker}... "
-            "(this may take 30-180 seconds depending on model and selection size)"
-        ):
-            try:
-                result = analyze_data_points(
-                    ticker=ticker,
-                    selected_keys=selected,
-                    context=context,
-                    config=config,
+        if _HAS_JOBS:
+            job_id = S.submit_job(
+                "analysis", ticker,
+                analyze_data_points,
+                ticker, selected, context, config, True,  # deep=True
+                label=f"analysis · {ticker} ({n_selected} pts)",
+            )
+            st.session_state[job_key] = job_id
+            st.session_state.pop(result_key, None)  # clear stale result
+            st.rerun()
+        else:
+            # No job queue available — fall back to blocking generation.
+            with st.spinner(
+                f"Generating {n_selected}-point deep analysis for {ticker}... "
+                "(several minutes; per-point generation)"
+            ):
+                try:
+                    result = analyze_data_points(
+                        ticker=ticker, selected_keys=selected,
+                        context=context, config=config, deep=True,
+                    )
+                    st.session_state[result_key] = result
+                except Exception as exc:
+                    st.error(f"Analysis failed: {exc}")
+                    return
+
+    # --- Poll an in-flight job ------------------------------------------
+    if _HAS_JOBS and st.session_state.get(job_key):
+        job = S.get_job(st.session_state[job_key])
+        if job is not None:
+            if job.state in (S.JobState.QUEUED, S.JobState.RUNNING):
+                st.info(
+                    f"⏳ Deep analysis running for {ticker} "
+                    f"({n_selected} points, ~{(n_selected + 1) * 30}s est). "
+                    "It runs in the background — you can use other tabs; "
+                    "this section updates when it's done."
                 )
-                st.session_state[result_key] = result
-            except Exception as exc:
-                st.error(f"Analysis failed: {exc}")
+                # Light auto-refresh so the result appears without a manual
+                # click. maybe_autorefresh reruns periodically while jobs run.
+                try:
+                    S.maybe_autorefresh()
+                except Exception:
+                    pass
+                return
+            elif job.state == S.JobState.DONE:
+                st.session_state[result_key] = job.result
+                st.session_state.pop(job_key, None)
+            elif job.state == S.JobState.ERROR:
+                st.error(f"Analysis job failed: {getattr(job, 'error', 'unknown error')}")
+                st.session_state.pop(job_key, None)
                 return
 
     # --- Render result ---------------------------------------------------

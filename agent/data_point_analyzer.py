@@ -579,6 +579,28 @@ _PARAGRAPH_TEMPERATURE: float = 0.15
 _TARGET_WORDS_PER_PARA_MIN: int = 150
 _TARGET_WORDS_PER_PARA_MAX: int = 200
 
+# --- Per-point ("deep") generation mode -------------------------------------
+# When enabled, analyze_data_points makes ONE LLM call per selected data point
+# (plus one overview call) instead of a single combined call. Each point gets
+# the model's full attention and token budget, which yields longer, more
+# specific paragraphs. The trade-off is wall-clock time: N+1 calls instead of
+# 1, so this is intended to be run as a BACKGROUND JOB (the UI submits it to
+# the job queue rather than blocking on it).
+_DEEP_MODE_DEFAULT: bool = True
+# Minimum words per per-point paragraph. The prompt asks for this, and we
+# retry ONCE if the model comes back materially short. Note: an 8B local model
+# will not always hit a high floor exactly; we treat this as a strong target
+# with one retry, not a hard guarantee, because forcing it harder tends to
+# produce padding/repetition rather than genuine analysis.
+_MIN_WORDS_PER_POINT: int = 300
+# If a per-point call returns fewer than this fraction of the floor, retry once
+# with an "expand it" nudge. 0.8 => retry if under 240 words for a 300 floor.
+_RETRY_BELOW_FRACTION: float = 0.8
+# Per-point generation temperature (slightly higher than the combined-mode
+# 0.15 to give the model room to develop distinct angles across 300 words
+# without collapsing into repetition).
+_DEEP_POINT_TEMPERATURE: float = 0.25
+
 
 # =============================================================================
 # PUBLIC API
@@ -650,6 +672,8 @@ def analyze_data_points(
     selected_keys: List[str],
     context: Dict[str, Any],
     config: Any,
+    deep: Optional[bool] = None,
+    progress_cb: Optional[Any] = None,
 ) -> Dict[str, Any]:
     """Generate overview + per-point analysis paragraphs.
 
@@ -659,6 +683,16 @@ def analyze_data_points(
         The ticker being analyzed (e.g. "AAPL").
     selected_keys : list of str
         Dotted-path keys from AVAILABLE_DATA_POINTS that the user checked.
+    deep : bool, optional
+        If True (the default via _DEEP_MODE_DEFAULT), generate ONE LLM call per
+        selected point (plus one overview call), each asked for a long
+        (_MIN_WORDS_PER_POINT) paragraph. This is slower (N+1 calls) and is
+        intended to run as a background job. If False, use the legacy single
+        combined call.
+    progress_cb : callable, optional
+        Optional callback ``progress_cb(done: int, total: int, label: str)``
+        invoked after each per-point call in deep mode, so a job runner can
+        report progress. Ignored in legacy mode.
     context : dict
         Output of ``data.pipeline.build_agent_context(ticker)``. Used to
         look up values for each selected key. No extra API calls are made.
@@ -711,6 +745,15 @@ def analyze_data_points(
     industry = context.get("industry") or context.get("metrics", {}).get("industry") or "n/a"
     as_of = context.get("as_of") or time.strftime("%Y-%m-%d")
 
+    company_name = (
+        context.get("metrics", {}).get("name")
+        or context.get("metrics", {}).get("shortName")
+        or context.get("metrics", {}).get("longName")
+        or ticker
+    )
+
+    use_deep = _DEEP_MODE_DEFAULT if deep is None else bool(deep)
+
     prompt = _build_prompt(
         ticker=ticker,
         sector=sector,
@@ -722,6 +765,70 @@ def analyze_data_points(
 
     pseudo_request = AgentRequest(prompt=prompt, context={}, model_tag=None)
     model_used = _resolve_model(pseudo_request, config)
+
+    # --- Deep (per-point) mode -----------------------------------------
+    # One overview call + one call per point, each asked for a long paragraph.
+    # Slower (N+1 calls) so this is meant to run as a background job. Mock mode
+    # falls through to the legacy deterministic path below.
+    if use_deep and model_used != "mock":
+        total_steps = len(valid_keys) + 1
+        paragraphs: Dict[str, str] = {}
+
+        # 1) Overview.
+        try:
+            ov_prompt = _build_overview_only_prompt(
+                ticker, company_name, sector, industry, as_of, valid_keys, context)
+            overview = _call_ollama_text(
+                ov_prompt, model_used, config,
+                temperature=_PARAGRAPH_TEMPERATURE).strip()
+        except Exception as exc:
+            logger.warning("data_point_analyzer | %s | overview failed: %s",
+                           ticker, exc)
+            overview = ""
+        if progress_cb:
+            try:
+                progress_cb(1, total_steps, "Overview")
+            except Exception:
+                pass
+
+        # 2) One call per point.
+        for i, k in enumerate(valid_keys, start=1):
+            para = _generate_point_deep(
+                ticker, company_name, sector, industry, as_of, k,
+                context, model_used, config)
+            paragraphs[k] = para
+            if progress_cb:
+                try:
+                    progress_cb(1 + i, total_steps, get_display_name(k))
+                except Exception:
+                    pass
+
+        # Assemble combined text (overview + headered paragraphs) so callers
+        # that read result["text"] still work.
+        text_parts: List[str] = []
+        if overview:
+            text_parts.append(f"Overview:\n{overview}")
+        for k in valid_keys:
+            text_parts.append(f"{get_display_name(k)}:\n{paragraphs.get(k, '').strip()}")
+        text = "\n\n".join(text_parts)
+
+        elapsed_ms = (time.perf_counter() - started_at) * 1000.0
+        word_count = len(text.split())
+        logger.info(
+            "data_point_analyzer | %s | DEEP | model=%s | points=%d | "
+            "words=%d | elapsed_ms=%.0f",
+            ticker, model_used, len(valid_keys), word_count, elapsed_ms,
+        )
+        return {
+            "text": text,
+            "overview": overview,
+            "paragraphs": paragraphs,
+            "selected_keys": valid_keys,
+            "model_used": model_used,
+            "elapsed_ms": round(elapsed_ms, 1),
+            "fallback": False,
+            "word_count": word_count,
+        }
 
     if model_used == "mock":
         logger.info("data_point_analyzer | %s | mock mode -> deterministic fallback", ticker)
@@ -936,6 +1043,164 @@ Produce {total_paragraphs} paragraphs total: ONE overview paragraph plus one par
 {output_template}
 
 Now write the analysis for {company_name} ({ticker})."""
+
+
+def _build_single_point_prompt(
+    ticker: str,
+    company_name: str,
+    sector: str,
+    industry: str,
+    as_of: str,
+    key: str,
+    context: Dict[str, Any],
+    min_words: int,
+    expand_hint: bool = False,
+) -> str:
+    """Build a prompt for ONE data point, asking for a long, dense paragraph.
+
+    Used by the per-point ("deep") generation mode. Because the model only has
+    to write about a single metric here, it can use its full token budget on
+    that metric — which is what produces the longer, more specific paragraphs
+    the combined-mode prompt couldn't reliably deliver.
+
+    To fill ``min_words`` with genuine content (not padding), the prompt asks
+    the model to cover five distinct analytical angles: value restatement,
+    benchmark comparison, mechanism, risk/sensitivity, and an explicit stance.
+    """
+    display = get_display_name(key)
+    value = get_formatted_value(context, key)
+    guidance = METRIC_GUIDANCE.get(key, "")
+
+    # A few supporting anchors so the model can benchmark without inventing.
+    metrics = context.get("metrics") or {}
+    macro = context.get("macro") or {}
+    anchors: List[str] = []
+    if metrics.get("trailing_pe") is not None and key != "metrics.trailing_pe":
+        anchors.append(f"Trailing P/E (context): {_fmt_ratio(metrics.get('trailing_pe'))}")
+    if macro.get("fed_funds") is not None and key != "macro.fed_funds":
+        anchors.append(f"Fed Funds (context): {_fmt_pct_raw(macro.get('fed_funds'))}")
+    anchor_block = "; ".join(anchors) if anchors else "(none)"
+
+    guidance_block = f"\nGUIDANCE (how to reason about this metric): {guidance}" if guidance else ""
+
+    expand_block = ""
+    if expand_hint:
+        expand_block = (
+            "\n\nYOUR PREVIOUS ATTEMPT WAS TOO SHORT. Write a fuller paragraph "
+            f"of at least {min_words} words by developing EACH of the five "
+            "angles below in more depth — add a concrete benchmark, a specific "
+            "mechanism, and a sensitivity/scenario. Do NOT pad with repetition."
+        )
+
+    return f"""You are writing one paragraph of an institutional-grade equity research note for a hedge fund analyst.
+
+=== COMPANY ===
+{company_name} ({ticker}) — Sector: {sector}, Industry: {industry}. As of: {as_of}.
+
+=== THE METRIC TO ANALYZE ===
+{display}: {value}{guidance_block}
+
+=== SUPPORTING CONTEXT (for benchmarking only) ===
+{anchor_block}
+
+=== TASK ===
+Write ONE substantial, flowing paragraph of AT LEAST {min_words} words analyzing **{display}** for **{company_name} ({ticker})**. It must be specifically about this company, not generic sector commentary. To reach the length with real substance (not padding), develop all five of these angles in prose:
+
+1. Open by restating the EXACT value given above ({value}) verbatim — this is the only correct number for this metric.
+2. Benchmark it: compare to the sector average, the company's own history, a named peer, or the relevant macro norm.
+3. Mechanism: explain WHY this value is what it is and HOW it flows through to {company_name}'s cash flow, margins, valuation, or growth.
+4. Risk / sensitivity: what would change this metric, and what is the scenario in which it becomes a problem (or an opportunity)?
+5. Close with an explicit stance for THIS metric alone: "supports buying," "is a sell signal," or "is neutral," with the reason.
+
+=== RULES ===
+- NUMBER GROUNDING: Use the exact value {value} every time you reference this metric. Never substitute, re-round, or invent a different number.
+- Apply the GUIDANCE above — do not fall back to generic boilerplate.
+- Write in flowing prose, no bullet points, no headers inside the paragraph.
+- Mention {company_name} or {ticker} by name at least once.
+- Do not discuss other metrics except as a brief named benchmark.
+- Do not summarize the task or describe what you are doing. Just write the paragraph.{expand_block}
+
+Write the {display} paragraph now (single paragraph, at least {min_words} words):"""
+
+
+def _generate_point_deep(
+    ticker: str,
+    company_name: str,
+    sector: str,
+    industry: str,
+    as_of: str,
+    key: str,
+    context: Dict[str, Any],
+    model_used: str,
+    config: Any,
+) -> str:
+    """Generate one long paragraph for a single data point, with one retry.
+
+    Returns the paragraph text (without the header — the caller adds the
+    canonical "Display Name:" header). On failure, returns a short
+    deterministic stub so one bad point never sinks the whole run.
+    """
+    display = get_display_name(key)
+    prompt = _build_single_point_prompt(
+        ticker, company_name, sector, industry, as_of, key, context,
+        min_words=_MIN_WORDS_PER_POINT,
+    )
+    try:
+        text = _call_ollama_text(prompt, model_used, config,
+                                 temperature=_DEEP_POINT_TEMPERATURE)
+        text = (text or "").strip()
+        # Retry once if materially short.
+        if len(text.split()) < int(_MIN_WORDS_PER_POINT * _RETRY_BELOW_FRACTION):
+            logger.info(
+                "data_point_analyzer | %s | point=%s short (%d w) -> retry",
+                ticker, key, len(text.split()),
+            )
+            retry_prompt = _build_single_point_prompt(
+                ticker, company_name, sector, industry, as_of, key, context,
+                min_words=_MIN_WORDS_PER_POINT, expand_hint=True,
+            )
+            retry = _call_ollama_text(retry_prompt, model_used, config,
+                                      temperature=_DEEP_POINT_TEMPERATURE)
+            retry = (retry or "").strip()
+            # Keep whichever is longer (the retry occasionally regresses).
+            if len(retry.split()) > len(text.split()):
+                text = retry
+        return text
+    except Exception as exc:  # pragma: no cover - defensive
+        logger.warning("data_point_analyzer | %s | point=%s failed: %s",
+                       ticker, key, exc)
+        value = get_formatted_value(context, key)
+        return (f"{display} for {company_name} stands at {value}. "
+                f"(Per-point analysis unavailable — the language model did not "
+                f"return a usable response for this metric.)")
+
+
+def _build_overview_only_prompt(
+    ticker: str,
+    company_name: str,
+    sector: str,
+    industry: str,
+    as_of: str,
+    selected_keys: List[str],
+    context: Dict[str, Any],
+) -> str:
+    """Prompt for JUST the overview synthesis (used in per-point mode)."""
+    lines: List[str] = []
+    for k in selected_keys:
+        lines.append(f"- {get_display_name(k)}: {get_formatted_value(context, k)}")
+    block = "\n".join(lines)
+    return f"""You are writing the opening synthesis of an institutional equity research note.
+
+=== COMPANY ===
+{company_name} ({ticker}) — Sector: {sector}, Industry: {industry}. As of: {as_of}.
+
+=== SELECTED METRICS (exact values — do not change any number) ===
+{block}
+
+=== TASK ===
+Write ONE overview paragraph of 150-250 words that synthesizes these metrics into a single investment thesis for {company_name} ({ticker}). State which metrics are most bullish, which are most bearish, and give a clear BUY / HOLD / AVOID stance. Use only the exact values above; do not invent numbers. Write in prose, no bullets, no header. Do not describe the task — just write the overview.
+
+Overview paragraph:"""
 
 
 # =============================================================================
