@@ -132,7 +132,25 @@ EXTRA_LARGE_CAPS: Tuple[str, ...] = (
 # Combined US universe (used as default pool)
 # =============================================================================
 
-US_UNIVERSE: Tuple[str, ...] = tuple(sorted(set(SP500_TICKERS + EXTRA_LARGE_CAPS)))
+# Symbols that no longer return data from yfinance. Filtered out of the
+# combined universe below so they don't spam "possibly delisted" warnings on
+# every warm/scan. See fix_universe.py for the full rationale.
+#
+# 20 genuinely delisted / acquired / renamed:
+_DELISTED_DEAD = frozenset({
+    "ANSS", "CMA", "CTLT", "CTRA", "DAY", "DFS", "FI", "HES", "HOLX", "IPG",
+    "JNPR", "K", "MMC", "MRO", "PARA", "PSTG", "PXD", "RDFN", "SQ", "WBA",
+})
+# 2 ALIVE but format-mismatched (yfinance wants BRK-B / BF-B, not the dot
+# form normalize_ticker stores). Excluded until the FETCH layer maps .B-class
+# tickers to the hyphen form; re-add them then.
+_DELISTED_FORMAT = frozenset({"BRK.B", "BF.B"})
+
+_DELISTED = _DELISTED_DEAD | _DELISTED_FORMAT
+
+US_UNIVERSE: Tuple[str, ...] = tuple(
+    sorted(set(SP500_TICKERS + EXTRA_LARGE_CAPS) - _DELISTED)
+)
 
 
 # =============================================================================

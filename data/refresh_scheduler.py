@@ -67,6 +67,14 @@ Suggested cron entries
     25  9   * * 1-5  cd /path/to/project && python -m data.refresh_scheduler scan
 """
 from __future__ import annotations
+# Load cached HuggingFace models (reranker cross-encoder, embedder) without
+# re-validating against huggingface.co on every run. Must be set before any
+# import pulls in a huggingface library, so it lives here at the top of this
+# entry point (the scheduler is invoked independently of main.py, which sets
+# the same flags). See fix_scheduler_offline.py.
+import os as _os
+_os.environ.setdefault("HF_HUB_OFFLINE", "1")
+_os.environ.setdefault("TRANSFORMERS_OFFLINE", "1")
 
 import logging
 from dataclasses import dataclass, field
