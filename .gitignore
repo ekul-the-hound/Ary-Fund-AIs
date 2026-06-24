@@ -125,3 +125,9 @@ $RECYCLE.BIN/
 # macOS
 .AppleDouble
 .LSOverride
+
+
+*.bak
+*.py.bak
+*.bak
+*.py.bak

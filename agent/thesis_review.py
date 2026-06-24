@@ -667,7 +667,7 @@ def _call_ollama_text(
     import urllib.request
 
     base_url = getattr(config, "OLLAMA_BASE_URL", "http://localhost:11434")
-    timeout = max(float(getattr(config, "AGENT_TIMEOUT", 30)), 180.0)
+    timeout = max(float(getattr(config, "AGENT_TIMEOUT", 30)), 360.0)  # raised 180->360 to match the essay step; review writes 1200+ words
     max_tokens = int(getattr(config, "MAX_TOKENS", 4096))
 
     body = {

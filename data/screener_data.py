@@ -198,8 +198,15 @@ def cmd_warm(symbols: list[str], *, sleep: float,
         try:
             # Prices first (populates the price cache; cheap if fresh).
             md.get_prices(sym, period="1y", use_cache=True)
-            # Fundamentals (the expensive part the screener lazy-skips).
-            md.get_fundamentals(sym, use_cache=True)
+            # Fundamentals with use_cache=False: the whole POINT of `warm` is
+            # to refresh the cache, so we must BYPASS the 24h TTL read. With
+            # use_cache=True, a re-warm within 24h short-circuits on the
+            # existing (possibly partial) row and never refetches — which
+            # silently leaves stale/partial fundamentals in place. Forcing a
+            # fresh fetch here guarantees the cache is rewritten with a
+            # complete payload. (get_fundamentals still WRITES to the cache via
+            # INSERT OR REPLACE regardless of the read flag.)
+            md.get_fundamentals(sym, use_cache=False)
             warmed += 1
         except Exception as e:
             failed.append(f"{sym} ({type(e).__name__})")

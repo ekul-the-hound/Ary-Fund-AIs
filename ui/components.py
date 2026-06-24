@@ -620,15 +620,20 @@ def card_evidence(chunk: Mapping[str, Any]) -> None:
         + f"</span>{score_bar}</div>"
     )
 
-    snippet = text if len(text) <= 320 else text[:317].rstrip() + "…"
-    # Escape HTML/markdown-significant characters so raw filing text (which
-    # often contains leading spaces, parentheses, and dollar figures) renders
-    # as plain prose rather than being styled as green code blocks by
-    # markdown. We render inside an explicit HTML span, so we escape < > &
-    # and collapse runs of leading whitespace that markdown treats as code.
+    # Filing excerpts contain newlines and leading-space-indented lines like
+    # "  (973)" / "Capital spending". st.markdown runs the MARKDOWN PARSER
+    # before honoring our HTML wrapper, so any 4+ space indent or blank-line
+    # break becomes a green <code>/<pre> block regardless of escaping or CSS.
+    # Fix: flatten the excerpt to a single continuous prose line (collapse all
+    # whitespace runs to one space), THEN escape. A compact evidence card reads
+    # better as one blob anyway, and markdown has no indentation left to
+    # misinterpret.
     import html as _html
+    import re as _re
+    flat = _re.sub(r"\s+", " ", text).strip()
+    snippet = flat if len(flat) <= 320 else flat[:317].rstrip() + "…"
     safe_snippet = _html.escape(snippet)
-    safe_title = _html.escape(text[:1000])
+    safe_title = _html.escape(flat[:1000])
     body = (
         f"<div style='font-size:0.84em;line-height:1.5;color:#cbd5e1;"
         f"white-space:normal;' "

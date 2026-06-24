@@ -761,12 +761,17 @@ _ALL_SCREENER_COLUMNS: tuple[str, ...] = (
 )
 
 
-# Cap on lazy fundamentals fetches per render. Each call is a yfinance
-# round trip; even with 24h SQLite caching, the *first* render after a
-# clean start can hit dozens of network calls for the visible page.
-# 60 covers the default Streamlit dataframe height comfortably without
-# stalling the UI on cold caches.
-_FUNDAMENTALS_LAZY_LIMIT = 60
+# Cap on lazy fundamentals reads per render. Each read goes through
+# MarketData.get_fundamentals(use_cache=True), which hits the 24h SQLite
+# cache in data/hedgefund.db. With the cache pre-warmed for the whole
+# universe (`python data/screener_data.py warm`), these are near-instant
+# cache hits, so the cap can cover the full ~560-name universe — this is
+# what fills the deep category columns (valuation, profitability, balance
+# sheet, etc.) for every row, not just the megacaps. Raised 60 -> 600.
+# NOTE: if the cache has expired (>24h since the last warm), names beyond
+# the warmed set fall back to live yfinance fetches and can slow the first
+# render; re-run `warm` daily (or via refresh_scheduler) to keep it fast.
+_FUNDAMENTALS_LAZY_LIMIT = 600
 
 
 def _empty_screener_row(symbol: str) -> dict[str, Any]:

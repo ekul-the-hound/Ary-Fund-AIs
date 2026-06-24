@@ -154,12 +154,13 @@ def _panel_omori(prices: pd.DataFrame) -> None:
     cols[1].metric("Shock return",
                    C.fmt_pct(cr) if C._is_num(cr) else "—")
     rates = res.get("rates_data") or {}
-    # Show the p-exponent for the first threshold if present.
-    if rates:
-        first = next(iter(rates.values()))
-        p = first.get("p") if isinstance(first, dict) else None
-        cols[2].metric("Decay p", f"{p:.2f}" if C._is_num(p) else "—",
-                       help="Omori decay exponent; higher = faster calming.")
+    # The decay exponent p lives in the top-level 'fit' block, not inside
+    # rates_data. Read it from there.
+    fit_block = res.get("fit") or {}
+    p = fit_block.get("p")
+    cols[2].metric("Decay p", f"{p:.2f}" if C._is_num(p) and p > 0 else "—",
+                   help="Omori decay exponent; higher = faster calming. "
+                        f"({res.get('decay_label', '')})")
     aft = res.get("aftershocks")
     if isinstance(aft, pd.DataFrame) and not aft.empty and "t_days" in aft.columns:
         fig = go.Figure()
@@ -278,13 +279,19 @@ def _panel_lempel_ziv(prices: pd.DataFrame) -> None:
     if _unavailable(res, "Lempel-Ziv"):
         return
     cols = st.columns(3)
+    # lz_normalized is the full time-series array; current_complexity is the
+    # latest scalar value. Show the scalar. There is no 'median' key in the
+    # return, so we show lz_raw (latest raw complexity) instead.
     cur = res.get("current_complexity")
-    norm = res.get("lz_normalized")
     label = res.get("regime_label")
-    cols[0].metric("LZ normalized",
-                   f"{norm:.3f}" if C._is_num(norm) else "—")
-    med = res.get("median")
-    cols[1].metric("Median LZ", f"{med:.3f}" if C._is_num(med) else "—")
+    cols[0].metric("LZ complexity (latest)",
+                   f"{cur:.3f}" if C._is_num(cur) else "—",
+                   help="Normalized Lempel-Ziv complexity of the latest window "
+                        "(0 = perfectly repetitive, 1 = random-like).")
+    raw = res.get("lz_raw")
+    # lz_raw may also be an array; only show if scalar.
+    cols[1].metric("LZ raw", f"{raw:.0f}" if C._is_num(raw) else "—",
+                   help="Raw LZ phrase count (latest).")
     cols[2].metric("Regime", str(label) if label else "—")
 
 
@@ -306,12 +313,17 @@ def _panel_sandpile(prices: pd.DataFrame) -> None:
     if _unavailable(res, "Sandpile"):
         return
     cols = st.columns(2)
-    tau = res.get("tau")
-    cols[0].metric("Power-law τ", f"{tau:.2f}" if C._is_num(tau) else "—",
+    # tau and fit_succeeded live inside the 'power_law_fit' sub-dict; the
+    # binned distribution lives inside 'avalanche_distribution'.
+    pl_fit = res.get("power_law_fit") or {}
+    dist = res.get("avalanche_distribution") or {}
+    tau = pl_fit.get("tau")
+    cols[0].metric("Power-law τ",
+                   f"{tau:.2f}" if C._is_num(tau) and tau > 0 else "—",
                    help="Avalanche-size exponent; ~1-1.5 is typical of SOC.")
-    cols[1].metric("Fit", "succeeded" if res.get("fit_succeeded") else "weak/failed")
-    centers = res.get("binned_centers")
-    freqs = res.get("binned_freqs")
+    cols[1].metric("Fit", "succeeded" if pl_fit.get("fit_succeeded") else "weak/failed")
+    centers = dist.get("binned_centers")
+    freqs = dist.get("binned_freqs")
     if centers is not None and freqs is not None:
         try:
             fig = go.Figure()
@@ -353,9 +365,9 @@ def _panel_kelly(prices: pd.DataFrame) -> None:
     cols = st.columns(4)
     cols[0].metric("Est. ann. return", C.fmt_pct(er))
     cols[1].metric("Est. ann. vol", C.fmt_pct(vol))
-    frac = res.get("kelly_fraction") or res.get("fraction") or res.get("capped_fraction")
+    frac = res.get("fraction") or res.get("recommended_percent")
     cols[2].metric("Kelly fraction", C.fmt_pct(frac) if C._is_num(frac) else "—")
-    dollars = res.get("position_size") or res.get("dollars") or res.get("allocation")
+    dollars = res.get("recommended_dollar_size")
     cols[3].metric("≈ Position", C.fmt_big(dollars) if C._is_num(dollars) else "—")
 
 
@@ -448,11 +460,19 @@ def _panel_black_scholes(prices: pd.DataFrame) -> None:
     if _bs_greeks is not None:
         try:
             g = _bs_greeks(S, K, T, r, sigma, option_type=otype)
+            # bs_greeks returns either a dict or a tuple
+            # (price, delta, gamma, vega, theta, rho). Handle both.
+            greek_vals = {}
             if isinstance(g, dict):
+                greek_vals = g
+            elif isinstance(g, (tuple, list)) and len(g) >= 6:
+                names = ("price", "delta", "gamma", "vega", "theta", "rho")
+                greek_vals = dict(zip(names, g))
+            if greek_vals:
                 gcols = st.columns(5)
                 for col, key in zip(gcols, ("delta", "gamma", "vega", "theta", "rho")):
-                    v = g.get(key)
-                    col.metric(key.title(), f"{v:.4f}" if C._is_num(v) else "—")
+                    v = greek_vals.get(key)
+                    col.metric(key.title(), f"{float(v):.4f}" if C._is_num(v) else "—")
         except Exception as e:  # pragma: no cover
             st.caption(f"Greeks unavailable: {e}")
 
@@ -522,9 +542,9 @@ def _panel_longstaff(prices: pd.DataFrame) -> None:
                 return
         if isinstance(res, dict):
             cols = st.columns(3)
-            price = res.get("price") or res.get("value")
-            se = res.get("std_error") or res.get("se")
-            euro = res.get("european_price") or res.get("european")
+            price = res.get("american_price")
+            se = res.get("american_se")
+            euro = res.get("european_price")
             cols[0].metric("American price",
                            C.fmt_money(float(price)) if C._is_num(price) else "—")
             cols[1].metric("Std error", f"{se:.4f}" if C._is_num(se) else "—")
