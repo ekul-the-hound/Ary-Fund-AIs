@@ -217,6 +217,37 @@ def _fetch_fundamentals_one(symbol: str) -> dict[str, Any]:
         except (TypeError, ValueError):
             return float("nan")
 
+    # --- Derived ratios + per-share (computed from already-fetched fields) ---
+    _shares_out = _num(ov.get("shares_outstanding"))
+    _revenue = _num(fin.get("revenue"))
+    _fcf = _num(fin.get("free_cash_flow"))
+    _net_income = _num(fin.get("net_income"))
+    _total_debt = _num(fin.get("total_debt"))
+    _mktcap = _num(ov.get("market_cap"))
+    _pb = _num(val.get("price_to_book"))
+
+    def _safe_div(a: Any, b: Any) -> float:
+        try:
+            if a is None or b is None or pd.isna(a) or pd.isna(b) or float(b) == 0.0:
+                return float("nan")
+            return float(a) / float(b)
+        except (TypeError, ValueError):
+            return float("nan")
+
+    _fcf_margin = _safe_div(_fcf, _revenue) * 100.0
+    _fcf_yield = _safe_div(_fcf, _mktcap) * 100.0
+    _invested = (_mktcap + _total_debt
+                 if pd.notna(_mktcap) and pd.notna(_total_debt) else float("nan"))
+    _roic = _safe_div(_net_income, _invested) * 100.0  # proxy (mkt cap as equity)
+    _price_proxy = _safe_div(_mktcap, _shares_out)
+    _cash_ps = _safe_div(_num(fin.get("total_cash")), _shares_out)
+    _book_ps = _safe_div(_price_proxy, _pb)            # price ÷ P/B
+    _sales_ps = _safe_div(_revenue, _shares_out)
+    _fcf_ps = _safe_div(_fcf, _shares_out)
+    _dy = _div_yield_normalize(div.get("dividend_yield"))
+    _div_ps = (_dy / 100.0 * _price_proxy
+               if pd.notna(_dy) and pd.notna(_price_proxy) else float("nan"))
+
     return {
         "symbol":           symbol,
         "name":             f.get("name") or symbol,
@@ -248,6 +279,16 @@ def _fetch_fundamentals_one(symbol: str) -> dict[str, Any]:
         "profit_margin":    _pct(fin.get("profit_margin")),
         "gross_margin":     _pct(fin.get("gross_margin")),
         "op_margin":        _pct(fin.get("operating_margin")),
+        # Derived ratios (computed above)
+        "fcf_margin":       _fcf_margin,
+        "fcf_yield":        _fcf_yield,
+        "roic":             _roic,
+        # Per-share (computed above)
+        "cash_per_share":   _cash_ps,
+        "book_per_share":   _book_ps,
+        "sales_per_share":  _sales_ps,
+        "fcf_per_share":    _fcf_ps,
+        "div_per_share":    _div_ps,
         # Growth
         "revenue_growth":   _pct(gr.get("revenue_growth")),
         "eps_dil_growth":   _pct(gr.get("earnings_growth")),
@@ -773,6 +814,13 @@ _ALL_SCREENER_COLUMNS: tuple[str, ...] = (
 # render; re-run `warm` daily (or via refresh_scheduler) to keep it fast.
 _FUNDAMENTALS_LAZY_LIMIT = 600
 
+# Cap on per-row technicals/performance computation per render. These require
+# price-history math (RSI/MA/ATR + trailing returns) for each row, so unlike
+# the cache-backed fundamentals we keep this cap small — RSI/MA on a micro-cap
+# is low-value and the cost scales with row count. Top-N by market cap only;
+# rows below the cap show "—" for technicals/performance.
+_TECHNICALS_LAZY_LIMIT = 100
+
 
 def _empty_screener_row(symbol: str) -> dict[str, Any]:
     """Row template for a symbol with no real data yet.
@@ -788,6 +836,59 @@ def _empty_screener_row(symbol: str) -> dict[str, Any]:
     row["analyst_rating"] = "—"
     row["ex_div_date"] = "—"
     return row
+
+
+def _compute_performance(prices: "pd.DataFrame") -> dict[str, float]:
+    """Trailing total returns (%) and 1-month realized vol (%) from a price
+    frame (OHLCV with a Close column). Returns NaN for windows longer than the
+    available history. Pure computation — no I/O."""
+    out = {
+        "perf_1w": float("nan"), "perf_1m": float("nan"),
+        "perf_3m": float("nan"), "perf_6m": float("nan"),
+        "perf_ytd": float("nan"), "perf_1y": float("nan"),
+        "volatility_1m": float("nan"),
+    }
+    try:
+        if prices is None or len(prices) == 0 or "Close" not in prices.columns:
+            return out
+        close = prices["Close"].dropna()
+        if len(close) < 2:
+            return out
+        last = float(close.iloc[-1])
+
+        def _ret(n: int) -> float:
+            if len(close) <= n:
+                return float("nan")
+            prev = float(close.iloc[-1 - n])
+            if prev == 0.0:
+                return float("nan")
+            return (last / prev - 1.0) * 100.0
+
+        # Approx trading-day windows.
+        out["perf_1w"] = _ret(5)
+        out["perf_1m"] = _ret(21)
+        out["perf_3m"] = _ret(63)
+        out["perf_6m"] = _ret(126)
+        out["perf_1y"] = _ret(252)
+
+        # YTD: first close of the current calendar year.
+        try:
+            idx = close.index
+            this_year = idx[-1].year
+            ytd_slice = close[[ts.year == this_year for ts in idx]]
+            if len(ytd_slice) >= 2 and float(ytd_slice.iloc[0]) != 0.0:
+                out["perf_ytd"] = (last / float(ytd_slice.iloc[0]) - 1.0) * 100.0
+        except Exception:
+            pass
+
+        # 1-month realized vol: std of daily returns over ~21d, annualized %.
+        rets = close.pct_change().dropna()
+        if len(rets) >= 21:
+            import numpy as _np
+            out["volatility_1m"] = float(rets.iloc[-21:].std() * _np.sqrt(252) * 100.0)
+    except Exception:
+        pass
+    return out
 
 
 @st.cache_data(ttl=300, show_spinner=False)
@@ -911,6 +1012,53 @@ def _build_screener_frame() -> pd.DataFrame:
                     continue
                 df.at[ridx, col] = val
         fetched += 1
+
+    # --- Step 5b: technicals + performance for the top-N by market cap ---
+    # Capped (Option 2): per-row price-history math is real CPU work, so we
+    # only compute it for the largest names. Reads the warm price cache.
+    try:
+        from data.market_data import MarketData as _MD
+    except Exception:
+        try:
+            from market_data import MarketData as _MD  # type: ignore
+        except Exception:
+            _MD = None  # technicals unavailable; columns stay NaN
+
+    if _MD is not None:
+        _md_t = _MD()
+        # df is not yet sorted by market cap here; pick the top-N by the
+        # market_cap column we just populated.
+        _top = df.dropna(subset=["market_cap"]).nlargest(
+            _TECHNICALS_LAZY_LIMIT, "market_cap"
+        ) if "market_cap" in df.columns else df.head(_TECHNICALS_LAZY_LIMIT)
+        _tech_done = 0
+        for ridx in _top.index:
+            sym = df.at[ridx, "symbol"]
+            if not sym:
+                continue
+            # Skip if technicals already present (idempotent across reruns).
+            if pd.notna(df.at[ridx, "rsi_14"]) and pd.notna(df.at[ridx, "ma_50"]):
+                continue
+            try:
+                tech = _md_t.get_technicals(sym, period="1y") or {}
+                if tech.get("rsi_14") is not None:
+                    df.at[ridx, "rsi_14"] = tech.get("rsi_14")
+                if tech.get("sma_50") is not None:
+                    df.at[ridx, "ma_50"] = tech.get("sma_50")
+                if tech.get("sma_200") is not None:
+                    df.at[ridx, "ma_200"] = tech.get("sma_200")
+                if tech.get("atr_14") is not None:
+                    df.at[ridx, "atr_14"] = tech.get("atr_14")
+                # Performance + 1m vol from the price cache (same 24h cache).
+                _px = _md_t.get_prices(sym, period="1y", use_cache=True)
+                perf = _compute_performance(_px)
+                for _col, _val in perf.items():
+                    if _col in df.columns and pd.notna(_val):
+                        df.at[ridx, _col] = _val
+                _tech_done += 1
+            except Exception:
+                continue
+        df.attrs["technicals_fetched"] = _tech_done
 
     # --- Step 6: derive rel_volume from volume / 30-day average ----
     # We don't have the 30-day average here without a second fetch,
