@@ -115,6 +115,82 @@ def _import_market_data():
     sys.exit(1)
 
 
+def _import_sec_fetcher():
+    for path in ("data.sec_fetcher", "sec_fetcher"):
+        try:
+            mod = __import__(path, fromlist=["SECFetcher"])
+            return mod.SECFetcher
+        except Exception:
+            continue
+    print("ERROR: could not import SECFetcher (tried data.sec_fetcher and "
+          "sec_fetcher).")
+    sys.exit(1)
+
+
+def cmd_xbrl(symbols: list[str], *, sleep: float,
+             limit: "Optional[int]" = None) -> None:
+    """Ingest SEC XBRL companyfacts for each symbol into the xbrl_facts table.
+
+    Drives the existing SECFetcher.ingest_xbrl_facts over the universe. Each
+    call fetches the company's companyfacts JSON (several MB), writes every
+    mapped concept (revenue, net income, total assets, capex, operating
+    income, ...) to xbrl_facts + the registry, and derives ratios.
+    """
+    SECFetcher = _import_sec_fetcher()
+    sec = SECFetcher()
+
+    if limit is not None:
+        symbols = symbols[:limit]
+    total = len(symbols)
+
+    ingested = 0
+    no_facts: list[str] = []
+    failed: list[str] = []
+    t0 = time.time()
+    print(f"[xbrl] Ingesting SEC XBRL companyfacts for {total} symbols into "
+          f"the xbrl_facts table…")
+    print("[xbrl] Each companyfacts JSON is several MB; this is a once-per-"
+          "quarter job. Be patient and kind to SEC's servers.")
+    print()
+
+    for i, sym in enumerate(symbols, 1):
+        try:
+            n = sec.ingest_xbrl_facts(sym)
+            if n > 0:
+                ingested += 1
+            else:
+                no_facts.append(sym)
+        except Exception as e:  # noqa: BLE001
+            failed.append(f"{sym} ({type(e).__name__})")
+
+        if i % 10 == 0 or i == total:
+            elapsed = time.time() - t0
+            rate = i / elapsed if elapsed > 0 else 0.0
+            eta = (total - i) / rate if rate > 0 else 0.0
+            print(f"[xbrl] {i}/{total}  ingested={ingested}  "
+                  f"no_facts={len(no_facts)}  failed={len(failed)}  "
+                  f"~{eta:5.0f}s left  (last: {sym})")
+
+        if sleep:
+            time.sleep(sleep)
+
+    dt = time.time() - t0
+    print()
+    print(f"[xbrl] Done. Ingested facts for {ingested}/{total} in {dt:.0f}s.")
+    if no_facts:
+        print(f"[xbrl] {len(no_facts)} symbol(s) had no us-gaap facts "
+              f"(e.g. foreign filers, ETFs): {', '.join(no_facts[:20])}"
+              + (" ..." if len(no_facts) > 20 else ""))
+    if failed:
+        print(f"[xbrl] {len(failed)} symbol(s) errored: {', '.join(failed[:20])}"
+              + (" ..." if len(failed) > 20 else ""))
+    print()
+    print("Now restart the screener — Op Income / Total Assets / CapEx should")
+    print("fill from XBRL for names that report those concepts. (Some "
+          "financials don't file a GAAP operating-income line, so those stay "
+          "blank — that's a filing reality, not a bug.)")
+
+
 # ----------------------------------------------------------------------
 # check — report delisted / no-data tickers
 # ----------------------------------------------------------------------
@@ -237,9 +313,11 @@ def cmd_warm(symbols: list[str], *, sleep: float,
 def main() -> None:
     parser = argparse.ArgumentParser(
         description="Download / cache the screener's universe data.")
-    parser.add_argument("command", choices=["check", "warm", "all"],
+    parser.add_argument("command", choices=["check", "warm", "all", "xbrl"],
                         help="check = report delisted; warm = fill cache; "
-                             "all = check then warm the survivors")
+                             "all = check then warm the survivors; "
+                             "xbrl = ingest SEC XBRL facts (Op Income/Total "
+                             "Assets/CapEx) for the universe")
     parser.add_argument("--limit", type=int, default=None,
                         help="Only process the first N symbols (quick test).")
     parser.add_argument("--sleep", type=float, default=0.20,
@@ -262,6 +340,8 @@ def main() -> None:
         good = cmd_check(symbols, sleep=args.sleep)
         print(f"[all] Warming the {len(good)} symbols that passed check…\n")
         cmd_warm(good, sleep=args.sleep, limit=args.limit)
+    elif args.command == "xbrl":
+        cmd_xbrl(symbols, sleep=args.sleep, limit=args.limit)
 
 
 if __name__ == "__main__":

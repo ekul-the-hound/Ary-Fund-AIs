@@ -119,6 +119,11 @@ XBRL_CONCEPT_MAP: dict[str, list[str]] = {
     "ticker.fundamental.total_assets": [
         "Assets",
     ],
+    "ticker.fundamental.operating_income_ttm": [
+        "OperatingIncomeLoss",
+        # Fallback some filers use when OperatingIncomeLoss is absent:
+        "IncomeLossFromContinuingOperationsBeforeIncomeTaxesExtraordinaryItemsNoncontrollingInterest",
+    ],
     "ticker.fundamental.total_liabilities": [
         "Liabilities",
     ],

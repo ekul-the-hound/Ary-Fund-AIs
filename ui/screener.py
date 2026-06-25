@@ -488,11 +488,6 @@ _CATEGORY_COLUMNS: dict[str, list[str]] = {
         "symbol", "name", "change_pct", "perf_1w", "perf_1m", "perf_3m",
         "perf_6m", "perf_ytd", "perf_1y", "volatility_1m",
     ],
-    "Extended hours": [
-        "symbol", "name", "premarket_close", "premarket_chg_pct",
-        "premarket_vol", "postmarket_close", "postmarket_chg_pct",
-        "postmarket_vol",
-    ],
     "Valuation": [
         "symbol", "name", "market_cap", "pe", "peg", "ps", "pb",
         "p_fcf", "ev_ebitda",
@@ -520,10 +515,6 @@ _CATEGORY_COLUMNS: dict[str, list[str]] = {
     "Per share": [
         "symbol", "name", "eps_dil", "book_per_share", "cash_per_share",
         "sales_per_share", "fcf_per_share", "div_per_share",
-    ],
-    "Technicals": [
-        "symbol", "name", "price", "change_pct", "rsi_14", "ma_50",
-        "ma_200", "beta", "atr_14", "volatility_1m",
     ],
 }
 
@@ -1013,52 +1004,82 @@ def _build_screener_frame() -> pd.DataFrame:
                 df.at[ridx, col] = val
         fetched += 1
 
-    # --- Step 5b: technicals + performance for the top-N by market cap ---
-    # Capped (Option 2): per-row price-history math is real CPU work, so we
-    # only compute it for the largest names. Reads the warm price cache.
+    # --- Step 5c: performance (trailing returns + 1m vol) for top-N -----
+    # Performance-only (no technicals). Capped to the largest names by market
+    # cap; reads the warm price cache. Rows below the cap stay "—".
     try:
         from data.market_data import MarketData as _MD
     except Exception:
         try:
             from market_data import MarketData as _MD  # type: ignore
         except Exception:
-            _MD = None  # technicals unavailable; columns stay NaN
+            _MD = None
 
     if _MD is not None:
-        _md_t = _MD()
-        # df is not yet sorted by market cap here; pick the top-N by the
-        # market_cap column we just populated.
+        _md_p = _MD()
         _top = df.dropna(subset=["market_cap"]).nlargest(
             _TECHNICALS_LAZY_LIMIT, "market_cap"
         ) if "market_cap" in df.columns else df.head(_TECHNICALS_LAZY_LIMIT)
-        _tech_done = 0
+        _perf_done = 0
         for ridx in _top.index:
             sym = df.at[ridx, "symbol"]
             if not sym:
                 continue
-            # Skip if technicals already present (idempotent across reruns).
-            if pd.notna(df.at[ridx, "rsi_14"]) and pd.notna(df.at[ridx, "ma_50"]):
+            # Skip if performance already present (idempotent across reruns).
+            if pd.notna(df.at[ridx, "perf_1m"]) and pd.notna(df.at[ridx, "perf_1y"]):
                 continue
             try:
-                tech = _md_t.get_technicals(sym, period="1y") or {}
-                if tech.get("rsi_14") is not None:
-                    df.at[ridx, "rsi_14"] = tech.get("rsi_14")
-                if tech.get("sma_50") is not None:
-                    df.at[ridx, "ma_50"] = tech.get("sma_50")
-                if tech.get("sma_200") is not None:
-                    df.at[ridx, "ma_200"] = tech.get("sma_200")
-                if tech.get("atr_14") is not None:
-                    df.at[ridx, "atr_14"] = tech.get("atr_14")
-                # Performance + 1m vol from the price cache (same 24h cache).
-                _px = _md_t.get_prices(sym, period="1y", use_cache=True)
+                _px = _md_p.get_prices(sym, period="1y", use_cache=True)
                 perf = _compute_performance(_px)
                 for _col, _val in perf.items():
                     if _col in df.columns and pd.notna(_val):
                         df.at[ridx, _col] = _val
-                _tech_done += 1
+                _perf_done += 1
             except Exception:
                 continue
-        df.attrs["technicals_fetched"] = _tech_done
+        df.attrs["performance_fetched"] = _perf_done
+
+    # --- Step 5d: fill Op Income / Total Assets / CapEx from XBRL -------
+    # Real from-filings values, read from the local xbrl_facts table
+    # (populated by `python data/screener_data.py xbrl`). Local SQLite read —
+    # no network at render time. Only fills rows where yfinance left these
+    # None; symbols not ingested or not reporting the concept stay "—".
+    try:
+        import sqlite3 as _sqlite3
+        _XBRL_COL_CONCEPT = {
+            "operating_income": "OperatingIncomeLoss",
+            "total_assets": "Assets",
+            "capex": "PaymentsToAcquirePropertyPlantAndEquipment",
+        }
+        _xbrl_db = "data/hedgefund.db"
+        with _sqlite3.connect(_xbrl_db) as _xc:
+            # Confirm the table exists (xbrl warm may not have run yet).
+            _has_tbl = _xc.execute(
+                "SELECT name FROM sqlite_master WHERE type='table' "
+                "AND name='xbrl_facts'"
+            ).fetchone() is not None
+            if _has_tbl:
+                for _ridx in df.index:
+                    _sym = df.at[_ridx, "symbol"]
+                    if not _sym:
+                        continue
+                    for _col, _concept in _XBRL_COL_CONCEPT.items():
+                        if _col not in df.columns:
+                            continue
+                        # Don't overwrite a value already present.
+                        if pd.notna(df.at[_ridx, _col]):
+                            continue
+                        _row = _xc.execute(
+                            "SELECT value FROM xbrl_facts "
+                            "WHERE ticker = ? AND concept = ? AND form = '10-K' "
+                            "ORDER BY period_end DESC LIMIT 1",
+                            (str(_sym).upper(), _concept),
+                        ).fetchone()
+                        if _row and _row[0] is not None:
+                            df.at[_ridx, _col] = float(_row[0])
+    except Exception:
+        # XBRL is best-effort enrichment; never break the frame build over it.
+        pass
 
     # --- Step 6: derive rel_volume from volume / 30-day average ----
     # We don't have the 30-day average here without a second fetch,
