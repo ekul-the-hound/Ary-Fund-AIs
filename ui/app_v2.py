@@ -139,7 +139,8 @@ def _import_backend() -> dict[str, Any]:
 
     # Optional report entry point (for the `report` command).
     report_fn = None
-    for modname in ("ui.pdf_renderer", "pdf_renderer"):
+    for modname in ("ui.report_orchestrator", "report_orchestrator",
+                    "ui.pdf_renderer", "pdf_renderer"):
         m = _safe_import(modname)
         if m is not None:
             for fn_name in ("generate_report", "render_report", "build_report"):

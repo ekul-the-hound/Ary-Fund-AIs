@@ -76,6 +76,22 @@ import os as _os
 _os.environ.setdefault("HF_HUB_OFFLINE", "1")
 _os.environ.setdefault("TRANSFORMERS_OFFLINE", "1")
 
+# --- Project-root bootstrap (so `from data.*` works when run as a script) ---
+# Running this file as `python data/refresh_scheduler.py` puts data/ on
+# sys.path, not the project root, so `import data.data_registry` fails and the
+# registry falls back to a degraded mode. Compute the root (this file's
+# parent's parent), chdir there, and add it to sys.path so both the script
+# form and the module form (`python -m data.refresh_scheduler`) resolve.
+import sys as _sys
+from pathlib import Path as _Path
+_SCHED_ROOT = _Path(__file__).resolve().parent.parent
+try:
+    _os.chdir(_SCHED_ROOT)
+except Exception:
+    pass
+if str(_SCHED_ROOT) not in _sys.path:
+    _sys.path.insert(0, str(_SCHED_ROOT))
+
 import logging
 from dataclasses import dataclass, field
 from datetime import datetime
