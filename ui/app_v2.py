@@ -355,7 +355,7 @@ def _render_sidebar(backend: dict[str, Any]) -> dict[str, Any]:
 _DESTINATIONS = ["Desk", "Board", "Screener", "Lab", "Analyzer", "Jobs"]
 # Utility destinations, shown at the bottom of the sidebar rather than the
 # top nav (telemetry + diagnostics, not part of the research flow).
-_UTILITY_DESTINATIONS = ["Metrics", "Debug"]
+_UTILITY_DESTINATIONS = ["Metrics", "Debug", "RAG"]
 _ALL_DESTINATIONS = _DESTINATIONS + _UTILITY_DESTINATIONS
 _DEST_KEY = "v2_destination"
 
@@ -579,6 +579,19 @@ def _render_analyzer_destination(backend: dict[str, Any], lookback: int) -> None
         st.error(f"Analyzer failed: {e}")
 
 
+def _render_rag_destination() -> None:
+    """Render the RAG learning panel (defined in lab.py) as a Tools page."""
+    st.markdown("### RAG learning")
+    try:
+        try:
+            from ui.lab import _render_rag_learning_panel
+        except Exception:
+            from lab import _render_rag_learning_panel  # type: ignore
+        _render_rag_learning_panel()
+    except Exception as e:  # noqa: BLE001
+        st.error(f"RAG learning panel unavailable: {e}")
+
+
 def _render_metrics_destination(backend: dict[str, Any]) -> None:
     """LLM telemetry (latency / cost / failures) from metrics.db.
 
@@ -728,6 +741,8 @@ def main() -> None:
         _render_analyzer_destination(backend, side["lookback"])
     elif dest == "Metrics":
         _render_metrics_destination(backend)
+    elif dest == "RAG":
+        _render_rag_destination()
     elif dest == "Jobs":
         _render_jobs_destination()
     elif dest == "Debug":

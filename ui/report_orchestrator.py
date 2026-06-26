@@ -95,17 +95,202 @@ def _import_build_agent_context():
     return None
 
 
+def _resolve_portfolio_db(passed: str, cfg: Any) -> str:
+    """Find the portfolio DB that actually holds agent_opinions.
+
+    The report worker may pass a db_path that resolves to an empty root-level
+    portfolio.db (there are two: an empty ./portfolio.db and the real
+    data/portfolio.db). So we try, in order:
+      1. cfg.PORTFOLIO_DB_PATH (the authoritative config value)
+      2. the passed db_path
+      3. data/portfolio.db anchored at the project root
+    and return the first one whose ``agent_opinions`` table exists and is
+    non-empty. Falls back to the config value (or the passed path) if none
+    qualify.
+    """
+    import sqlite3
+    candidates = []
+    cfg_path = getattr(cfg, "PORTFOLIO_DB_PATH", None) if cfg else None
+    if cfg_path:
+        candidates.append(str(cfg_path))
+    if passed:
+        candidates.append(str(passed))
+    try:
+        _root = Path(__file__).resolve().parent.parent
+    except Exception:
+        _root = Path.cwd()
+    candidates.append(str(_root / "data" / "portfolio.db"))
+
+    for cand in candidates:
+        try:
+            if not Path(cand).exists():
+                continue
+            with sqlite3.connect(cand) as conn:
+                row = conn.execute(
+                    "SELECT COUNT(*) FROM sqlite_master "
+                    "WHERE type='table' AND name='agent_opinions'"
+                ).fetchone()
+                if row and row[0] > 0:
+                    n = conn.execute(
+                        "SELECT COUNT(*) FROM agent_opinions"
+                    ).fetchone()
+                    if n and n[0] > 0:
+                        return cand
+        except Exception:
+            continue
+    return cfg_path or passed or str(_root / "data" / "portfolio.db")
+
+
+def _load_latest_opinion(ticker: str, portfolio_db_path: str) -> dict:
+    """st-free read of the latest agent opinion from portfolio.db.
+
+    Mirrors app.load_latest_opinion's body (without the @st.cache_data
+    decorator, so it's safe on a worker thread). The opinions table is written
+    by main.py via portfolio_db.save_agent_opinion; payload_json holds the full
+    merged opinion (outlook, confidence, rationale, key_risks, risk_flags...).
+    Returns {} if absent.
+    """
+    import sqlite3
+    import json
+    if not portfolio_db_path:
+        return {}
+    try:
+        with sqlite3.connect(portfolio_db_path) as conn:
+            row = conn.execute(
+                "SELECT payload_json FROM agent_opinions "
+                "WHERE ticker = ? ORDER BY id DESC LIMIT 1",
+                (ticker,),
+            ).fetchone()
+        if not row:
+            return {}
+        return json.loads(row[0]) or {}
+    except Exception:
+        return {}
+
+
+def _merge_opinion_into_ctx(ctx: dict, opinion: dict) -> dict:
+    """Layer the agent-opinion fields onto a raw context using the ACTUAL
+    payload shape stored in agent_opinions.
+
+    The stored opinion is rich: it has a full markdown ``essay`` string, a
+    builder-shaped ``risk_flags`` ({levels:{...combined...}, reasons:{...}}),
+    ``key_metrics`` (dict), ``filings_summary`` (dict), plus the scalar thesis
+    fields. We pass each through to the keys the report builders read, rather
+    than synthesizing or reshaping."""
+    if not opinion:
+        return ctx
+    ctx = dict(ctx or {})
+
+    # Thesis scalars (for the exec-summary badge row + structured fallback).
+    ctx["thesis"] = {
+        "outlook": opinion.get("outlook"),
+        "price_direction": opinion.get("price_direction"),
+        "confidence": opinion.get("confidence"),
+        "time_horizon": opinion.get("time_horizon"),
+        "rationale": opinion.get("rationale"),
+        "key_risks": opinion.get("key_risks", []),
+        "opportunities": opinion.get("key_opportunities", []),
+    }
+
+    # Essay: the payload stores the full markdown narrative as a string.
+    # build_thesis reads essay.get("text"), so wrap it.
+    essay = opinion.get("essay_revised") or opinion.get("essay")
+    if isinstance(essay, str) and essay.strip():
+        ctx["essay"] = {"text": essay, "fallback": False}
+    elif isinstance(essay, dict):
+        ctx["essay"] = essay
+
+    # Risk: the payload's risk_flags is ALREADY in the builder shape
+    # ({levels, reasons}) — pass it straight through.
+    rf = opinion.get("risk_flags")
+    if isinstance(rf, dict) and rf:
+        ctx["risk"] = rf
+        ctx["risk_flags"] = rf
+
+    # Key metrics + filings summary the builders can render.
+    km = opinion.get("key_metrics")
+    if isinstance(km, dict) and km:
+        ctx["metrics"] = km
+    fs = opinion.get("filings_summary")
+    if fs:
+        ctx["filings_summary"] = fs
+
+    return ctx
+
+
 # ---------------------------------------------------------------------------
 # Map the agent context onto the report ctx the builders expect
 # ---------------------------------------------------------------------------
 def _map_agent_ctx_to_report_ctx(
     ticker: str, agent_ctx: dict, snapshot_id: str,
 ) -> dict:
-    """Translate build_agent_context()'s output into the keys the report
-    section builders read. Unknown/absent inputs are simply omitted; the
-    builders render placeholders for missing sections."""
+    """Translate a ticker context (from load_ticker_context OR
+    build_agent_context) into the keys the report section builders read.
+
+    Handles the load_ticker_context opinion-overlay shape specifically, since
+    that's the populated path:
+      * thesis: {outlook, direction, confidence, summary, key_risks, ...}
+        → builders want thesis.rationale / thesis.outlook / thesis.price_direction,
+          plus an essay.text. We remap names and synthesize an essay from the
+          summary so the Thesis section renders prose instead of a placeholder.
+      * risk: {combined_level, fundamental_risk, macro_risk, market_risk, flags}
+        → builders want risk.levels.{combined,fundamental,macro,market} and
+          risk.reasons. We reshape into that nested form.
+    Unknown/absent inputs are omitted; builders render placeholders for those.
+    """
     agent_ctx = agent_ctx or {}
     as_of = agent_ctx.get("as_of") or datetime.now().date().isoformat()
+
+    # --- Thesis: remap load_ticker_context's dict to builder field names ---
+    raw_thesis = agent_ctx.get("thesis")
+    thesis_out: dict = {}
+    essay_out: dict = {}
+    if isinstance(raw_thesis, dict) and raw_thesis:
+        summary = (raw_thesis.get("summary") or raw_thesis.get("rationale")
+                   or "")
+        thesis_out = {
+            "outlook": raw_thesis.get("outlook"),
+            # builder reads price_direction; load_ticker_context uses direction
+            "price_direction": (raw_thesis.get("price_direction")
+                                or raw_thesis.get("direction")),
+            "confidence": raw_thesis.get("confidence"),
+            "time_horizon": raw_thesis.get("time_horizon"),
+            "rationale": summary,
+            "key_risks": raw_thesis.get("key_risks") or [],
+            "opportunities": raw_thesis.get("opportunities")
+            or raw_thesis.get("key_opportunities") or [],
+        }
+        # Synthesize an essay from the summary so build_thesis renders prose.
+        if summary:
+            essay_out = {"text": summary, "fallback": False}
+    elif isinstance(raw_thesis, str) and raw_thesis.strip():
+        essay_out = {"text": raw_thesis, "fallback": False}
+
+    # Prefer an explicit essay if the context already had one.
+    ctx_essay = agent_ctx.get("essay")
+    if isinstance(ctx_essay, dict) and ctx_essay.get("text"):
+        essay_out = ctx_essay
+    elif isinstance(ctx_essay, str) and ctx_essay.strip():
+        essay_out = {"text": ctx_essay, "fallback": False}
+
+    # --- Risk: reshape flat load_ticker_context risk into nested levels ---
+    raw_risk = agent_ctx.get("risk") or {}
+    risk_out: dict = {}
+    if isinstance(raw_risk, dict) and raw_risk:
+        if "levels" in raw_risk:
+            # Already in builder shape.
+            risk_out = raw_risk
+        else:
+            levels = {
+                "combined": raw_risk.get("combined_level"),
+                "fundamental": raw_risk.get("fundamental_risk"),
+                "macro": raw_risk.get("macro_risk"),
+                "market": raw_risk.get("market_risk"),
+            }
+            risk_out = {
+                "levels": {k: v for k, v in levels.items() if v},
+                "reasons": raw_risk.get("flags") or raw_risk.get("reasons") or [],
+            }
 
     report_ctx: dict[str, Any] = {
         "ticker": ticker.upper(),
@@ -115,24 +300,22 @@ def _map_agent_ctx_to_report_ctx(
         "generated_at": datetime.now().isoformat(timespec="seconds"),
         "report_title": f"{ticker.upper()} Investment Memo",
         "scope": ticker.upper(),
-        # Direct passthroughs (same meaning in both contexts).
-        "prices": agent_ctx.get("prices") or {},
+        # Passthroughs.
+        "prices": agent_ctx.get("prices") or agent_ctx.get("price_summary") or {},
         "metrics": agent_ctx.get("metrics") or {},
         "key_metrics": agent_ctx.get("metrics") or {},
         "filings": agent_ctx.get("filings") or [],
-        "macro": agent_ctx.get("macro") or {},
+        "macro": agent_ctx.get("macro") or agent_ctx.get("macro_extras") or {},
         "provenance": agent_ctx.get("provenance") or {},
-        # Risk: agent has risk_scores; builders read 'risk' + 'risk_flags'.
-        "risk": agent_ctx.get("risk_scores") or {},
-        "risk_flags": agent_ctx.get("risk_flags") or [],
-        # Derived signals: builders read 'derived' + 'signals'.
-        "derived": agent_ctx.get("derived_signals") or {},
-        "signals": agent_ctx.get("derived_signals") or {},
-        # Retrieved RAG chunks become the supporting 'sources'.
-        "sources": agent_ctx.get("retrieved_context") or [],
-        # Thesis/essay/charts are best-effort; absent → placeholder sections.
-        "thesis": agent_ctx.get("thesis") or agent_ctx.get("thesis_text") or "",
-        "essay": agent_ctx.get("essay") or "",
+        # Remapped thesis/risk/essay.
+        "thesis": thesis_out,
+        "essay": essay_out,
+        "risk": risk_out,
+        "risk_flags": risk_out,
+        # Derived signals.
+        "derived": agent_ctx.get("derived_signals") or agent_ctx.get("derived") or {},
+        "signals": agent_ctx.get("derived_signals") or agent_ctx.get("signals") or {},
+        "sources": agent_ctx.get("retrieved_context") or agent_ctx.get("sources") or [],
         "charts": agent_ctx.get("charts") or [],
         "analyst": agent_ctx.get("analyst") or {},
         "filings_summary": agent_ctx.get("filings_summary") or "",
@@ -148,6 +331,7 @@ def generate_report(
     db_path: str = "data/hedgefund.db",
     cfg: Any = None,
     output_dir: str = "reports",
+    context: Optional[dict] = None,
 ) -> Path:
     """Build a PDF investment memo for ``ticker`` and return its Path.
 
@@ -163,6 +347,15 @@ def generate_report(
         (sections degrade to placeholders where data is missing).
     output_dir :
         Directory for the PDF (created if needed). Default ``reports/``.
+    context :
+        OPTIONAL pre-built context dict. When the caller already has the
+        ticker's context (e.g. the Desk's ``load_ticker_context`` result, which
+        layers the agent-opinion thesis/risk on top of the raw data), pass it
+        here and we render from it directly — skipping our own
+        build_agent_context call. This is the path that produces a fully
+        populated report, because load_ticker_context includes the LLM opinion
+        overlay (thesis summary, risk levels) that bare build_agent_context
+        does not.
 
     Returns
     -------
@@ -184,23 +377,50 @@ def generate_report(
             except Exception:
                 continue
 
-    # Gather the registry-backed context for this ticker.
-    build_agent_context = _import_build_agent_context()
-    agent_ctx: dict = {}
-    if build_agent_context is not None:
+    # Prefer a caller-supplied context (the Desk's load_ticker_context result,
+    # which includes the thesis/risk opinion overlay). Only fall back to our
+    # own build_agent_context call when no context was passed.
+    if context:
+        agent_ctx = context
+    else:
+        build_agent_context = _import_build_agent_context()
+        agent_ctx = {}
+        if build_agent_context is not None:
+            try:
+                agent_ctx = build_agent_context(ticker, db_path, cfg)
+            except Exception as e:  # noqa: BLE001
+                logger.warning(
+                    "report_orchestrator: build_agent_context failed for %s "
+                    "(%s); rendering a skeleton report.", ticker, e,
+                )
+                agent_ctx = {}
+        else:
+            logger.warning(
+                "report_orchestrator: build_agent_context unavailable; "
+                "rendering a skeleton report for %s.", ticker,
+            )
+
+        # Layer the LLM opinion (thesis + risk) on top — same as the Desk's
+        # load_ticker_context. Resolve the portfolio DB robustly: the passed
+        # db_path can point at an empty root-level portfolio.db, so we prefer
+        # config's PORTFOLIO_DB_PATH / data/portfolio.db where the
+        # agent_opinions table actually lives.
         try:
-            agent_ctx = build_agent_context(ticker, db_path, cfg)
+            _pdb = _resolve_portfolio_db(db_path, cfg)
+            opinion = _load_latest_opinion(ticker, _pdb)
+            if opinion:
+                agent_ctx = _merge_opinion_into_ctx(agent_ctx, opinion)
+            else:
+                logger.info(
+                    "report_orchestrator: no agent opinion found for %s in %s "
+                    "— thesis/risk sections will be placeholders. Run `gen %s` "
+                    "first to produce an opinion.", ticker, _pdb, ticker,
+                )
         except Exception as e:  # noqa: BLE001
             logger.warning(
-                "report_orchestrator: build_agent_context failed for %s (%s); "
-                "rendering a skeleton report.", ticker, e,
+                "report_orchestrator: opinion merge failed for %s (%s).",
+                ticker, e,
             )
-            agent_ctx = {}
-    else:
-        logger.warning(
-            "report_orchestrator: build_agent_context unavailable; rendering a "
-            "skeleton report for %s.", ticker,
-        )
 
     snapshot_id = f"{ticker}-{datetime.now().strftime('%Y%m%d-%H%M%S')}"
     report_ctx = _map_agent_ctx_to_report_ctx(ticker, agent_ctx, snapshot_id)
@@ -222,7 +442,18 @@ def generate_report(
             "report_orchestrator: produced an empty Story — nothing to render."
         )
 
+    # Resolve output_dir to an ABSOLUTE path anchored at the project root, so
+    # the PDF lands in a predictable place regardless of the process CWD (the
+    # Streamlit server's CWD isn't guaranteed to be the project root). The root
+    # is this file's parent's parent (ui/ -> root); fall back to CWD if that
+    # can't be determined.
     out_dir = Path(output_dir)
+    if not out_dir.is_absolute():
+        try:
+            _root = Path(__file__).resolve().parent.parent
+        except Exception:
+            _root = Path.cwd()
+        out_dir = _root / output_dir
     out_dir.mkdir(parents=True, exist_ok=True)
     output_path = out_dir / f"{ticker}_memo_{datetime.now().date().isoformat()}.pdf"
 

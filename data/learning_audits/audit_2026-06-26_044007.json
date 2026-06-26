@@ -1,0 +1,20 @@
+{
+  "timestamp": "2026-06-26T04:40:07.291286+00:00",
+  "result": {
+    "reevaluation": {
+      "evaluated": 0,
+      "demoted": 0,
+      "demoted_thesis_ids": [],
+      "score_changes_significant": 0,
+      "errors": 0
+    },
+    "samples_for_review": [],
+    "corpus_stats": {
+      "active": 0,
+      "demoted": 0,
+      "by_author": {},
+      "by_ticker": {},
+      "quota_active": false
+    }
+  }
+}

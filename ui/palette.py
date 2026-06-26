@@ -342,6 +342,43 @@ def _render_job_row(job: S.Job) -> None:
     if job.state == S.JobState.ERROR and job.error:
         st.caption(f"↳ {job.error[:200]}")
 
+    # Finished report jobs expose the PDF path as job.result — offer it.
+    if job.state == S.JobState.DONE and job.kind == "report":
+        _pdf = getattr(job, "result", None)
+        try:
+            from pathlib import Path as _P
+            if _pdf and str(_pdf).lower().endswith(".pdf") and _P(_pdf).exists():
+                _p = _P(_pdf)
+                with open(_p, "rb") as _fh:
+                    st.download_button(
+                        label=f"⬇ Download {_p.name}",
+                        data=_fh.read(),
+                        file_name=_p.name,
+                        mime="application/pdf",
+                        key=f"dl_{job.kind}_{job.ticker}_{_p.name}",
+                        use_container_width=False,
+                    )
+                # Open buttons — work because Streamlit runs on this machine.
+                import os as _os
+                _oc1, _oc2, _oc3 = st.columns([1, 1, 3])
+                if _oc1.button("Open PDF",
+                               key=f"open_{job.kind}_{job.ticker}_{_p.name}"):
+                    try:
+                        _os.startfile(str(_p))  # noqa: B606 (Windows-only, local)
+                    except Exception as _oe:  # noqa: BLE001
+                        st.caption(f"could not open ({_oe}); use Download.")
+                if _oc2.button("Open folder",
+                               key=f"openf_{job.kind}_{job.ticker}_{_p.name}"):
+                    try:
+                        _os.startfile(str(_p.parent))  # noqa: B606
+                    except Exception as _oe:  # noqa: BLE001
+                        st.caption(f"could not open folder ({_oe}).")
+                st.caption(f"↳ saved to {_p}")
+            elif _pdf:
+                st.caption(f"↳ report result: {_pdf}")
+        except Exception as _e:  # noqa: BLE001
+            st.caption(f"↳ report ready but link failed: {_e}")
+
 
 # ======================================================================
 # Finished-job side effects (cache invalidation)

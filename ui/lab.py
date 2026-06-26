@@ -524,8 +524,7 @@ def render_lab(
     with main:
         view = st.radio(
             "View",
-            ["Per-ticker bench", "Extended models", "Portfolio structure",
-             "RAG learning"],
+            ["Per-ticker bench", "Extended models", "Portfolio structure"],
             horizontal=True,
             key="lab_view")
         st.markdown("---")
@@ -549,8 +548,6 @@ def render_lab(
                 )
             else:
                 _render_extended(ticker, prices)
-        elif view == "RAG learning":
-            _render_rag_learning_panel()
         else:
             _render_structure_panel(held_tickers, price_loader)
 
