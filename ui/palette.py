@@ -317,6 +317,24 @@ def render_job_tray(*, ticker: Optional[str] = None,
         S.clear_finished_jobs()
         st.rerun()
 
+    # Open the most recent report PDF (newest in reports/), if any.
+    if head_r.button("Open latest report", key="tray_open_latest",
+                     use_container_width=True):
+        try:
+            import os as _os
+            from pathlib import Path as _P
+            _root = _P(__file__).resolve().parent.parent
+            _rdir = _root / "reports"
+            _pdfs = sorted(_rdir.glob("*.pdf"),
+                           key=lambda p: p.stat().st_mtime, reverse=True) \
+                if _rdir.exists() else []
+            if _pdfs:
+                _os.startfile(str(_pdfs[0]))  # noqa: B606 (Windows-only, local)
+            else:
+                st.caption("No reports yet — run `report <ticker>` first.")
+        except Exception as _e:  # noqa: BLE001
+            st.caption(f"Couldn't open latest report: {_e}")
+
     for j in jobs:
         _render_job_row(j)
 
