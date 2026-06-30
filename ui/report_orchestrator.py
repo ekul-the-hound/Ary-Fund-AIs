@@ -465,7 +465,104 @@ def generate_report(
         title=f"{ticker} Investment Memo",
     )
     logger.info("report_orchestrator: wrote %s", written)
+
+    # Also write an HTML sidecar (same data) so the app can display the report
+    # content inline without needing a PDF parser. Best-effort; never fails the
+    # PDF.
+    try:
+        html_path = Path(written).with_suffix(".html")
+        _write_html_sidecar(html_path, report_ctx)
+    except Exception as e:  # noqa: BLE001
+        logger.warning("report_orchestrator: HTML sidecar failed (%s).", e)
+
     return Path(written)
+
+
+def _write_html_sidecar(path: Path, ctx: dict) -> None:
+    """Write a readable HTML version of the report from the ctx, so the app can
+    show the content inline. No PDF parsing — built from the same data."""
+    import html as _html
+
+    def esc(x: Any) -> str:
+        return _html.escape(str(x)) if x is not None else ""
+
+    t = esc(ctx.get("ticker", ""))
+    parts: list[str] = []
+    parts.append(f"<h1>{t} Investment Memo</h1>")
+    parts.append(
+        f"<p style='color:#888'>Snapshot {esc(ctx.get('snapshot_id'))} · "
+        f"as of {esc(ctx.get('snapshot_date'))} · "
+        f"generated {esc(ctx.get('generated_at'))}</p>"
+    )
+
+    # Thesis scalars.
+    th = ctx.get("thesis") or {}
+    if isinstance(th, dict) and any(th.values()):
+        parts.append("<h2>Outlook</h2><ul>")
+        for k in ("outlook", "price_direction", "confidence", "time_horizon"):
+            if th.get(k) is not None:
+                parts.append(f"<li><b>{esc(k)}:</b> {esc(th.get(k))}</li>")
+        parts.append("</ul>")
+
+    # Essay (the narrative).
+    essay = ctx.get("essay") or {}
+    essay_text = essay.get("text") if isinstance(essay, dict) else essay
+    if essay_text:
+        # Convert simple **bold** markers and newlines to HTML.
+        body = esc(essay_text).replace("**", "")
+        body = body.replace("\\n", "<br>").replace("\n", "<br>")
+        parts.append("<h2>Investment Thesis</h2>")
+        parts.append(f"<div>{body}</div>")
+
+    # Risk.
+    risk = ctx.get("risk") or {}
+    levels = risk.get("levels") if isinstance(risk, dict) else None
+    if levels:
+        parts.append("<h2>Risk</h2><ul>")
+        for k, v in levels.items():
+            parts.append(f"<li><b>{esc(k)}:</b> {esc(v)}</li>")
+        parts.append("</ul>")
+        reasons = risk.get("reasons")
+        if isinstance(reasons, dict):
+            for cat, rs in reasons.items():
+                if rs:
+                    parts.append(f"<p><b>{esc(cat)} reasons:</b></p><ul>")
+                    for r in (rs if isinstance(rs, list) else [rs]):
+                        parts.append(f"<li>{esc(r)}</li>")
+                    parts.append("</ul>")
+        elif isinstance(reasons, list) and reasons:
+            parts.append("<ul>")
+            for r in reasons:
+                parts.append(f"<li>{esc(r)}</li>")
+            parts.append("</ul>")
+
+    # Key metrics.
+    km = ctx.get("metrics") or {}
+    if isinstance(km, dict) and km:
+        parts.append("<h2>Key Metrics</h2><ul>")
+        for k, v in km.items():
+            if v is not None:
+                parts.append(f"<li><b>{esc(k)}:</b> {esc(v)}</li>")
+        parts.append("</ul>")
+
+    # Filings summary.
+    fs = ctx.get("filings_summary")
+    if isinstance(fs, dict) and fs:
+        parts.append("<h2>Filings Summary</h2><ul>")
+        for k, v in fs.items():
+            parts.append(f"<li><b>{esc(k)}:</b> {esc(v)}</li>")
+        parts.append("</ul>")
+    elif isinstance(fs, str) and fs.strip():
+        parts.append(f"<h2>Filings Summary</h2><div>{esc(fs)}</div>")
+
+    doc = (
+        "<html><head><meta charset='utf-8'><style>"
+        "body{font-family:system-ui,sans-serif;max-width:820px;margin:1rem auto;"
+        "line-height:1.5} h1{margin-bottom:.2rem} h2{margin-top:1.4rem;"
+        "border-bottom:1px solid #ddd;padding-bottom:.2rem} li{margin:.15rem 0}"
+        "</style></head><body>" + "".join(parts) + "</body></html>"
+    )
+    path.write_text(doc, encoding="utf-8")
 
 
 __all__ = ["generate_report"]

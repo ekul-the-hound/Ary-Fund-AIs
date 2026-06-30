@@ -317,23 +317,58 @@ def render_job_tray(*, ticker: Optional[str] = None,
         S.clear_finished_jobs()
         st.rerun()
 
-    # Open the most recent report PDF (newest in reports/), if any.
-    if head_r.button("Open latest report", key="tray_open_latest",
-                     use_container_width=True):
-        try:
-            import os as _os
-            from pathlib import Path as _P
-            _root = _P(__file__).resolve().parent.parent
-            _rdir = _root / "reports"
-            _pdfs = sorted(_rdir.glob("*.pdf"),
-                           key=lambda p: p.stat().st_mtime, reverse=True) \
-                if _rdir.exists() else []
-            if _pdfs:
-                _os.startfile(str(_pdfs[0]))  # noqa: B606 (Windows-only, local)
-            else:
-                st.caption("No reports yet — run `report <ticker>` first.")
-        except Exception as _e:  # noqa: BLE001
-            st.caption(f"Couldn't open latest report: {_e}")
+    # --- Saved reports: Read inline / Open / Download per row ---------------
+    try:
+        import os as _os
+        from pathlib import Path as _P
+        import datetime as _dt
+        import streamlit.components.v1 as _components
+        _root = _P(__file__).resolve().parent.parent
+        _rdir = _root / "reports"
+        _pdfs = sorted(_rdir.glob("*.pdf"),
+                       key=lambda p: p.stat().st_mtime, reverse=True) \
+            if _rdir.exists() else []
+        if _pdfs:
+            st.markdown("**Saved reports**")
+            for _i, _pdf in enumerate(_pdfs[:12]):
+                _ts = _dt.datetime.fromtimestamp(_pdf.stat().st_mtime)
+                _nc, _rc, _oc, _dc = st.columns([3, 1, 1, 1])
+                _nc.caption(f"{_pdf.name}  ·  {_ts.strftime('%Y-%m-%d %H:%M')}")
+                _rk = f"rep_read_{_i}"
+                if _rc.button("Read", key=f"rep_readbtn_{_i}",
+                              use_container_width=True):
+                    st.session_state[_rk] = not st.session_state.get(_rk, False)
+                if _oc.button("Open", key=f"rep_open_{_i}",
+                              use_container_width=True):
+                    try:
+                        _os.startfile(str(_pdf))  # noqa: B606 (Windows-only)
+                    except Exception as _oe:  # noqa: BLE001
+                        st.caption(f"Open failed ({_oe}); use Download.")
+                try:
+                    with open(_pdf, "rb") as _fh:
+                        _dc.download_button(
+                            "⬇", data=_fh.read(), file_name=_pdf.name,
+                            mime="application/pdf", key=f"rep_dl_{_i}",
+                            use_container_width=True)
+                except Exception as _de:  # noqa: BLE001
+                    _dc.caption("dl?")
+                # Inline reader: show the HTML sidecar content.
+                if st.session_state.get(_rk, False):
+                    _html = _pdf.with_suffix(".html")
+                    if _html.exists():
+                        try:
+                            _components.html(_html.read_text(encoding="utf-8"),
+                                             height=520, scrolling=True)
+                        except Exception as _he:  # noqa: BLE001
+                            st.caption(f"couldn't render ({_he}).")
+                    else:
+                        st.caption("No inline text for this report (it predates "
+                                   "the in-app reader). Regenerate it with "
+                                   "`report <ticker>` to enable Read.")
+        else:
+            st.caption("No reports saved yet — run `report <ticker>` to make one.")
+    except Exception as _pe:  # noqa: BLE001
+        st.caption(f"saved-reports list unavailable: {_pe}")
 
     for j in jobs:
         _render_job_row(j)
