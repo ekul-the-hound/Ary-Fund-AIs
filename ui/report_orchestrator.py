@@ -326,6 +326,134 @@ def _map_agent_ctx_to_report_ctx(
 # ---------------------------------------------------------------------------
 # Public entry point — the name app_v2's resolver looks for
 # ---------------------------------------------------------------------------
+def _build_macro_for_report(cfg: Any) -> dict:
+    """Fetch the macro dashboard and FLATTEN it into the flat keys the report's
+    build_macro section reads (vix, yield_curve_spread, cpi_yoy_pct, ...).
+
+    get_macro_dashboard returns a nested structure (interest_rates, inflation,
+    employment, ...); build_macro wants flat keys. We translate. Best-effort:
+    returns {} on any failure (then the Macro section stays a placeholder).
+    Note: full coverage needs FRED_API_KEY in .env; without it, GDP/some series
+    are absent and the section shows whatever IS cached.
+    """
+    try:
+        try:
+            from data.macro_data import MacroData
+        except Exception:
+            from macro_data import MacroData  # type: ignore
+        api_key = getattr(cfg, "FRED_API_KEY", None) if cfg else None
+        md = MacroData(api_key=api_key) if api_key else MacroData()
+        dash = md.get_macro_dashboard() or {}
+    except Exception as e:  # noqa: BLE001
+        logger.info("report_orchestrator: macro fetch failed (%s); section "
+                    "will be a placeholder.", e)
+        return {}
+
+    ir = dash.get("interest_rates", {}) or {}
+    inf = dash.get("inflation", {}) or {}
+    emp = dash.get("employment", {}) or {}
+    fin = dash.get("financial_conditions", {}) or {}
+    rec = dash.get("recession_signals", {}) or {}
+
+    flat = {
+        "vix": fin.get("vix") or dash.get("vix"),
+        "yield_curve_spread": ir.get("yield_spread_10y2y"),
+        "yield_curve_inverted": ir.get("yield_curve_inverted"),
+        "cpi_yoy_pct": inf.get("cpi_yoy_pct"),
+        "unemployment_rate": emp.get("unemployment_rate"),
+        "recession_probability": rec.get("recession_probability")
+        or rec.get("recession_prob"),
+        "hy_oas": fin.get("hy_oas"),
+        "financial_stress": fin.get("financial_stress"),
+        "fed_funds": ir.get("fed_funds"),
+    }
+    # Drop None values so build_macro only shows populated rows.
+    return {k: v for k, v in flat.items() if v is not None}
+
+
+def _build_price_chart(ticker: str, prices: Any, db_path: str):
+    """Build a matplotlib price chart and return it as a ChartSpec source.
+
+    Uses ctx prices if usable; else fetches 1y of daily closes from MarketData.
+    Returns a ChartSpec or None. Runs on a worker thread, so we force the Agg
+    backend (no GUI)."""
+    try:
+        import matplotlib
+        matplotlib.use("Agg")  # headless; safe on a worker thread
+        import matplotlib.pyplot as plt
+        import pandas as pd
+    except Exception as e:  # noqa: BLE001
+        logger.info("report_orchestrator: matplotlib unavailable (%s).", e)
+        return None
+
+    # Resolve a price series to plot.
+    series = None
+    try:
+        if isinstance(prices, pd.DataFrame) and "Close" in prices.columns:
+            series = prices["Close"].dropna()
+        elif isinstance(prices, dict) and prices.get("history") is not None:
+            _h = prices["history"]
+            if isinstance(_h, pd.DataFrame) and "Close" in _h.columns:
+                series = _h["Close"].dropna()
+        if series is None or len(series) < 2:
+            # Fetch fresh from MarketData.
+            try:
+                from data.market_data import MarketData
+            except Exception:
+                from market_data import MarketData  # type: ignore
+            md = MarketData()
+            df = md.get_prices(ticker, period="1y", use_cache=True)
+            if df is not None and "Close" in getattr(df, "columns", []):
+                series = df["Close"].dropna()
+    except Exception as e:  # noqa: BLE001
+        logger.info("report_orchestrator: price series resolve failed (%s).", e)
+        return None
+
+    if series is None or len(series) < 2:
+        return None
+
+    try:
+        fig, ax = plt.subplots(figsize=(7.0, 3.2))
+        ax.plot(series.index, series.values, linewidth=1.4)
+        try:
+            ma50 = series.rolling(50).mean()
+            ax.plot(series.index, ma50.values, linewidth=1.0, alpha=0.8,
+                    label="MA50")
+            ax.legend(loc="best", fontsize=8)
+        except Exception:
+            pass
+        ax.set_title(f"{ticker} — 1Y price")
+        ax.grid(True, alpha=0.3)
+        fig.tight_layout()
+    except Exception as e:  # noqa: BLE001
+        logger.info("report_orchestrator: chart render failed (%s).", e)
+        return None
+
+    # Wrap as a ChartSpec (charts.py coerces a matplotlib Figure to PNG).
+    try:
+        prefixes = ("ui.", "report.", "")
+        ChartSpec = None
+        for p in prefixes:
+            try:
+                _cm = importlib.import_module(f"{p}charts")
+                ChartSpec = _cm.ChartSpec
+                break
+            except Exception:
+                continue
+        if ChartSpec is None:
+            return None
+        return ChartSpec(
+            title=f"{ticker} Price (1Y)",
+            source=fig,
+            caption=f"{ticker} daily close with 50-day moving average, "
+                    f"trailing one year.",
+            label="Figure 1",
+        )
+    except Exception as e:  # noqa: BLE001
+        logger.info("report_orchestrator: ChartSpec wrap failed (%s).", e)
+        return None
+
+
 def generate_report(
     ticker: str,
     db_path: str = "data/hedgefund.db",
@@ -423,6 +551,26 @@ def generate_report(
             )
 
     snapshot_id = f"{ticker}-{datetime.now().strftime('%Y%m%d-%H%M%S')}"
+
+    # Enrich with macro + a price chart (the two sections the opinion payload
+    # doesn't carry). Best-effort; failures leave those sections as placeholders.
+    if not context:  # only for the build path; a passed context is used as-is
+        try:
+            macro_flat = _build_macro_for_report(cfg)
+            if macro_flat:
+                agent_ctx = dict(agent_ctx)
+                agent_ctx["macro"] = macro_flat
+        except Exception as e:  # noqa: BLE001
+            logger.info("report_orchestrator: macro enrich skipped (%s).", e)
+        try:
+            chart_spec = _build_price_chart(
+                ticker, agent_ctx.get("prices"), db_path)
+            if chart_spec is not None:
+                agent_ctx = dict(agent_ctx)
+                agent_ctx["charts"] = [chart_spec]
+        except Exception as e:  # noqa: BLE001
+            logger.info("report_orchestrator: chart enrich skipped (%s).", e)
+
     report_ctx = _map_agent_ctx_to_report_ctx(ticker, agent_ctx, snapshot_id)
 
     # Assemble the Story by iterating the canonical section order.
