@@ -307,11 +307,41 @@ def compute_risk_flags(
     combined = _combine_levels(levels)
     levels["combined"] = combined
 
+    # Distinguish "evaluated, nothing elevated" (all clear) from a genuine
+    # data gap. Empty reasons + inputs present -> all-clear note; empty reasons
+    # + no inputs -> "no data". Levels are unaffected.
+    def _had(d, keys):
+        try:
+            return any(d.get(k) is not None for k in keys)
+        except Exception:  # noqa: BLE001
+            return False
+
+    _macro_had = _had(mc, ("vix", "recession_probability",
+                           "yield_curve_spread", "yield_curve_inverted"))
+    _market_had = _had(m, ("realized_vol", "volatility", "drawdown",
+                           "max_drawdown", "rsi"))
+    _fund_had = bool(m)
+    _agent_had = bool(ar)
+
+    def _reasons_for(scored, had, clear_msg):
+        if scored:
+            return scored
+        return [clear_msg] if had else ["no data"]
+
     reasons: Dict[str, List[str]] = {
-        "fundamental": fundamental_reasons or ["no data"],
-        "macro": macro_reasons or ["no data"],
-        "market": market_reasons or ["no data"],
-        "agent": agent_reasons or ["no data"],
+        "fundamental": _reasons_for(
+            fundamental_reasons, _fund_had,
+            "fundamentals within normal ranges vs peers"),
+        "macro": _reasons_for(
+            macro_reasons, _macro_had,
+            "macro indicators within normal ranges (VIX, recession odds, "
+            "yield curve)"),
+        "market": _reasons_for(
+            market_reasons, _market_had,
+            "price/volatility metrics within normal ranges"),
+        "agent": _reasons_for(
+            agent_reasons, _agent_had,
+            "no additional risks flagged by the agent"),
     }
 
     logger.info(

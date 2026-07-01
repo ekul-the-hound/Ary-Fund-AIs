@@ -211,9 +211,55 @@ def _merge_opinion_into_ctx(ctx: dict, opinion: dict) -> dict:
     km = opinion.get("key_metrics")
     if isinstance(km, dict) and km:
         ctx["metrics"] = km
+
+    # Filings: the report's filings builder renders a list of filing dicts or a
+    # {recent:[...]} dict. Our payload's filings_summary is
+    # {management_tone, red_flags, filings_considered, summary} — reshape it
+    # into a 'recent'-style dict so the section renders the summary + red flags
+    # instead of "no parseable rows".
     fs = opinion.get("filings_summary")
-    if fs:
+    if isinstance(fs, dict) and fs:
+        recent = []
+        summ = fs.get("summary")
+        if summ:
+            recent.append({
+                "filed_date": opinion.get("as_of", ""),
+                "filing_type": f"Summary ({fs.get('filings_considered', '?')} "
+                               f"filings)",
+                "description": summ,
+            })
+        for rf in (fs.get("red_flags") or []):
+            recent.append({
+                "filed_date": "",
+                "filing_type": "Red flag",
+                "description": str(rf),
+            })
+        tone = fs.get("management_tone")
+        if tone:
+            recent.append({
+                "filed_date": "",
+                "filing_type": "Management tone",
+                "description": str(tone),
+            })
+        ctx["filings"] = {"recent": recent, "red_flags": fs.get("red_flags") or []}
         ctx["filings_summary"] = fs
+    elif isinstance(fs, str) and fs.strip():
+        ctx["filings_summary"] = fs
+
+    # Provenance / sources: synthesize from what the opinion records, so the
+    # Appendix "Data sources" shows real metadata instead of a placeholder.
+    prov = {}
+    for k in ("as_of", "bias_score", "confidence"):
+        if opinion.get(k) is not None:
+            prov[k] = opinion.get(k)
+    if isinstance(fs, dict) and fs.get("filings_considered") is not None:
+        prov["filings_considered"] = fs.get("filings_considered")
+    rf = opinion.get("risk_flags")
+    if isinstance(rf, dict) and rf.get("levels"):
+        prov["risk_model"] = "sector-relative z-scores (Altman/Piotroski/Beneish)"
+    prov["sources"] = "SEC EDGAR (XBRL/filings), yfinance (prices/fundamentals), FRED (macro)"
+    if prov:
+        ctx["provenance"] = prov
 
     return ctx
 

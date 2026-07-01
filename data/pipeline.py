@@ -866,7 +866,26 @@ def build_agent_context(ticker: str, db_path: str, cfg) -> dict:
         ``{}``, or ``[]`` — never zero or fabricated.
     """
     pipe = _build_pipeline(db_path, cfg)
-    reg = get_default_registry(db_path)
+    # Registry lives in the canonical market/registry DB (hedgefund.db), NOT
+    # the portfolio DB. Reading it from db_path (the portfolio path) returns an
+    # almost-empty data_points table, so derived signals / macro never reach
+    # the context. Resolve the registry DB explicitly.
+    _reg_db = None
+    try:
+        for _attr in ("MARKET_DB_PATH", "DATA_DB_PATH", "REGISTRY_DB_PATH"):
+            _v = getattr(cfg, _attr, None) if cfg else None
+            if _v:
+                _reg_db = str(_v)
+                break
+        if _reg_db is None:
+            try:
+                from data.data_registry import DEFAULT_DB_PATH as _DEF
+            except Exception:
+                from data_registry import DEFAULT_DB_PATH as _DEF  # type: ignore
+            _reg_db = _DEF  # data/hedgefund.db
+    except Exception:
+        _reg_db = None
+    reg = get_default_registry(_reg_db or db_path)
 
     ctx = _empty_context(ticker)
 

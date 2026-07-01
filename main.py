@@ -406,6 +406,31 @@ def _process_ticker(
             except Exception:  # noqa: BLE001
                 _peer_slice = None
 
+        # Wire market-risk signals into key_metrics so _score_market can
+        # produce real reasons instead of "no data". build_agent_context
+        # already computed these in context["derived_signals"]; they just
+        # weren't copied into the metrics dict the scanner reads.
+        try:
+            _ds = (context.get("derived_signals")
+                   if isinstance(context, dict) else None) or {}
+            if isinstance(key_metrics, dict) and _ds:
+                _market_map = {
+                    "realized_vol": ("realized_vol_30d", "realized_vol",
+                                     "volatility"),
+                    "drawdown": ("drawdown", "max_drawdown"),
+                    "rsi": ("rsi", "rsi_14"),
+                }
+                for _dest, _srcs in _market_map.items():
+                    if key_metrics.get(_dest) is not None:
+                        continue
+                    for _s in _srcs:
+                        _v = _ds.get(_s)
+                        if _v is not None:
+                            key_metrics[_dest] = _v
+                            break
+        except Exception:  # noqa: BLE001 — never break the run over this
+            pass
+
         risk_flags = risk_scanner.compute_risk_flags(
             ticker=ticker,
             metrics=key_metrics,
