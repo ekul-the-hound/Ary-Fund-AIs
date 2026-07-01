@@ -221,9 +221,12 @@ def _merge_opinion_into_ctx(ctx: dict, opinion: dict) -> dict:
     if isinstance(fs, dict) and fs:
         recent = []
         summ = fs.get("summary")
+        _as_of = opinion.get("as_of", "")
+        # Clean the ISO timestamp down to a plain date for display.
+        _date_disp = str(_as_of)[:10] if _as_of else ""
         if summ:
             recent.append({
-                "filed_date": opinion.get("as_of", ""),
+                "filed_date": _date_disp,
                 "filing_type": f"Summary ({fs.get('filings_considered', '?')} "
                                f"filings)",
                 "description": summ,
@@ -251,7 +254,11 @@ def _merge_opinion_into_ctx(ctx: dict, opinion: dict) -> dict:
     prov = {}
     for k in ("as_of", "bias_score", "confidence"):
         if opinion.get(k) is not None:
-            prov[k] = opinion.get(k)
+            _val = opinion.get(k)
+            # Show as_of as a plain date, not a raw ISO timestamp.
+            if k == "as_of":
+                _val = str(_val)[:10]
+            prov[k] = _val
     if isinstance(fs, dict) and fs.get("filings_considered") is not None:
         prov["filings_considered"] = fs.get("filings_considered")
     rf = opinion.get("risk_flags")
@@ -302,6 +309,9 @@ def _map_agent_ctx_to_report_ctx(
             "confidence": raw_thesis.get("confidence"),
             "time_horizon": raw_thesis.get("time_horizon"),
             "rationale": summary,
+            # build_thesis's coverage check looks for thesis.summary; provide it
+            # so a present rationale doesn't get flagged as a missing section.
+            "summary": summary,
             "key_risks": raw_thesis.get("key_risks") or [],
             "opportunities": raw_thesis.get("opportunities")
             or raw_thesis.get("key_opportunities") or [],
