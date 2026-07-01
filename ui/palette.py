@@ -262,6 +262,44 @@ def inject_shortcut_hint() -> None:
 # ======================================================================
 # Job tray
 # ======================================================================
+def _refresh_job_worker(db_path: str) -> dict:
+    """Background-job worker: run the data refresh via RefreshScheduler.
+
+    Runs the daily cadence (macro FRED -> registry) and the hourly cadence
+    (derived-signals recompute for every watchlist ticker), both forced so they
+    execute regardless of the last-run interval. Writes to the canonical
+    registry DB (data/hedgefund.db) so gen/risk-scan pick the data up.
+    Touches no Streamlit — safe for the job queue.
+    """
+    try:
+        try:
+            from data.refresh_scheduler import RefreshScheduler
+        except Exception:
+            from refresh_scheduler import RefreshScheduler  # type: ignore
+        # Registry lives in hedgefund.db, not the portfolio DB.
+        reg_db = "data/hedgefund.db"
+        sched = RefreshScheduler(db_path=reg_db)
+        daily = sched.run_daily(force=True)
+        hourly = sched.run_hourly(force=True)
+
+        def _ok(results):
+            try:
+                return sum(1 for r in results
+                           if getattr(r, "status", "ok") == "ok")
+            except Exception:  # noqa: BLE001
+                return len(results) if results else 0
+
+        return {
+            "daily_tasks": len(daily or []),
+            "daily_ok": _ok(daily or []),
+            "hourly_tasks": len(hourly or []),
+            "hourly_ok": _ok(hourly or []),
+            "note": "macro + derived signals refreshed for all tickers",
+        }
+    except Exception as e:  # noqa: BLE001
+        return {"note": f"error: {type(e).__name__}: {e}"}
+
+
 def render_job_tray(*, ticker: Optional[str] = None,
                     compact: bool = False) -> None:
     """Render the background-job tray over ``ui.state``'s queue.
@@ -316,6 +354,17 @@ def render_job_tray(*, ticker: Optional[str] = None,
                      use_container_width=True):
         S.clear_finished_jobs()
         st.rerun()
+
+    # Refresh data — runs macro + derived-signals refresh for all tickers as a
+    # background job, so gen produces complete market/macro risk reasons.
+    if head_r.button("Refresh data", key="tray_refresh",
+                     use_container_width=True):
+        try:
+            _db = "data/hedgefund.db"
+            S.submit_job("refresh", "ALL", _refresh_job_worker, _db)
+            st.toast("Data refresh started — see the Jobs list.")
+        except Exception as _re:  # noqa: BLE001
+            st.caption(f"Couldn't start refresh: {_re}")
 
     # --- Saved reports: Read inline / Open / Download per row ---------------
     try:

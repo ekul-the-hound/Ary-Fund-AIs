@@ -25,6 +25,20 @@ import numpy as np
 import pandas as pd
 import yfinance as yf
 
+def _yahoo_symbol(ticker: str) -> str:
+    """Translate a canonical dot-class symbol to yfinance's hyphen form.
+
+    Yahoo Finance spells share classes with a hyphen (BRK-B, BF-B), while this
+    project stores them with a dot (BRK.B, BF.B). Convert only for the Yahoo
+    call; the dot-form remains the cache/registry key everywhere else. Plain
+    symbols pass through unchanged.
+    """
+    if not ticker:
+        return ticker
+    return ticker.replace(".", "-")
+
+
+
 logger = logging.getLogger(__name__)
 
 
@@ -193,7 +207,7 @@ class MarketData:
 
         # Fetch from Yahoo
         logger.info(f"Fetching {ticker} prices: period={period}, interval={interval}")
-        t = yf.Ticker(ticker)
+        t = yf.Ticker(_yahoo_symbol(ticker))
 
         if start:
             df = t.history(start=start, end=end, interval=interval)
@@ -221,7 +235,7 @@ class MarketData:
         day_high, day_low, fifty_two_week_high, fifty_two_week_low
         """
         ticker = ticker.upper()
-        t = yf.Ticker(ticker)
+        t = yf.Ticker(_yahoo_symbol(ticker))
         info = t.info
 
         price = info.get("currentPrice") or info.get("regularMarketPrice", 0)
@@ -264,7 +278,7 @@ class MarketData:
             if cached:
                 return cached
 
-        t = yf.Ticker(ticker)
+        t = yf.Ticker(_yahoo_symbol(ticker))
         info = t.info
 
         fundamentals = {
@@ -341,7 +355,7 @@ class MarketData:
         Each is a DataFrame with annual data (most recent 4 years).
         """
         ticker = ticker.upper()
-        t = yf.Ticker(ticker)
+        t = yf.Ticker(_yahoo_symbol(ticker))
 
         return {
             "income_statement": t.income_stmt,
@@ -744,7 +758,7 @@ class MarketData:
         DataFrames plus computed ATM IV and put/call ratio.
         """
         ticker = ticker.upper()
-        t = yf.Ticker(ticker)
+        t = yf.Ticker(_yahoo_symbol(ticker))
         try:
             expiries = list(t.options or [])[:max_expiries]
         except Exception as e:  # noqa: BLE001
@@ -824,7 +838,7 @@ class MarketData:
     def _spot_price_safe(self, ticker: str, t=None) -> Optional[float]:
         try:
             if t is None:
-                t = yf.Ticker(ticker)
+                t = yf.Ticker(_yahoo_symbol(ticker))
             info = getattr(t, "info", {}) or {}
             return float(info.get("regularMarketPrice") or info.get("currentPrice") or 0) or None
         except Exception:  # noqa: BLE001
@@ -936,7 +950,7 @@ class MarketData:
         """
         ticker = ticker.upper()
         try:
-            info = yf.Ticker(ticker).info or {}
+            info = yf.Ticker(_yahoo_symbol(ticker)).info or {}
         except Exception as e:  # noqa: BLE001
             logger.warning("short_interest | %s | yfinance error: %s", ticker, e)
             return {}
