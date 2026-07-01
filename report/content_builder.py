@@ -331,7 +331,9 @@ def build_key_metrics(ctx: dict, theme: DocTheme) -> list[Flowable]:
 
 def build_charts(ctx: dict, theme: DocTheme) -> list[Flowable]:
     styles = theme.styles()
-    out: list[Flowable] = [Paragraph("Charts", styles["H1"])]
+    # Leading spacer so the Charts header never collides with the last row
+    # of the preceding metrics table.
+    out: list[Flowable] = [Spacer(1, 10), Paragraph("Charts", styles["H1"])]
 
     charts_raw = ctx.get("charts")
     specs = _coerce_chart_list(charts_raw)
@@ -699,7 +701,7 @@ def _two_col_table(rows: list[tuple[str, Any]], theme: DocTheme) -> Flowable:
     return _table(
         [[label, value] for label, value in rows],
         theme,
-        col_widths=[2.0 * inch, 4.0 * inch],
+        col_widths=[2.6 * inch, 3.4 * inch],
         header_row=False,
     )
 
