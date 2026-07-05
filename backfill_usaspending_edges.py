@@ -131,9 +131,8 @@ def _query_awards(recipient_name: str, days: int) -> dict:
             }],
             "award_type_codes": ["A", "B", "C", "D"],
         },
-        "fields": ["Award ID", "Recipient Name", "Award Amount",
-                   "Action Date", "Awarding Agency"],
-        "sort": "Action Date", "order": "desc", "limit": 100,
+        "fields": ["Award ID", "Recipient Name", "Award Amount", "Start Date"],
+        "sort": "Award Amount", "order": "desc", "limit": 100,
     }
     r = requests.post(_URL, json=body,
                       headers={"User-Agent": _UA, "Content-Type": "application/json"},
@@ -148,7 +147,7 @@ def _query_awards(recipient_name: str, days: int) -> dict:
             total += float(row.get("Award Amount") or 0)
         except (TypeError, ValueError):
             pass
-        d = row.get("Action Date")
+        d = row.get("Start Date")
         if d and (last is None or d > last):
             last = d
     return {"total": total, "n": len(results), "last": last}
