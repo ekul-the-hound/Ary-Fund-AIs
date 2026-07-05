@@ -134,3 +134,8 @@ $RECYCLE.BIN/
 
 *.bak
 *.py.bak
+
+data/*.db
+data/*_done.json
+data/f13f_corrected.json
+__pycache__/

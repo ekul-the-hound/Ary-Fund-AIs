@@ -1,0 +1,971 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>ARY QUANT · Money Flow Graph</title>
+<script src="https://cdn.jsdelivr.net/npm/d3@7/dist/d3.min.js"></script>
+<style>
+  :root{
+    /* Zed-ish charcoal surface stack */
+    --bg:#0e0e11;
+    --canvas:#0b0b0e;
+    --panel:#16161c;
+    --elev:#1c1c23;
+    --elev2:#22222b;
+    --border:#2a2a33;
+    --hair:#20202700;
+    --hairline:#202027;
+    --txt:#d8d8e2;
+    --txt-dim:#9a9aab;
+    --txt-mute:#6a6a79;
+    --txt-faint:#4d4d59;
+    /* signature accent */
+    --acc:#6c5cff;
+    --acc-soft:#8b7dff;
+    --acc-dim:#2c2740;
+    --cyan:#22d3ee;
+    --pred:#b98bff;      /* suspected / prediction */
+    --danger:#ff5c6c;
+    --ok:#3fb950;
+    /* sector palette */
+    --s-tech:#4f9cf9;
+    --s-fin:#3fb950;
+    --s-health:#a371f7;
+    --s-consumer:#e3b341;
+    --s-energy:#f0883e;
+    --s-industrial:#39c5cf;
+    --s-comm:#db61a2;
+    --mono:ui-monospace,"SF Mono","JetBrains Mono","Menlo","Cascadia Code",monospace;
+    --sans:"Inter",system-ui,-apple-system,"Segoe UI",Roboto,sans-serif;
+  }
+  *{box-sizing:border-box}
+  html,body{height:100%;margin:0}
+  body{
+    background:var(--bg);color:var(--txt);font-family:var(--sans);
+    font-size:13px;line-height:1.4;overflow:hidden;
+    -webkit-font-smoothing:antialiased;
+  }
+  .num,.mono{font-family:var(--mono);font-variant-numeric:tabular-nums}
+
+  /* ---------- app shell ---------- */
+  #app{
+    display:grid;height:100vh;
+    grid-template-columns:1fr 336px;
+    grid-template-rows:52px 1fr 132px;
+    grid-template-areas:
+      "top    top"
+      "canvas side"
+      "bottom side";
+  }
+
+  /* ---------- top bar ---------- */
+  #topbar{
+    grid-area:top;display:flex;align-items:center;gap:14px;
+    padding:0 16px;background:var(--panel);
+    border-bottom:1px solid var(--hairline);
+  }
+  .brand{display:flex;align-items:center;gap:9px;flex:none}
+  .brand .dot{
+    width:11px;height:11px;border-radius:3px;
+    background:linear-gradient(135deg,var(--acc),var(--cyan));
+    box-shadow:0 0 12px var(--acc);
+  }
+  .brand b{font-weight:600;letter-spacing:.2px;font-size:13px}
+  .brand span{color:var(--txt-mute);font-size:11px;font-family:var(--mono)}
+
+  .searchwrap{position:relative;flex:0 1 320px;min-width:150px}
+  .searchwrap svg{position:absolute;left:9px;top:50%;transform:translateY(-50%);
+    width:13px;height:13px;stroke:var(--txt-mute);fill:none;stroke-width:1.6}
+  #search{
+    width:100%;background:var(--canvas);border:1px solid var(--border);
+    color:var(--txt);border-radius:7px;padding:7px 10px 7px 28px;font-size:12px;
+    font-family:var(--sans);outline:none;transition:border-color .15s;
+  }
+  #search:focus{border-color:var(--acc)}
+  #search::placeholder{color:var(--txt-faint)}
+  .kbd{
+    font-family:var(--mono);font-size:10px;color:var(--txt-mute);
+    border:1px solid var(--border);border-radius:4px;padding:1px 5px;
+    background:var(--elev);position:absolute;right:7px;top:50%;transform:translateY(-50%);
+  }
+
+  .modes{display:flex;gap:4px;flex:none}
+  .modebtn{
+    display:flex;align-items:center;gap:6px;
+    background:var(--elev);border:1px solid var(--border);color:var(--txt-dim);
+    padding:6px 10px;border-radius:7px;cursor:pointer;font-size:11.5px;
+    font-family:var(--sans);transition:all .13s;white-space:nowrap;
+  }
+  .modebtn:hover{border-color:var(--txt-faint);color:var(--txt)}
+  .modebtn.active{background:var(--acc-dim);border-color:var(--acc);color:var(--acc-soft)}
+  .modebtn.disabled{opacity:.4;cursor:not-allowed}
+  .modebtn .mk{font-family:var(--mono);font-size:9.5px;color:var(--txt-faint);
+    border:1px solid var(--border);border-radius:3px;padding:0 3px}
+  .modebtn.active .mk{color:var(--acc);border-color:var(--acc)}
+
+  .spacer{flex:1}
+  .topstats{display:flex;gap:16px;flex:none}
+  .topstat{display:flex;flex-direction:column;line-height:1.15}
+  .topstat b{font-family:var(--mono);font-size:14px;color:var(--txt)}
+  .topstat span{font-size:9.5px;color:var(--txt-mute);text-transform:uppercase;letter-spacing:.6px}
+
+  /* ---------- canvas ---------- */
+  #canvas{grid-area:canvas;position:relative;background:
+    radial-gradient(circle at 50% 40%, #131319 0%, var(--canvas) 70%);
+    overflow:hidden}
+  #graph{width:100%;height:100%;display:block;cursor:grab}
+  #graph:active{cursor:grabbing}
+  #graph.panning{cursor:grabbing}
+
+  .link{stroke-linecap:round;transition:opacity .18s}
+  .link.suspected{stroke-dasharray:5 5}
+  .link.inferred{stroke-dasharray:1.5 4}
+  .node circle{cursor:pointer;transition:stroke-width .15s,opacity .18s}
+  .node text{
+    font-family:var(--mono);font-size:9.5px;fill:var(--txt-dim);
+    pointer-events:none;text-anchor:middle;user-select:none;
+    paint-order:stroke;stroke:var(--canvas);stroke-width:2.6px;
+  }
+  .node.dim circle{opacity:.12}
+  .node.dim text{opacity:.12}
+  .link.dim{opacity:.05 !important}
+  .node.faded circle,.link.faded{opacity:0;pointer-events:none}
+  .node.selected circle{stroke:#fff !important}
+  .link.selected{stroke:#fff !important;opacity:1 !important}
+  @media (prefers-reduced-motion: no-preference){
+    .link.suspected{animation:flow 1s linear infinite}
+  }
+  @keyframes flow{to{stroke-dashoffset:-10}}
+
+  /* floating flow legend on canvas */
+  .canvas-legend{
+    position:absolute;left:14px;bottom:14px;background:rgba(20,20,26,.82);
+    backdrop-filter:blur(8px);border:1px solid var(--hairline);border-radius:9px;
+    padding:10px 12px;font-size:10.5px;color:var(--txt-dim);pointer-events:none;
+    max-width:230px;
+  }
+  .canvas-legend .heat{
+    height:8px;border-radius:4px;margin:5px 0 3px;
+    background:linear-gradient(90deg,#22d3ee,#a3e635,#facc15,#f97316,#ef4444);
+  }
+  .canvas-legend .heat-labels{display:flex;justify-content:space-between;
+    font-family:var(--mono);font-size:9px;color:var(--txt-mute)}
+  .cl-row{display:flex;align-items:center;gap:7px;margin-top:6px}
+  .cl-row .line{width:22px;height:0;border-top-width:2px;border-top-style:solid;flex:none}
+
+  .zoomctl{position:absolute;right:14px;bottom:14px;display:flex;flex-direction:column;
+    background:var(--panel);border:1px solid var(--hairline);border-radius:8px;overflow:hidden}
+  .zoomctl button{
+    width:32px;height:30px;background:none;border:none;color:var(--txt-dim);
+    cursor:pointer;font-size:15px;font-family:var(--mono);
+  }
+  .zoomctl button:hover{background:var(--elev);color:var(--txt)}
+  .zoomctl button+button{border-top:1px solid var(--hairline)}
+
+  /* ---------- side panel ---------- */
+  #side{grid-area:side;background:var(--panel);border-left:1px solid var(--hairline);
+    display:flex;flex-direction:column;min-height:0}
+  .tabs{display:flex;border-bottom:1px solid var(--hairline);flex:none}
+  .tab{flex:1;padding:10px 4px;text-align:center;cursor:pointer;font-size:11.5px;
+    color:var(--txt-mute);border-bottom:2px solid transparent;transition:all .13s}
+  .tab:hover{color:var(--txt-dim)}
+  .tab.active{color:var(--txt);border-bottom-color:var(--acc)}
+  .tabpanel{flex:1;overflow-y:auto;padding:14px;min-height:0}
+  .tabpanel::-webkit-scrollbar{width:8px}
+  .tabpanel::-webkit-scrollbar-thumb{background:var(--border);border-radius:4px}
+  .hidden{display:none !important}
+
+  .sec-title{font-size:10px;text-transform:uppercase;letter-spacing:.8px;
+    color:var(--txt-mute);margin:0 0 8px;font-weight:600}
+  .sec+.sec{margin-top:18px}
+
+  /* details */
+  .empty{color:var(--txt-faint);text-align:center;padding:40px 10px;font-size:12px}
+  .empty svg{width:30px;height:30px;stroke:var(--txt-faint);fill:none;stroke-width:1.4;
+    margin-bottom:10px;opacity:.6}
+  .node-head{display:flex;align-items:flex-start;gap:11px;margin-bottom:12px}
+  .node-badge{width:36px;height:36px;border-radius:9px;flex:none;display:flex;
+    align-items:center;justify-content:center;font-family:var(--mono);font-size:11px;
+    font-weight:600;color:#0b0b0e}
+  .node-head .nm{font-size:15px;font-weight:600;line-height:1.2}
+  .node-head .tk{font-family:var(--mono);font-size:11px;color:var(--txt-mute);margin-top:2px}
+  .chips{display:flex;flex-wrap:wrap;gap:5px;margin-top:6px}
+  .chip{font-size:10px;padding:2px 7px;border-radius:20px;border:1px solid var(--border);
+    color:var(--txt-dim);background:var(--elev)}
+  .chip.risk{border-color:var(--danger);color:var(--danger);background:rgba(255,92,108,.08)}
+  .kv{display:grid;grid-template-columns:1fr auto;gap:6px 10px;margin:10px 0}
+  .kv .k{color:var(--txt-mute);font-size:11.5px}
+  .kv .v{font-family:var(--mono);font-size:12px;color:var(--txt);text-align:right}
+  .meter{height:5px;background:var(--elev2);border-radius:3px;overflow:hidden;margin-top:3px}
+  .meter i{display:block;height:100%;border-radius:3px;background:linear-gradient(90deg,var(--acc),var(--cyan))}
+
+  .rel{display:block;width:100%;text-align:left;background:var(--elev);
+    border:1px solid var(--border);border-radius:8px;padding:9px 10px;margin-top:7px;
+    cursor:pointer;transition:border-color .13s,background .13s}
+  .rel:hover{border-color:var(--acc);background:var(--elev2)}
+  .rel-top{display:flex;align-items:center;justify-content:space-between;gap:8px}
+  .rel-dir{display:flex;align-items:center;gap:5px;font-family:var(--mono);font-size:11.5px}
+  .rel-dir .arrow{color:var(--txt-faint)}
+  .rel-amt{font-family:var(--mono);font-size:12px;font-weight:600}
+  .rel-sub{display:flex;align-items:center;gap:8px;margin-top:5px;font-size:10px;color:var(--txt-mute)}
+  .type-badge{font-size:9px;padding:1px 6px;border-radius:20px;font-family:var(--mono);
+    text-transform:uppercase;letter-spacing:.4px}
+  .tb-confirmed{background:rgba(63,185,80,.13);color:var(--ok)}
+  .tb-inferred{background:rgba(108,92,255,.14);color:var(--acc-soft)}
+  .tb-suspected{background:rgba(185,139,255,.14);color:var(--pred)}
+
+  /* edge / why panel */
+  .why-flow{display:flex;align-items:center;justify-content:center;gap:12px;
+    padding:14px;background:var(--elev);border:1px solid var(--border);border-radius:10px;margin-bottom:12px}
+  .why-node{text-align:center}
+  .why-node .b{width:30px;height:30px;border-radius:8px;margin:0 auto 5px;display:flex;
+    align-items:center;justify-content:center;font-family:var(--mono);font-size:10px;color:#0b0b0e;font-weight:600}
+  .why-node .l{font-size:10px;color:var(--txt-dim);font-family:var(--mono)}
+  .why-arrow{display:flex;flex-direction:column;align-items:center;color:var(--txt-mute);flex:1}
+  .why-arrow .amt{font-family:var(--mono);font-size:14px;color:var(--txt);font-weight:600;margin-bottom:3px}
+  .why-arrow .ln{width:100%;height:2px;position:relative;background:currentColor;border-radius:2px}
+  .why-arrow .ln::after{content:"";position:absolute;right:-1px;top:-3px;border:4px solid transparent;
+    border-left-color:currentColor;border-right:0}
+  .src-doc{display:block;font-family:var(--mono);font-size:11px;color:var(--cyan);
+    word-break:break-all;text-decoration:none;padding:8px 10px;background:var(--canvas);
+    border:1px solid var(--border);border-radius:7px;margin-top:6px}
+  .src-doc:hover{border-color:var(--cyan)}
+  .rationale{font-size:12px;color:var(--txt-dim);line-height:1.5;
+    padding:10px;background:var(--elev);border-radius:8px;border-left:2px solid var(--acc)}
+
+  /* filters */
+  .filt-group{margin-bottom:16px}
+  .checks{display:flex;flex-direction:column;gap:2px}
+  .check{display:flex;align-items:center;gap:8px;cursor:pointer;padding:4px 6px;border-radius:6px;font-size:12px}
+  .check:hover{background:var(--elev)}
+  .check input{appearance:none;width:14px;height:14px;border:1.5px solid var(--border);
+    border-radius:4px;cursor:pointer;position:relative;flex:none;background:var(--canvas)}
+  .check input:checked{background:var(--sw,var(--acc));border-color:var(--sw,var(--acc))}
+  .check input:checked::after{content:"";position:absolute;left:4px;top:1px;width:3px;height:7px;
+    border:solid #0b0b0e;border-width:0 2px 2px 0;transform:rotate(45deg)}
+  .check .sw{width:9px;height:9px;border-radius:2px;flex:none}
+  .check .lbl{flex:1}
+  .check .cnt{font-family:var(--mono);font-size:10px;color:var(--txt-mute)}
+
+  .rng-val{font-family:var(--mono);font-size:11px;color:var(--txt-dim);float:right}
+  input[type=range]{width:100%;appearance:none;height:4px;border-radius:2px;
+    background:var(--elev2);outline:none;margin:8px 0 2px}
+  input[type=range]::-webkit-slider-thumb{appearance:none;width:14px;height:14px;border-radius:50%;
+    background:var(--acc);cursor:pointer;border:2px solid var(--panel);box-shadow:0 0 6px var(--acc-dim)}
+  input[type=range]::-moz-range-thumb{width:14px;height:14px;border-radius:50%;background:var(--acc);
+    cursor:pointer;border:2px solid var(--panel)}
+
+  .btn-reset{width:100%;margin-top:8px;background:var(--elev);border:1px solid var(--border);
+    color:var(--txt-dim);padding:8px;border-radius:7px;cursor:pointer;font-family:var(--sans);font-size:12px}
+  .btn-reset:hover{border-color:var(--acc);color:var(--acc-soft)}
+
+  /* legend tab */
+  .leg-item{display:flex;align-items:center;gap:9px;margin-bottom:9px;font-size:12px}
+  .leg-item .sw{width:13px;height:13px;border-radius:4px;flex:none}
+  .leg-item .cir{border-radius:50%;flex:none;border:2px solid}
+  .leg-line{width:26px;flex:none}
+  .mover{display:flex;align-items:center;justify-content:space-between;gap:8px;
+    padding:7px 9px;background:var(--elev);border-radius:7px;margin-top:6px;cursor:pointer;
+    border:1px solid transparent;transition:border-color .12s}
+  .mover:hover{border-color:var(--acc)}
+  .mover .r{width:16px;font-family:var(--mono);font-size:11px;color:var(--txt-faint);flex:none}
+  .mover .p{flex:1;font-family:var(--mono);font-size:11px}
+  .mover .a{font-family:var(--mono);font-size:12px;font-weight:600}
+  .ksrow{display:flex;justify-content:space-between;font-size:11.5px;padding:5px 0;
+    border-bottom:1px solid var(--hairline);color:var(--txt-dim)}
+  .ksrow:last-child{border:none}
+  .ksrow .kbd{position:static;transform:none}
+
+  /* ---------- bottom timeline ---------- */
+  #bottom{grid-area:bottom;background:var(--panel);border-top:1px solid var(--hairline);
+    display:flex;flex-direction:column;padding:10px 16px 12px;min-height:0}
+  .tl-head{display:flex;align-items:center;gap:12px;margin-bottom:8px}
+  .tl-head .ttl{font-size:10px;text-transform:uppercase;letter-spacing:.8px;color:var(--txt-mute);font-weight:600}
+  .playbtn{width:28px;height:28px;border-radius:7px;background:var(--acc-dim);border:1px solid var(--acc);
+    color:var(--acc-soft);cursor:pointer;display:flex;align-items:center;justify-content:center;flex:none}
+  .playbtn:hover{background:var(--acc);color:#0b0b0e}
+  .playbtn svg{width:12px;height:12px;fill:currentColor}
+  .tl-date{font-family:var(--mono);font-size:12px;color:var(--txt);flex:none}
+  .tl-date span{color:var(--txt-mute);font-size:10px}
+  .tl-count{font-family:var(--mono);font-size:11px;color:var(--txt-mute);margin-left:auto}
+  #timeslider{margin:0;flex:none}
+  .events{display:flex;gap:7px;overflow-x:auto;padding-top:9px;flex:1;align-items:stretch}
+  .events::-webkit-scrollbar{height:6px}
+  .events::-webkit-scrollbar-thumb{background:var(--border);border-radius:3px}
+  .ev{flex:none;min-width:158px;background:var(--elev);border:1px solid var(--border);
+    border-radius:8px;padding:7px 9px;cursor:pointer;transition:border-color .12s}
+  .ev:hover{border-color:var(--acc)}
+  .ev.new{border-color:var(--pred);box-shadow:0 0 0 1px rgba(185,139,255,.25)}
+  .ev-date{font-family:var(--mono);font-size:9.5px;color:var(--txt-mute)}
+  .ev-pair{font-family:var(--mono);font-size:11px;margin:3px 0;display:flex;align-items:center;gap:4px}
+  .ev-pair .arrow{color:var(--txt-faint)}
+  .ev-bot{display:flex;align-items:center;justify-content:space-between;gap:6px}
+  .ev-amt{font-family:var(--mono);font-size:11px;font-weight:600}
+
+  /* tooltip */
+  #tip{position:fixed;pointer-events:none;z-index:100;background:rgba(22,22,28,.96);
+    backdrop-filter:blur(10px);border:1px solid var(--border);border-radius:9px;padding:9px 11px;
+    font-size:11.5px;max-width:250px;opacity:0;transition:opacity .12s;box-shadow:0 8px 26px rgba(0,0,0,.5)}
+  #tip.show{opacity:1}
+  #tip .t-nm{font-weight:600;margin-bottom:3px;display:flex;align-items:center;gap:6px}
+  #tip .t-nm .d{width:8px;height:8px;border-radius:2px;flex:none}
+  #tip .t-row{display:flex;justify-content:space-between;gap:14px;color:var(--txt-dim);margin-top:2px}
+  #tip .t-row .num{color:var(--txt)}
+  #tip .t-mute{color:var(--txt-mute);font-size:10.5px;margin-top:4px}
+
+  /* toast */
+  #toast{position:fixed;bottom:150px;left:50%;transform:translateX(-50%) translateY(20px);
+    background:var(--elev2);border:1px solid var(--acc);color:var(--txt);padding:10px 16px;
+    border-radius:9px;font-size:12px;z-index:200;opacity:0;transition:all .2s;pointer-events:none}
+  #toast.show{opacity:1;transform:translateX(-50%) translateY(0)}
+
+  @media (max-width:900px){
+    #app{grid-template-columns:1fr;grid-template-rows:52px 1fr 128px;
+      grid-template-areas:"top" "canvas" "bottom"}
+    #side{display:none}
+    .topstats{display:none}
+  }
+</style>
+</head>
+<body>
+<div id="app">
+  <!-- TOP BAR -->
+  <div id="topbar">
+    <div class="brand">
+      <div class="dot"></div>
+      <b>ARY&nbsp;Flow</b><span>sec://money-graph</span>
+    </div>
+    <div class="searchwrap">
+      <svg viewBox="0 0 24 24"><circle cx="11" cy="11" r="7"/><path d="M21 21l-4.5-4.5"/></svg>
+      <input id="search" placeholder="Search ticker, company, or executive…" autocomplete="off" />
+      <span class="kbd">/</span>
+    </div>
+    <div class="modes">
+      <button class="modebtn active" data-mode="force"><span class="mk">1</span>Force</button>
+      <button class="modebtn" data-mode="sector"><span class="mk">2</span>Sector</button>
+      <button class="modebtn" data-mode="concentric"><span class="mk">3</span>Concentric</button>
+      <button class="modebtn disabled" id="geoBtn" title="Needs company location data">Geo</button>
+    </div>
+    <div class="spacer"></div>
+    <div class="topstats">
+      <div class="topstat"><b id="stNodes">0</b><span>Companies</span></div>
+      <div class="topstat"><b id="stEdges">0</b><span>Flows</span></div>
+      <div class="topstat"><b id="stVolume">$0</b><span>Tracked</span></div>
+    </div>
+  </div>
+
+  <!-- CANVAS -->
+  <div id="canvas">
+    <svg id="graph"></svg>
+    <div class="canvas-legend">
+      <div style="color:var(--txt-mute);font-size:9.5px;text-transform:uppercase;letter-spacing:.6px;margin-bottom:2px">Flow amount</div>
+      <div class="heat"></div>
+      <div class="heat-labels"><span>$1B</span><span>$75B</span></div>
+      <div class="cl-row"><span class="line" style="border-top-color:#3fb950;border-top-style:solid"></span>Confirmed filing</div>
+      <div class="cl-row"><span class="line" style="border-top-color:var(--acc-soft);border-top-style:dotted"></span>Inferred (13F/13D)</div>
+      <div class="cl-row"><span class="line" style="border-top-color:var(--pred);border-top-style:dashed"></span>Suspected (news)</div>
+    </div>
+    <div class="zoomctl">
+      <button id="zin" title="Zoom in">+</button>
+      <button id="zout" title="Zoom out">−</button>
+      <button id="zfit" title="Reset view (R)">⤢</button>
+    </div>
+  </div>
+
+  <!-- SIDE PANEL -->
+  <div id="side">
+    <div class="tabs">
+      <div class="tab active" data-tab="details">Details</div>
+      <div class="tab" data-tab="filters">Filters</div>
+      <div class="tab" data-tab="legend">Legend</div>
+    </div>
+    <div class="tabpanel" id="tab-details">
+      <div class="empty" id="detailsEmpty">
+        <svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="3"/><circle cx="5" cy="6" r="2"/><circle cx="19" cy="7" r="2"/><circle cx="18" cy="18" r="2"/><path d="M7 7l3 3m8-1l-4 3m3 4l-4-3"/></svg>
+        Select a company or flow to inspect provenance, filings, and connected relationships.
+      </div>
+      <div id="detailsBody"></div>
+    </div>
+    <div class="tabpanel hidden" id="tab-filters"></div>
+    <div class="tabpanel hidden" id="tab-legend"></div>
+  </div>
+
+  <!-- BOTTOM TIMELINE -->
+  <div id="bottom">
+    <div class="tl-head">
+      <div class="ttl">Timeline</div>
+      <button class="playbtn" id="playBtn" title="Play flow history">
+        <svg viewBox="0 0 24 24"><path d="M8 5v14l11-7z"/></svg>
+      </button>
+      <div class="tl-date">As of <span id="tlDate">—</span></div>
+      <div class="tl-count" id="tlCount"></div>
+    </div>
+    <input type="range" id="timeslider" min="0" max="100" value="100" />
+    <div class="events" id="events"></div>
+  </div>
+</div>
+
+<div id="tip"></div>
+<div id="toast"></div>
+
+<script>
+/* =========================================================================
+   ARY FUND · SEC MONEY FLOW GRAPH
+   Single-file D3 network. Money flows source -> target (buyer -> supplier/holding).
+   ========================================================================= */
+
+/* ---------- 1. DATA (injected by ui/money_flow.py) ----------
+   The Streamlit host replaces __ARY_GRAPH_JSON__ with the output of
+   data.money_graph.build_money_graph(). Falls back to an empty graph so the
+   file still opens standalone for template editing. */
+const INJECTED = (function(){
+  try { return __ARY_GRAPH_JSON__; }
+  catch(e){ return (window.__ARY_GRAPH__ || {nodes:[],edges:[],meta:{}}); }
+})();
+const DATA = {nodes: INJECTED.nodes || [], edges: INJECTED.edges || []};
+const META = INJECTED.meta || {};
+
+/* ---------- 2. CONFIG ---------- */
+const SECTOR_COLORS = {
+  "Technology":"#4f9cf9", "Financials":"#3fb950", "Healthcare":"#a371f7",
+  "Consumer":"#e3b341", "Energy":"#f0883e", "Industrials":"#39c5cf", "Communication":"#db61a2"
+};
+const RISK_THRESHOLD = 0.6;
+const heatInterp = d3.interpolateRgbBasis(["#22d3ee","#a3e635","#facc15","#f97316","#ef4444"]);
+
+const fmt$ = (b) => {                    // b in $billions
+  if (b >= 1000) return "$" + (b/1000).toFixed(2) + "T";
+  if (b >= 1)    return "$" + b.toFixed(b<10?1:0) + "B";
+  return "$" + (b*1000).toFixed(0) + "M";
+};
+const parseDate = d3.utcParse("%Y-%m-%d");
+const fmtDate = d3.utcFormat("%b %d, %Y");
+const fmtDateShort = d3.utcFormat("%b '%y");
+
+/* ---------- 3. STATE ---------- */
+const allSectors = Array.from(new Set(DATA.nodes.map(n => n.sector)));
+const allTypes = ["confirmed","inferred","suspected"];
+const _dts = DATA.edges.map(e=>parseDate(e.date)).filter(Boolean);
+// Timeline upper bound = "now" (the graph build time from meta.generated_at,
+// falling back to the browser clock), so the "As of" label reads today even
+// when the newest filing is older. Lower bound = earliest edge.
+const _nowRef = (META && META.generated_at) ? new Date(META.generated_at) : new Date();
+const _minEdge = _dts.length ? d3.min(_dts) : new Date(Date.now() - 2.6e10);
+const _maxEdge = _dts.length ? d3.max(_dts) : _nowRef;
+const dateExtent = [_minEdge, (_nowRef > _maxEdge ? _nowRef : _maxEdge)];
+const amtExtent = d3.extent(DATA.edges, e => e.amount);
+
+const state = {
+  layout:"force",
+  selectedNode:null,
+  selectedEdge:null,
+  search:"",
+  filters:{
+    sectors:new Set(allSectors),
+    types:new Set(allTypes),
+    minConfidence:0,
+    minAmount:0
+  },
+  asOf:dateExtent[1].getTime()
+};
+
+/* ---------- 4. DOM ---------- */
+const svg = d3.select("#graph");
+const canvasEl = document.getElementById("canvas");
+const tip = document.getElementById("tip");
+let W = canvasEl.clientWidth, H = canvasEl.clientHeight;
+svg.attr("viewBox", [0,0,W,H]);
+
+/* defs: risk glow + arrow marker */
+const defs = svg.append("defs");
+const glow = defs.append("filter").attr("id","riskGlow").attr("x","-60%").attr("y","-60%").attr("width","220%").attr("height","220%");
+glow.append("feGaussianBlur").attr("stdDeviation","4").attr("result","b");
+const gm = glow.append("feMerge");
+gm.append("feMergeNode").attr("in","b");
+gm.append("feMergeNode").attr("in","SourceGraphic");
+defs.append("marker").attr("id","arrow").attr("viewBox","0 -5 10 10").attr("refX",9).attr("refY",0)
+  .attr("markerWidth",5).attr("markerHeight",5).attr("orient","auto")
+  .append("path").attr("d","M0,-4L8,0L0,4").attr("fill","context-stroke").attr("opacity",0.8);
+
+const viewport = svg.append("g").attr("class","viewport");
+const gLinks = viewport.append("g").attr("class","links");
+const gNodes = viewport.append("g").attr("class","nodes");
+
+/* ---------- 5. SCALES ---------- */
+const _sizes = DATA.nodes.map(n=>n.size).filter(v=>v>0);
+const rScale = d3.scaleLog().domain([Math.min(1,...(_sizes.length?_sizes:[1])), Math.max(2,...(_sizes.length?_sizes:[2]))]).range([10,34]);
+const _amtMax = amtExtent[1] || 10;
+const wScale = d3.scaleLog().domain([Math.max(0.5,amtExtent[0]||0.5), Math.max(1,_amtMax)]).range([1.2,7]).clamp(true);
+const heatScale = d3.scaleLog().domain([Math.max(0.5,amtExtent[0]||0.5), Math.max(1,_amtMax)]).range([0,1]).clamp(true);
+const nodeColor = n => SECTOR_COLORS[n.sector] || "#888";
+const edgeColor = e => e.type==="suspected" ? "#b98bff" : heatInterp(heatScale(e.amount));
+const nodeR = n => rScale(n.size);
+
+/* build id->node map & neighbor index */
+const nodeById = new Map(DATA.nodes.map(n => [n.id, n]));
+const neighborIndex = new Map(DATA.nodes.map(n => [n.id, new Set()]));
+DATA.edges.forEach(e => {
+  neighborIndex.get(e.source)?.add(e.target);
+  neighborIndex.get(e.target)?.add(e.source);
+});
+
+/* ---------- 6. SIMULATION ---------- */
+const sim = d3.forceSimulation(DATA.nodes)
+  .force("link", d3.forceLink(DATA.edges).id(d=>d.id).distance(d=>90 + 30*(1-d.confidence)).strength(d=>0.05 + 0.25*d.confidence))
+  .force("charge", d3.forceManyBody().strength(-320))
+  .force("center", d3.forceCenter(W/2, H/2))
+  .force("collide", d3.forceCollide().radius(d=>nodeR(d)+7))
+  .on("tick", ticked);
+
+/* ---------- 7. RENDER ---------- */
+const linkSel = gLinks.selectAll("line").data(DATA.edges).join("line")
+  .attr("class", d=>"link "+d.type)
+  .attr("stroke", edgeColor)
+  .attr("stroke-width", d=>wScale(d.amount))
+  .attr("stroke-opacity", d=>0.25 + 0.6*d.confidence)
+  .attr("marker-end","url(#arrow)")
+  .style("cursor","pointer")
+  .on("mouseover", (ev,d)=>showEdgeTip(ev,d))
+  .on("mousemove", moveTip)
+  .on("mouseout", hideTip)
+  .on("click", (ev,d)=>{ev.stopPropagation(); selectEdge(d);});
+
+const nodeSel = gNodes.selectAll("g").data(DATA.nodes).join("g")
+  .attr("class", d=>"node"+(d.risk_score>=RISK_THRESHOLD?" risk":""))
+  .call(d3.drag().on("start",dragStart).on("drag",dragged).on("end",dragEnd));
+
+nodeSel.append("circle")
+  .attr("r", nodeR)
+  .attr("fill", d=>nodeColor(d))
+  .attr("fill-opacity", 0.9)
+  .attr("stroke", d=> d.risk_score>=RISK_THRESHOLD ? "#ff5c6c" : d3.color(nodeColor(d)).brighter(0.6))
+  .attr("stroke-width", d=>1 + 4*d.confidence)
+  .attr("filter", d=> d.risk_score>=RISK_THRESHOLD ? "url(#riskGlow)" : null)
+  .on("mouseover", (ev,d)=>showNodeTip(ev,d))
+  .on("mousemove", moveTip)
+  .on("mouseout", hideTip)
+  .on("click", (ev,d)=>{ev.stopPropagation(); selectNode(d);});
+
+nodeSel.append("text").attr("dy", d=>nodeR(d)+11).text(d=>d.ticker);
+
+function ticked(){
+  linkSel
+    .attr("x1", d=>d.source.x).attr("y1", d=>d.source.y)
+    .attr("x2", d=>edgeTargetX(d)).attr("y2", d=>edgeTargetY(d));
+  nodeSel.attr("transform", d=>`translate(${d.x},${d.y})`);
+}
+// shorten link so arrowhead sits at node border
+function edgeTargetX(d){const dx=d.target.x-d.source.x,dy=d.target.y-d.source.y,l=Math.hypot(dx,dy)||1;return d.target.x-(dx/l)*(nodeR(d.target)+3);}
+function edgeTargetY(d){const dx=d.target.x-d.source.x,dy=d.target.y-d.source.y,l=Math.hypot(dx,dy)||1;return d.target.y-(dy/l)*(nodeR(d.target)+3);}
+
+/* ---------- 8. DRAG ---------- */
+function dragStart(ev,d){ if(!ev.active) sim.alphaTarget(0.3).restart(); d.fx=d.x; d.fy=d.y; }
+function dragged(ev,d){ d.fx=ev.x; d.fy=ev.y; }
+function dragEnd(ev,d){ if(!ev.active) sim.alphaTarget(0); if(state.layout==="force"){d.fx=null;d.fy=null;} }
+
+/* ---------- 9. ZOOM ---------- */
+const zoom = d3.zoom().scaleExtent([0.25,4]).on("zoom", ev=>viewport.attr("transform", ev.transform));
+svg.call(zoom).on("dblclick.zoom", null);
+svg.on("click", clearSelection);
+document.getElementById("zin").onclick = ()=>svg.transition().duration(220).call(zoom.scaleBy,1.35);
+document.getElementById("zout").onclick= ()=>svg.transition().duration(220).call(zoom.scaleBy,0.72);
+document.getElementById("zfit").onclick= resetView;
+function resetView(){ svg.transition().duration(400).call(zoom.transform, d3.zoomIdentity); }
+
+/* ---------- 10. TOOLTIP ---------- */
+function showNodeTip(ev,d){
+  const outEdges = DATA.edges.filter(e=>e.source.id===d.id).length;
+  const inEdges  = DATA.edges.filter(e=>e.target.id===d.id).length;
+  tip.innerHTML = `
+    <div class="t-nm"><span class="d" style="background:${nodeColor(d)}"></span>${d.name}</div>
+    <div class="t-row"><span>${d.ticker} · ${d.sector}</span></div>
+    <div class="t-row"><span>Market cap</span><span class="num">${fmt$(d.metadata.market_cap)}</span></div>
+    <div class="t-row"><span>Revenue (TTM)</span><span class="num">${fmt$(d.metadata.revenue)}</span></div>
+    <div class="t-row"><span>Flows out / in</span><span class="num">${outEdges} / ${inEdges}</span></div>
+    <div class="t-mute">${d.metadata.filings_count} filings · latest ${d.metadata.form_type} ${fmtDate(parseDate(d.metadata.latest_filing_date))}${d.risk_score>=RISK_THRESHOLD?' · ⚠ elevated risk':''}</div>`;
+  tip.classList.add("show"); moveTip(ev);
+}
+function showEdgeTip(ev,d){
+  tip.innerHTML = `
+    <div class="t-nm"><span class="type-badge tb-${d.type}">${d.type}</span></div>
+    <div class="t-row"><span class="num">${d.source.id} → ${d.target.id}</span></div>
+    <div class="t-row"><span>Amount</span><span class="num" style="color:${edgeColor(d)}">${fmt$(d.amount)}</span></div>
+    <div class="t-row"><span>Date</span><span class="num">${fmtDate(parseDate(d.date))}</span></div>
+    <div class="t-row"><span>Confidence</span><span class="num">${(d.confidence*100).toFixed(0)}%</span></div>
+    <div class="t-mute">Click for provenance →</div>`;
+  tip.classList.add("show"); moveTip(ev);
+}
+function moveTip(ev){
+  const pad=14, w=tip.offsetWidth, h=tip.offsetHeight;
+  let x=ev.clientX+pad, y=ev.clientY+pad;
+  if(x+w>innerWidth) x=ev.clientX-w-pad;
+  if(y+h>innerHeight) y=ev.clientY-h-pad;
+  tip.style.left=x+"px"; tip.style.top=y+"px";
+}
+function hideTip(){ tip.classList.remove("show"); }
+
+/* ---------- 11. SELECTION + HIGHLIGHT ---------- */
+function selectNode(d){
+  state.selectedNode=d; state.selectedEdge=null;
+  const nb=neighborIndex.get(d.id);
+  nodeSel.classed("dim", n=> n.id!==d.id && !nb.has(n.id)).classed("selected", n=>n.id===d.id);
+  linkSel.classed("dim", e=> e.source.id!==d.id && e.target.id!==d.id).classed("selected",false);
+  renderNodeDetails(d);
+  switchTab("details");
+}
+function selectEdge(d){
+  state.selectedEdge=d; state.selectedNode=null;
+  nodeSel.classed("dim", n=> n.id!==d.source.id && n.id!==d.target.id).classed("selected", n=>n.id===d.source.id||n.id===d.target.id);
+  linkSel.classed("dim", e=> e!==d).classed("selected", e=>e===d);
+  renderEdgeDetails(d);
+  switchTab("details");
+}
+function clearSelection(){
+  state.selectedNode=null; state.selectedEdge=null;
+  nodeSel.classed("dim",false).classed("selected",false);
+  linkSel.classed("dim",false).classed("selected",false);
+  applyFilters();
+  document.getElementById("detailsBody").innerHTML="";
+  document.getElementById("detailsEmpty").style.display="";
+}
+
+/* ---------- 12. DETAILS RENDERERS ---------- */
+function relRow(e, self){
+  const outgoing = e.source.id===self.id;
+  const other = outgoing ? e.target : e.source;
+  const arrow = outgoing ? "→" : "←";
+  return `<button class="rel" data-eidx="${DATA.edges.indexOf(e)}">
+    <div class="rel-top">
+      <div class="rel-dir"><span>${self.id}</span><span class="arrow">${arrow}</span><span>${other.id}</span></div>
+      <div class="rel-amt" style="color:${edgeColor(e)}">${fmt$(e.amount)}</div>
+    </div>
+    <div class="rel-sub">
+      <span class="type-badge tb-${e.type}">${e.type}</span>
+      <span>${fmtDate(parseDate(e.date))}</span>
+      <span style="margin-left:auto">${(e.confidence*100).toFixed(0)}% conf</span>
+    </div></button>`;
+}
+function renderNodeDetails(d){
+  document.getElementById("detailsEmpty").style.display="none";
+  const outs = DATA.edges.filter(e=>e.source.id===d.id).sort((a,b)=>b.amount-a.amount);
+  const ins  = DATA.edges.filter(e=>e.target.id===d.id).sort((a,b)=>b.amount-a.amount);
+  const outSum = d3.sum(outs,e=>e.amount), inSum=d3.sum(ins,e=>e.amount);
+  const col = nodeColor(d);
+  document.getElementById("detailsBody").innerHTML = `
+    <div class="node-head">
+      <div class="node-badge" style="background:${col}">${d.ticker.slice(0,4)}</div>
+      <div>
+        <div class="nm">${d.name}</div>
+        <div class="tk">${d.ticker} · NASDAQ/NYSE</div>
+        <div class="chips">
+          <span class="chip" style="border-color:${col};color:${col}">${d.sector}</span>
+          ${d.risk_score>=RISK_THRESHOLD?`<span class="chip risk">⚠ risk ${(d.risk_score*100).toFixed(0)}</span>`:''}
+        </div>
+      </div>
+    </div>
+    <div class="kv">
+      <div class="k">Market cap</div><div class="v">${fmt$(d.metadata.market_cap)}</div>
+      <div class="k">Revenue (TTM)</div><div class="v">${fmt$(d.metadata.revenue)}</div>
+      <div class="k">Capital / spend out</div><div class="v">${fmt$(outSum)}</div>
+      <div class="k">Capital / spend in</div><div class="v">${fmt$(inSum)}</div>
+      <div class="k">Filings on record</div><div class="v">${d.metadata.filings_count}</div>
+      <div class="k">Latest filing</div><div class="v">${d.metadata.form_type} · ${fmtDateShort(parseDate(d.metadata.latest_filing_date))}</div>
+    </div>
+    <div class="sec">
+      <div class="sec-title">Provenance quality</div>
+      <div class="meter"><i style="width:${d.confidence*100}%"></i></div>
+      <div style="display:flex;justify-content:space-between;font-size:10px;color:var(--txt-mute);margin-top:4px" class="mono">
+        <span>${(d.confidence*100).toFixed(0)}% confidence</span><span>${d.metadata.executives?d.metadata.executives.join(' · '):''}</span>
+      </div>
+    </div>
+    ${outs.length?`<div class="sec"><div class="sec-title">Pays / deploys to (${outs.length})</div>${outs.map(e=>relRow(e,d)).join('')}</div>`:''}
+    ${ins.length?`<div class="sec"><div class="sec-title">Receives from (${ins.length})</div>${ins.map(e=>relRow(e,d)).join('')}</div>`:''}`;
+  wireRelRows();
+}
+function renderEdgeDetails(d){
+  document.getElementById("detailsEmpty").style.display="none";
+  const sc=nodeColor(d.source), tc=nodeColor(d.target), col=edgeColor(d);
+  const isNews = d.source_doc.startsWith("news://");
+  document.getElementById("detailsBody").innerHTML = `
+    <div class="sec-title" style="margin-bottom:10px">Why this connection?</div>
+    <div class="why-flow">
+      <div class="why-node"><div class="b" style="background:${sc}">${d.source.ticker.slice(0,4)}</div><div class="l">${d.source.id}</div></div>
+      <div class="why-arrow" style="color:${col}"><div class="amt">${fmt$(d.amount)}</div><div class="ln"></div></div>
+      <div class="why-node"><div class="b" style="background:${tc}">${d.target.ticker.slice(0,4)}</div><div class="l">${d.target.id}</div></div>
+    </div>
+    <div class="kv">
+      <div class="k">Relationship type</div><div class="v"><span class="type-badge tb-${d.type}">${d.type}</span></div>
+      <div class="k">Transaction date</div><div class="v">${fmtDate(parseDate(d.date))}</div>
+      <div class="k">Confidence</div><div class="v">${(d.confidence*100).toFixed(0)}%</div>
+      <div class="k">Direction</div><div class="v">${d.source.id} pays ${d.target.id}</div>
+    </div>
+    <div class="sec">
+      <div class="sec-title">${isNews?'News source':'Source filing'}</div>
+      <a class="src-doc" href="${isNews?'#':d.source_doc}" target="_blank" rel="noopener">${d.source_doc}</a>
+    </div>
+    ${d.description?`<div class="sec"><div class="sec-title">Rationale</div><div class="rationale">${d.description}</div></div>`:''}`;
+}
+function wireRelRows(){
+  document.querySelectorAll(".rel").forEach(btn=>{
+    btn.onclick=()=>{ const e=DATA.edges[+btn.dataset.eidx]; selectEdge(e); };
+  });
+}
+
+/* ---------- 13. FILTERS ---------- */
+function buildFilters(){
+  const sectorCounts = {}; DATA.nodes.forEach(n=>sectorCounts[n.sector]=(sectorCounts[n.sector]||0)+1);
+  const typeCounts = {}; DATA.edges.forEach(e=>typeCounts[e.type]=(typeCounts[e.type]||0)+1);
+  const p=document.getElementById("tab-filters");
+  p.innerHTML = `
+    <div class="filt-group">
+      <div class="sec-title">Sector</div>
+      <div class="checks">${allSectors.map(s=>`
+        <label class="check"><input type="checkbox" class="f-sector" value="${s}" style="--sw:${SECTOR_COLORS[s]}" checked>
+          <span class="sw" style="background:${SECTOR_COLORS[s]}"></span><span class="lbl">${s}</span><span class="cnt">${sectorCounts[s]}</span></label>`).join('')}
+      </div>
+    </div>
+    <div class="filt-group">
+      <div class="sec-title">Flow type</div>
+      <div class="checks">${allTypes.map(t=>`
+        <label class="check"><input type="checkbox" class="f-type" value="${t}" checked>
+          <span class="type-badge tb-${t}" style="margin-right:2px">${t}</span><span class="lbl"></span><span class="cnt">${typeCounts[t]||0}</span></label>`).join('')}
+      </div>
+    </div>
+    <div class="filt-group">
+      <div class="sec-title">Min amount <span class="rng-val" id="amtVal">$0</span></div>
+      <input type="range" id="f-amount" min="0" max="${Math.ceil(amtExtent[1])}" step="0.5" value="0">
+    </div>
+    <div class="filt-group">
+      <div class="sec-title">Min confidence <span class="rng-val" id="confVal">0%</span></div>
+      <input type="range" id="f-conf" min="0" max="100" step="5" value="0">
+    </div>
+    <button class="btn-reset" id="resetFilters">Reset filters</button>`;
+
+  p.querySelectorAll(".f-sector").forEach(c=>c.onchange=()=>{
+    c.checked?state.filters.sectors.add(c.value):state.filters.sectors.delete(c.value); applyFilters();
+  });
+  p.querySelectorAll(".f-type").forEach(c=>c.onchange=()=>{
+    c.checked?state.filters.types.add(c.value):state.filters.types.delete(c.value); applyFilters();
+  });
+  const amt=p.querySelector("#f-amount"); amt.oninput=()=>{state.filters.minAmount=+amt.value; document.getElementById("amtVal").textContent=fmt$(+amt.value); applyFilters();};
+  const conf=p.querySelector("#f-conf"); conf.oninput=()=>{state.filters.minConfidence=+conf.value/100; document.getElementById("confVal").textContent=conf.value+"%"; applyFilters();};
+  p.querySelector("#resetFilters").onclick=resetFilters;
+}
+function resetFilters(){
+  state.filters.sectors=new Set(allSectors);
+  state.filters.types=new Set(allTypes);
+  state.filters.minAmount=0; state.filters.minConfidence=0;
+  document.querySelectorAll(".f-sector,.f-type").forEach(c=>c.checked=true);
+  const a=document.getElementById("f-amount"), c=document.getElementById("f-conf");
+  if(a){a.value=0; document.getElementById("amtVal").textContent="$0";}
+  if(c){c.value=0; document.getElementById("confVal").textContent="0%";}
+  applyFilters();
+}
+
+/* node visible if sector passes + matches search; edge visible if type/amt/conf/asOf pass + endpoints visible */
+function nodeMatchesSearch(n){
+  if(!state.search) return true;
+  const q=state.search.toLowerCase();
+  return n.id.toLowerCase().includes(q) || n.name.toLowerCase().includes(q) ||
+         (n.metadata.executives||[]).some(e=>e.toLowerCase().includes(q));
+}
+function nodeVisible(n){ return state.filters.sectors.has(n.sector); }
+function edgeVisible(e){
+  return state.filters.types.has(e.type)
+    && e.amount>=state.filters.minAmount
+    && e.confidence>=state.filters.minConfidence
+    && parseDate(e.date).getTime()<=state.asOf
+    && nodeVisible(e.source) && nodeVisible(e.target);
+}
+function applyFilters(){
+  const searchActive = !!state.search;
+  nodeSel.classed("faded", n=>!nodeVisible(n));
+  linkSel.classed("faded", e=>!edgeVisible(e));
+  // search dims non-matches (keeps selection highlight if active)
+  if(!state.selectedNode && !state.selectedEdge){
+    nodeSel.classed("dim", n=> searchActive && !nodeMatchesSearch(n));
+    linkSel.classed("dim", e=> searchActive && !(nodeMatchesSearch(e.source)||nodeMatchesSearch(e.target)));
+  }
+  updateStats(); renderEvents();
+}
+
+/* ---------- 14. SEARCH ---------- */
+const searchEl=document.getElementById("search");
+searchEl.oninput=()=>{ state.search=searchEl.value.trim(); applyFilters(); };
+searchEl.onkeydown=(e)=>{ if(e.key==="Enter"){ const m=DATA.nodes.find(nodeMatchesSearch); if(m&&state.search) selectNode(m);} if(e.key==="Escape"){searchEl.value="";state.search="";searchEl.blur();applyFilters();} };
+
+/* ---------- 15. LAYOUT MODES ---------- */
+function setLayout(mode){
+  state.layout=mode;
+  document.querySelectorAll(".modebtn[data-mode]").forEach(b=>b.classList.toggle("active", b.dataset.mode===mode));
+  DATA.nodes.forEach(n=>{n.fx=null;n.fy=null;});
+  sim.force("x",null).force("y",null).force("radial",null);
+
+  if(mode==="force"){
+    sim.force("charge", d3.forceManyBody().strength(-320))
+       .force("center", d3.forceCenter(W/2,H/2))
+       .force("link").distance(d=>90+30*(1-d.confidence));
+  } else if(mode==="sector"){
+    const cols=Math.ceil(Math.sqrt(allSectors.length));
+    const cellW=W/cols, rows=Math.ceil(allSectors.length/cols), cellH=H/rows;
+    const centers={};
+    allSectors.forEach((s,i)=>{ centers[s]={x:(i%cols+0.5)*cellW, y:(Math.floor(i/cols)+0.5)*cellH}; });
+    sim.force("center",null)
+       .force("charge", d3.forceManyBody().strength(-120))
+       .force("x", d3.forceX(d=>centers[d.sector].x).strength(0.35))
+       .force("y", d3.forceY(d=>centers[d.sector].y).strength(0.35));
+  } else if(mode==="concentric"){
+    const ranked=[...DATA.nodes].sort((a,b)=>b.size-a.size);
+    const rank=new Map(ranked.map((n,i)=>[n.id,i]));
+    const maxR=Math.min(W,H)/2-50;
+    sim.force("center",null)
+       .force("charge", d3.forceManyBody().strength(-90))
+       .force("radial", d3.forceRadial(d=>{
+          const t=rank.get(d.id)/(DATA.nodes.length-1); return t*maxR;
+       }, W/2, H/2).strength(0.85));
+  }
+  sim.alpha(0.9).restart();
+}
+document.querySelectorAll(".modebtn[data-mode]").forEach(b=>b.onclick=()=>setLayout(b.dataset.mode));
+document.getElementById("geoBtn").onclick=()=>toast("Geographic layout needs company HQ / operating-region data — not in this dataset yet.");
+
+/* ---------- 16. TIMELINE ---------- */
+const slider=document.getElementById("timeslider");
+const span=dateExtent[1]-dateExtent[0];
+function setAsOf(pct){
+  state.asOf=dateExtent[0].getTime()+span*(pct/100);
+  document.getElementById("tlDate").textContent=fmtDate(new Date(state.asOf));
+  applyFilters();
+}
+slider.oninput=()=>setAsOf(+slider.value);
+setAsOf(100);
+
+let playing=false, playTimer=null;
+const playBtn=document.getElementById("playBtn");
+playBtn.onclick=()=>{
+  if(playing){ stopPlay(); return; }
+  playing=true; playBtn.innerHTML='<svg viewBox="0 0 24 24"><path d="M6 5h4v14H6zm8 0h4v14h-4z"/></svg>';
+  let v = (+slider.value>=100)?0:+slider.value;
+  playTimer=setInterval(()=>{
+    v+=1.5; if(v>=100){v=100; slider.value=100; setAsOf(100); stopPlay(); return;}
+    slider.value=v; setAsOf(v);
+  }, 45);
+};
+function stopPlay(){ playing=false; clearInterval(playTimer); playBtn.innerHTML='<svg viewBox="0 0 24 24"><path d="M8 5v14l11-7z"/></svg>'; }
+
+function renderEvents(){
+  const now=state.asOf;
+  const visible=DATA.edges.filter(edgeVisible).sort((a,b)=>parseDate(b.date)-parseDate(a.date));
+  document.getElementById("tlCount").textContent=`${visible.length} flow${visible.length!==1?'s':''} active`;
+  const recentCut=now-1000*60*60*24*45; // "new" = within 45d of as-of
+  document.getElementById("events").innerHTML = visible.slice(0,24).map(e=>{
+    const isNew=parseDate(e.date).getTime()>=recentCut;
+    return `<div class="ev${isNew?' new':''}" data-eidx="${DATA.edges.indexOf(e)}">
+      <div class="ev-date">${fmtDate(parseDate(e.date))}</div>
+      <div class="ev-pair"><span>${e.source.id}</span><span class="arrow">→</span><span>${e.target.id}</span></div>
+      <div class="ev-bot"><span class="type-badge tb-${e.type}">${e.type}</span><span class="ev-amt" style="color:${edgeColor(e)}">${fmt$(e.amount)}</span></div>
+    </div>`;
+  }).join('') || `<div style="color:var(--txt-faint);font-size:11px;padding:8px">No flows in current filter/time window.</div>`;
+  document.querySelectorAll(".ev").forEach(el=>el.onclick=()=>selectEdge(DATA.edges[+el.dataset.eidx]));
+}
+
+/* ---------- 17. STATS + LEGEND ---------- */
+function updateStats(){
+  const vNodes=DATA.nodes.filter(nodeVisible);
+  const vEdges=DATA.edges.filter(edgeVisible);
+  document.getElementById("stNodes").textContent=vNodes.length;
+  document.getElementById("stEdges").textContent=vEdges.length;
+  document.getElementById("stVolume").textContent=fmt$(d3.sum(vEdges,e=>e.amount));
+}
+function buildLegend(){
+  const movers=[...DATA.edges].sort((a,b)=>b.amount-a.amount).slice(0,5);
+  const suspected=DATA.edges.filter(e=>e.type==="suspected").length;
+  document.getElementById("tab-legend").innerHTML = `
+    <div class="sec"><div class="sec-title">Node = company</div>
+      ${Object.entries(SECTOR_COLORS).filter(([s])=>allSectors.includes(s)).map(([s,c])=>
+        `<div class="leg-item"><span class="sw" style="background:${c}"></span>${s}</div>`).join('')}
+      <div class="leg-item" style="margin-top:8px"><span class="cir" style="width:16px;height:16px;border-color:#ff5c6c;box-shadow:0 0 8px #ff5c6c;background:#2a1a1e"></span>Elevated risk (red glow)</div>
+      <div style="font-size:10.5px;color:var(--txt-mute);margin-top:6px">Circle area ∝ market cap (log). Border thickness ∝ provenance confidence.</div>
+    </div>
+    <div class="sec"><div class="sec-title">Edge = money flow</div>
+      <div class="leg-item"><span class="leg-line" style="border-top:2px solid #3fb950"></span>Confirmed (filing)</div>
+      <div class="leg-item"><span class="leg-line" style="border-top:2px dotted var(--acc-soft)"></span>Inferred (13F/13D/13G)</div>
+      <div class="leg-item"><span class="leg-line" style="border-top:2px dashed var(--pred)"></span>Suspected (news, ${suspected})</div>
+      <div style="font-size:10.5px;color:var(--txt-mute);margin-top:6px">Thickness ∝ amount (log). Color = heat scale. Opacity ∝ confidence. Arrow points buyer → supplier.</div>
+    </div>
+    <div class="sec"><div class="sec-title">Biggest relationships</div>
+      ${movers.map((e,i)=>`<div class="mover" data-eidx="${DATA.edges.indexOf(e)}">
+        <span class="r">${i+1}</span><span class="p">${e.source.id} → ${e.target.id}</span>
+        <span class="a" style="color:${edgeColor(e)}">${fmt$(e.amount)}</span></div>`).join('')}
+    </div>
+    <div class="sec"><div class="sec-title">Keyboard</div>
+      <div class="ksrow"><span>Reset view & filters</span><span class="kbd">R</span></div>
+      <div class="ksrow"><span>Force layout</span><span class="kbd">1</span></div>
+      <div class="ksrow"><span>Sector layout</span><span class="kbd">2</span></div>
+      <div class="ksrow"><span>Concentric layout</span><span class="kbd">3</span></div>
+      <div class="ksrow"><span>Focus search</span><span class="kbd">/</span></div>
+      <div class="ksrow"><span>Clear selection</span><span class="kbd">Esc</span></div>
+    </div>`;
+  document.querySelectorAll("#tab-legend .mover").forEach(el=>el.onclick=()=>selectEdge(DATA.edges[+el.dataset.eidx]));
+}
+
+/* ---------- 18. TABS ---------- */
+function switchTab(name){
+  document.querySelectorAll(".tab").forEach(t=>t.classList.toggle("active", t.dataset.tab===name));
+  ["details","filters","legend"].forEach(n=>document.getElementById("tab-"+n).classList.toggle("hidden", n!==name));
+}
+document.querySelectorAll(".tab").forEach(t=>t.onclick=()=>switchTab(t.dataset.tab));
+
+/* ---------- 19. KEYBOARD ---------- */
+document.addEventListener("keydown", e=>{
+  if(document.activeElement===searchEl && e.key!=="Escape") return;
+  if(e.key==="/"){ e.preventDefault(); searchEl.focus(); searchEl.select(); }
+  else if(e.key==="r"||e.key==="R"){ resetView(); resetFilters(); clearSelection(); searchEl.value=""; state.search=""; slider.value=100; setAsOf(100); setLayout("force"); }
+  else if(e.key==="1"){ setLayout("force"); }
+  else if(e.key==="2"){ setLayout("sector"); }
+  else if(e.key==="3"){ setLayout("concentric"); }
+  else if(e.key==="Escape"){ clearSelection(); }
+});
+
+/* ---------- 20. TOAST + RESIZE ---------- */
+let toastTimer;
+function toast(msg){
+  const t=document.getElementById("toast"); t.textContent=msg; t.classList.add("show");
+  clearTimeout(toastTimer); toastTimer=setTimeout(()=>t.classList.remove("show"),3200);
+}
+window.addEventListener("resize", ()=>{
+  W=canvasEl.clientWidth; H=canvasEl.clientHeight; svg.attr("viewBox",[0,0,W,H]);
+  if(state.layout==="force") sim.force("center", d3.forceCenter(W/2,H/2));
+  sim.alpha(0.3).restart();
+});
+
+/* ---------- 21. INIT ---------- */
+buildFilters(); buildLegend(); updateStats(); renderEvents();
+setTimeout(()=>svg.transition().duration(600).call(zoom.scaleTo,0.9), 400);
+
+/* ---------- 22. PROVENANCE BADGE + EMPTY STATE ---------- */
+(function(){
+  const brandSpan = document.querySelector('.brand span');
+  if(META && META.source === 'demo'){
+    if(brandSpan) brandSpan.textContent = 'demo data — SEC tables empty';
+  } else if(brandSpan){
+    const p = META.provenance || {};
+    const parts = Object.entries(p).filter(([,v])=>v>0).map(([k,v])=>k+':'+v);
+    brandSpan.textContent = DATA.nodes.length + ' co · ' + DATA.edges.length + ' flows'
+      + (parts.length? ' · '+parts.join(' '):'');
+  }
+  if(!DATA.nodes.length){
+    const c = document.getElementById('canvas');
+    const d = document.createElement('div');
+    d.style.cssText='position:absolute;inset:0;display:flex;flex-direction:column;align-items:center;justify-content:center;color:var(--txt-mute);gap:8px;text-align:center;padding:24px';
+    d.innerHTML='<div style="font-size:15px;color:var(--txt-dim)">No money-flow data for this scope</div>'
+      +'<div style="font-size:12px;max-width:380px">Populate ownership/13F tables via the SEC fetcher '
+      +'(<span class="mono">refresh_ticker_filings</span>) or widen the ticker scope, then rebuild.</div>';
+    c.appendChild(d);
+  }
+})();
+
+</script>
+</body>
+</html>

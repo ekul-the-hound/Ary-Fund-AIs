@@ -352,7 +352,7 @@ def _render_sidebar(backend: dict[str, Any]) -> dict[str, Any]:
 # Destination navigation
 # ======================================================================
 # Top-nav destinations (primary workflow surfaces).
-_DESTINATIONS = ["Desk", "Board", "Screener", "Lab", "Analyzer", "Jobs"]
+_DESTINATIONS = ["Desk", "Board", "Screener", "Lab", "Analyzer", "Flow", "Jobs"]
 # Utility destinations, shown at the bottom of the sidebar rather than the
 # top nav (telemetry + diagnostics, not part of the research flow).
 _UTILITY_DESTINATIONS = ["Metrics", "Debug", "RAG"]
@@ -592,6 +592,26 @@ def _render_rag_destination() -> None:
         st.error(f"RAG learning panel unavailable: {e}")
 
 
+def _render_flow_destination(backend: dict[str, Any]) -> None:
+    """SEC money-flow network (ui/money_flow).
+
+    Company-to-company capital & supply relationships assembled by
+    data.money_graph and rendered by ui/money_flow_template.html.
+    """
+    try:
+        from ui.money_flow import render_money_flow_destination
+    except Exception:
+        try:
+            from money_flow import render_money_flow_destination  # type: ignore
+        except Exception as e:  # noqa: BLE001
+            st.error(
+                f"Money Flow Graph unavailable: {e}. Ensure "
+                "`ui/money_flow.py`, `ui/money_flow_template.html`, and "
+                "`data/money_graph.py` are present.")
+            return
+    render_money_flow_destination(backend)
+
+
 def _render_metrics_destination(backend: dict[str, Any]) -> None:
     """LLM telemetry (latency / cost / failures) from metrics.db.
 
@@ -739,6 +759,8 @@ def main() -> None:
         _render_lab_destination(backend, side["lookback"])
     elif dest == "Analyzer":
         _render_analyzer_destination(backend, side["lookback"])
+    elif dest == "Flow":
+        _render_flow_destination(backend)
     elif dest == "Metrics":
         _render_metrics_destination(backend)
     elif dest == "RAG":
