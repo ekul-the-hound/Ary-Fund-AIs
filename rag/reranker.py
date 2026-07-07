@@ -83,8 +83,30 @@ class Reranker:
     def model(self):
         if self._model is None:
             try:
+                import os
                 from sentence_transformers import CrossEncoder
-                self._model = CrossEncoder(self.model_name)
+                # Load from local cache without re-validating against the
+                # HuggingFace Hub on every startup (~15s of HTTP round-
+                # trips). The model is already cached locally.
+                _prev_hub = os.environ.get("HF_HUB_OFFLINE")
+                _prev_tf = os.environ.get("TRANSFORMERS_OFFLINE")
+                os.environ["HF_HUB_OFFLINE"] = "1"
+                os.environ["TRANSFORMERS_OFFLINE"] = "1"
+                try:
+                    self._model = CrossEncoder(self.model_name)
+                except Exception:  # noqa: BLE001
+                    # Cold cache (e.g. fresh machine): allow a networked
+                    # download by restoring the prior offline setting and
+                    # retrying once.
+                    if _prev_hub is None:
+                        os.environ.pop("HF_HUB_OFFLINE", None)
+                    else:
+                        os.environ["HF_HUB_OFFLINE"] = _prev_hub
+                    if _prev_tf is None:
+                        os.environ.pop("TRANSFORMERS_OFFLINE", None)
+                    else:
+                        os.environ["TRANSFORMERS_OFFLINE"] = _prev_tf
+                    self._model = CrossEncoder(self.model_name)
                 logger.info("Reranker loaded | %s", self.model_name)
             except ImportError as e:
                 raise RuntimeError(
