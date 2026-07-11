@@ -79,6 +79,10 @@ from ui import board as board_view
 from ui import lab as lab_view
 from ui import pipeline_rail as rail_view
 from ui import palette as palette_view
+try:
+    from ui import macro_view
+except Exception:  # noqa: BLE001 — Macro tab degrades gracefully
+    macro_view = None
 
 logger = logging.getLogger("ary_quant.ui.app_v2")
 
@@ -352,7 +356,7 @@ def _render_sidebar(backend: dict[str, Any]) -> dict[str, Any]:
 # Destination navigation
 # ======================================================================
 # Top-nav destinations (primary workflow surfaces).
-_DESTINATIONS = ["Desk", "Board", "Screener", "Lab", "Analyzer", "Flow", "Jobs"]
+_DESTINATIONS = ["Desk", "Board", "Screener", "Lab", "Analyzer", "Flow", "Macro", "Jobs"]
 # Utility destinations, shown at the bottom of the sidebar rather than the
 # top nav (telemetry + diagnostics, not part of the research flow).
 _UTILITY_DESTINATIONS = ["Metrics", "Debug", "RAG"]
@@ -761,6 +765,11 @@ def main() -> None:
         _render_analyzer_destination(backend, side["lookback"])
     elif dest == "Flow":
         _render_flow_destination(backend)
+    elif dest == "Macro":
+        if macro_view is not None:
+            macro_view.render_macro()
+        else:
+            st.warning("Macro view not importable — is ui/macro_view.py in place?")
     elif dest == "Metrics":
         _render_metrics_destination(backend)
     elif dest == "RAG":

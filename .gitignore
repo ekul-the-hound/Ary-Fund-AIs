@@ -139,3 +139,7 @@ data/*.db
 data/*_done.json
 data/f13f_corrected.json
 __pycache__/
+
+*.bak
+constraints_openbb.txt
+pip_freeze_pre_openbb.txt
