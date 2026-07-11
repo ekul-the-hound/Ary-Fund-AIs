@@ -57,38 +57,64 @@ import streamlit as st
 # the dashboard should use for semantic state — everything else is
 # structural (borders, text, backgrounds).
 
+# ----------------------------------------------------------------------
+# THEME — single source of truth for every color in the dashboard.
+# OpenBB Workspace-style dark palette (close approximation; OpenBB does
+# not publish exact tokens). To retune the whole UI, edit values here —
+# nothing below or downstream hardcodes hex.
+# ----------------------------------------------------------------------
+THEME: dict[str, str] = {
+    # structural
+    "bg":       "#0B0E14",   # app canvas — near-black navy
+    "surface":  "#131722",   # cards / panels
+    "raised":   "#1A1F2B",   # hover / elevated surfaces
+    "border":   "#232936",   # hairlines, card borders
+    "text":     "#E6E8EB",   # primary text
+    "text_dim": "#8A919E",   # secondary text, captions
+    "accent":   "#2962FF",   # the one interactive blue
+    # semantic (brightened one step vs the old Tailwind-600 values so
+    # they read cleanly on the darker canvas)
+    "good":     "#22C55E",   # low risk / bullish / safe / fresh
+    "warn":     "#EAB308",   # medium risk / grey zone / recent
+    "bad":      "#EF4444",   # high risk / bearish / distress
+    "severe":   "#B91C1C",   # severe risk
+    "muted":    "#7C8591",   # unknown / neutral / stale
+    # translucent fills
+    "card_bg":  "rgba(148,163,184,0.05)",
+}
+
 RISK_COLORS: dict[str, str] = {
-    "low": "#16a34a",        # green-600
-    "medium": "#ca8a04",     # amber-600
-    "moderate": "#ca8a04",   # alias used by portfolio concentration bucket
-    "high": "#dc2626",       # red-600
-    "severe": "#991b1b",     # red-800
-    "unknown": "#6b7280",    # gray-500
+    "low": THEME["good"],
+    "medium": THEME["warn"],
+    "moderate": THEME["warn"],   # alias used by portfolio concentration bucket
+    "high": THEME["bad"],
+    "severe": THEME["severe"],
+    "unknown": THEME["muted"],
 }
 
 OUTLOOK_COLORS: dict[str, str] = {
-    "bullish": "#16a34a",
-    "neutral": "#6b7280",
-    "bearish": "#dc2626",
-    "unknown": "#6b7280",
+    "bullish": THEME["good"],
+    "neutral": THEME["muted"],
+    "bearish": THEME["bad"],
+    "unknown": THEME["muted"],
 }
 
 # Distress zones from risk_scanner.altman_z (zone in {distress, grey, safe}).
 ZONE_COLORS: dict[str, str] = {
-    "safe": "#16a34a",
-    "grey": "#ca8a04",
-    "distress": "#dc2626",
-    "unknown": "#6b7280",
+    "safe": THEME["good"],
+    "grey": THEME["warn"],
+    "distress": THEME["bad"],
+    "unknown": THEME["muted"],
 }
 
 # Freshness staleness ramp, applied to a section's latest as_of.
-FRESH_FRESH = "#16a34a"     # < 1 day
-FRESH_RECENT = "#ca8a04"    # < 7 days
-FRESH_STALE = "#6b7280"     # older / unknown
+FRESH_FRESH = THEME["good"]      # < 1 day
+FRESH_RECENT = THEME["warn"]     # < 7 days
+FRESH_STALE = THEME["muted"]     # older / unknown
 
-_NEUTRAL_TEXT = "#9ca3af"
-_HAIRLINE = "#1f2630"
-_CARD_BG = "rgba(148,163,184,0.06)"
+_NEUTRAL_TEXT = THEME["text_dim"]
+_HAIRLINE = THEME["border"]
+_CARD_BG = THEME["card_bg"]
 
 
 # ======================================================================

@@ -1,0 +1,25 @@
+# OpenBB Workspace-style dark theme for ARY QUANT.
+#
+# PLACEMENT (important): this file only works at
+#     D:\Ary Fund\.streamlit\config.toml
+# Streamlit reads [theme] only from a folder named ".streamlit" next to
+# where you launch the app. At the project root it does nothing and the
+# theme will silently not apply. This is NOT related to your config.py
+# module — different file, different job.
+#
+# To install, from the project root in PowerShell:
+#     New-Item -ItemType Directory -Force -Path .streamlit
+#     Move-Item -Force config.toml .streamlit\config.toml
+# then fully restart Streamlit.
+#
+# These values mirror the THEME dict installed at the top of
+# ui/components.py by fix_theme_openbb.py — retune one, retune the other
+# so Streamlit's chrome and the custom HTML stay in sync.
+
+[theme]
+base = "dark"
+primaryColor = "#2962FF"             # THEME["accent"]
+backgroundColor = "#0B0E14"          # THEME["bg"]
+secondaryBackgroundColor = "#131722" # THEME["surface"] — sidebar, inputs
+textColor = "#E6E8EB"                # THEME["text"]
+font = "sans serif"

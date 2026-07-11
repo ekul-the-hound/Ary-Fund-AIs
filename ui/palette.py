@@ -227,7 +227,7 @@ def render_help() -> None:
         st.markdown(
             f"<div style='display:flex;gap:12px;font-size:0.88em;margin:2px 0;'>"
             f"<span style='min-width:120px;'>{cmd}</span>"
-            f"<span style='color:#9ca3af;'>{desc}</span></div>",
+            f"<span style='color:{C._NEUTRAL_TEXT};'>{desc}</span></div>",
             unsafe_allow_html=True)
     st.caption("Tip: a bare symbol (just `nvda`) jumps straight to that name. "
                "Verbs are case-insensitive.")
@@ -337,7 +337,7 @@ def render_job_tray(*, ticker: Optional[str] = None,
             errs = sum(1 for j in finished if j.state == S.JobState.ERROR)
             tail = f" · {errs} error(s)" if errs else ""
             st.markdown(
-                f"<span style='font-size:0.82em;color:#9ca3af;'>"
+                f"<span style='font-size:0.82em;color:{C._NEUTRAL_TEXT};'>"
                 f"✓ {len(finished)} finished{tail}</span>",
                 unsafe_allow_html=True)
         return
@@ -425,7 +425,7 @@ def render_job_tray(*, ticker: Optional[str] = None,
 
 def _render_job_row(job: S.Job) -> None:
     if job.state == S.JobState.RUNNING:
-        glyph, color, status = "⏳", "#3b82f6", f"running · {job.elapsed():.0f}s"
+        glyph, color, status = "⏳", C.THEME["accent"], f"running · {job.elapsed():.0f}s"
     elif job.state == S.JobState.QUEUED:
         glyph, color, status = "•", C._NEUTRAL_TEXT, "queued"
     elif job.state == S.JobState.DONE:

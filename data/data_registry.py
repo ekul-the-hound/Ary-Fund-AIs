@@ -98,6 +98,7 @@ CANONICAL_FIELDS: dict[str, tuple[str, str, str, str]] = {
     "ticker.fundamental.eps_diluted_ttm":  ("num", "TTM diluted EPS",                  "quarterly", "forward_fill"),
     "ticker.fundamental.fcf_ttm":          ("num", "TTM free cash flow",               "quarterly", "forward_fill"),
     "ticker.fundamental.net_income_ttm":   ("num", "TTM net income",                   "quarterly", "forward_fill"),
+    "ticker.fundamental.operating_income_ttm": ("num", "TTM operating income (EBIT)",     "quarterly", "forward_fill"),
     "ticker.fundamental.gross_margin":     ("num", "Gross margin %",                   "quarterly", "forward_fill"),
     "ticker.fundamental.operating_margin": ("num", "Operating margin %",               "quarterly", "forward_fill"),
     "ticker.fundamental.capex_ttm":        ("num", "TTM capex (PPE acquisitions)",     "quarterly", "forward_fill"),

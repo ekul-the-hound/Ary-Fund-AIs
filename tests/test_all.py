@@ -5009,7 +5009,7 @@ def test_no_raw_provider_access_when_registry_populated(
     _populate_full_snapshot(fresh_registry, "AAPL")
     patched_pipeline_builder["pipe"] = _make_safe_pipeline(allow_providers=True)
 
-    cfg = SimpleNamespace()
+    cfg = SimpleNamespace(MARKET_DB_PATH=tmp_db_path)
     ctx = pipeline_mod.build_agent_context("AAPL", tmp_db_path, cfg)
 
     # Canonical values must come from the registry, not from the empty
@@ -5035,7 +5035,7 @@ def test_full_snapshot_returns_complete_schema(
     _populate_full_snapshot(fresh_registry, "AAPL")
     patched_pipeline_builder["pipe"] = _make_safe_pipeline(allow_providers=True)
 
-    cfg = SimpleNamespace()
+    cfg = SimpleNamespace(MARKET_DB_PATH=tmp_db_path)
     ctx = pipeline_mod.build_agent_context("AAPL", tmp_db_path, cfg)
 
     # Every contract key is present
@@ -5073,7 +5073,7 @@ def test_partial_snapshot_returns_safe_fallbacks(
     _populate_partial_snapshot(fresh_registry, "AAPL")
     patched_pipeline_builder["pipe"] = _make_safe_pipeline(allow_providers=True)
 
-    cfg = SimpleNamespace()
+    cfg = SimpleNamespace(MARKET_DB_PATH=tmp_db_path)
     ctx = pipeline_mod.build_agent_context("AAPL", tmp_db_path, cfg)
 
     # Price made it through
@@ -5106,7 +5106,7 @@ def test_universe_context_uses_registry_only(
     _populate_full_snapshot(fresh_registry, "MSFT")
     patched_pipeline_builder["pipe"] = _make_safe_pipeline(allow_providers=True)
 
-    cfg = SimpleNamespace()
+    cfg = SimpleNamespace(MARKET_DB_PATH=tmp_db_path)
     universe = pipeline_mod.build_universe_context(["AAPL", "MSFT"], tmp_db_path, cfg)
 
     assert set(universe.keys()) == {"AAPL", "MSFT"}
@@ -5129,7 +5129,7 @@ def test_provenance_and_freshness_recorded(
     _populate_full_snapshot(fresh_registry, "AAPL")
     patched_pipeline_builder["pipe"] = _make_safe_pipeline(allow_providers=True)
 
-    cfg = SimpleNamespace()
+    cfg = SimpleNamespace(MARKET_DB_PATH=tmp_db_path)
     ctx = pipeline_mod.build_agent_context("AAPL", tmp_db_path, cfg)
 
     prov = ctx["provenance"]
@@ -5159,7 +5159,7 @@ def test_empty_registry_does_not_raise(
     The function must produce a schema-complete empty context."""
     patched_pipeline_builder["pipe"] = _make_safe_pipeline(allow_providers=True)
 
-    cfg = SimpleNamespace()
+    cfg = SimpleNamespace(MARKET_DB_PATH=tmp_db_path)
     ctx = pipeline_mod.build_agent_context("NEWCO", tmp_db_path, cfg)
 
     assert ctx["ticker"] == "NEWCO"
